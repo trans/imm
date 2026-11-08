@@ -1,0 +1,23 @@
+[project]
+name = "imm"
+version = "0.1.0"
+description = "Prior-guided language-memory modeling experiments"
+requires-python = ">=3.10"
+license = { text = "PolyForm-Noncommercial-1.0.0" }
+dependencies = [
+  "marisa-trie",
+  "numpy",
+]
+
+[project.optional-dependencies]
+torch = ["torch"]
+
+[build-system]
+requires = ["setuptools>=40.8.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["imm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

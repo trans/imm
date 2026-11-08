@@ -1,0 +1,20 @@
+name: imm
+version: 0.1.0
+
+targets:
+  imm_tree_build:
+    main: bin/imm_tree_build.cr
+  imm_horizon_build:
+    main: bin/imm_horizon_build.cr
+  imm_horizon_array_build:
+    main: bin/imm_horizon_array_build.cr
+  imm_horizon_profile:
+    main: bin/imm_horizon_profile.cr
+
+dependencies:
+  sqlite3:
+    github: crystal-lang/crystal-sqlite3
+
+crystal: '>= 1.20.2'
+
+license: PolyForm-Noncommercial-1.0.0
