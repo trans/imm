@@ -819,7 +819,24 @@ class MarisaCountModel(CountModel):
 
 
 class PackedCountModel(CountModel):
-    def __init__(self, tokens: bytes, vocab_size: int, depth: int, extra_features: list[str]):
+    """Counts as sorted packed tables.
+
+    segment_starts, if given, cuts tokens into separate stretches of text
+    (offsets into tokens, starting with 0): no n-gram is counted across the
+    joins. Cross-fitting counts the training text minus one fold this way.
+    """
+
+    def __init__(
+        self,
+        tokens: bytes,
+        vocab_size: int,
+        depth: int,
+        extra_features: list[str],
+        segment_starts: list[int] | None = None,
+    ):
+        if segment_starts is not None and (not segment_starts or segment_starts[0] != 0):
+            raise ValueError("segment_starts must begin with 0")
+        self.segment_starts = segment_starts
         self.tokens = tokens
         self.vocab_size = vocab_size
         self.depth = depth
@@ -839,34 +856,32 @@ class PackedCountModel(CountModel):
     def build(self) -> None:
         arr = np.frombuffer(self.tokens, dtype=np.uint8)
         n = len(arr)
-        for d in range(self.depth + 1):
-            if d == 0:
-                self.tables[d] = PackedNgramTable.from_pairs(
-                    np.zeros(n, dtype=np.uint64),
-                    arr,
-                )
-            elif n > d:
-                self.tables[d] = PackedNgramTable.from_pairs(
-                    packed_keys_for_windows(arr, 0, n - d, d),
-                    arr[d:n],
-                )
-            else:
-                self.tables[d] = PackedNgramTable.empty()
+        starts = self.segment_starts or [0]
+        segments = [(s, e) for s, e in zip(starts, [*starts[1:], n]) if e > s]
 
-        suffix_root_rows = max(0, n - 1)
-        self.suffix_tables[0] = PackedNgramTable.from_pairs(
-            np.zeros(suffix_root_rows, dtype=np.uint64),
-            arr[:suffix_root_rows],
-        )
-        for d in range(1, self.depth + 1):
-            rows = n - d
-            if rows > 0:
-                self.suffix_tables[d] = PackedNgramTable.from_pairs(
-                    packed_keys_for_windows(arr, 1, rows, d),
-                    arr[:rows],
-                )
-            else:
-                self.suffix_tables[d] = PackedNgramTable.empty()
+        def pairs(depth: int, suffix: bool) -> tuple[np.ndarray, np.ndarray]:
+            """Keys and targets of every window inside one segment. Prefix:
+            the depth tokens before a target. Suffix: the depth tokens after
+            the token they follow (keys start one later)."""
+            keys, targets = [], []
+            for s, e in segments:
+                # a suffix row needs a token after it even at depth 0
+                rows = (e - s) - (max(depth, 1) if suffix else depth)
+                if rows <= 0:
+                    continue
+                if depth == 0:
+                    keys.append(np.zeros(rows, dtype=np.uint64))
+                else:
+                    keys.append(packed_keys_for_windows(arr, s + (1 if suffix else 0), rows, depth))
+                targets.append(arr[s : s + rows] if suffix else arr[s + depth : s + depth + rows])
+            if not keys:
+                return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint8)
+            return np.concatenate(keys), np.concatenate(targets)
+
+        for d in range(self.depth + 1):
+            self.tables[d] = PackedNgramTable.from_pairs(*pairs(d, suffix=False))
+        for d in range(self.depth + 1):
+            self.suffix_tables[d] = PackedNgramTable.from_pairs(*pairs(d, suffix=True))
 
         root = self.tables[0].stats(0)
         if root is not None and root.total > 0:

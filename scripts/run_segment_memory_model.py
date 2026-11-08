@@ -41,7 +41,11 @@ from imm.skip_horizon_features import (
     ensure_skip_horizon_artifact,
     ensure_skip_horizon_count_artifact,
 )
-from imm.vectorized_count_prior import build_depth_prior_tables, compile_prior_rows_numpy_mmap
+from imm.vectorized_count_prior import (
+    build_depth_prior_tables,
+    compile_cross_fit_rows_numpy_mmap,
+    compile_prior_rows_numpy_mmap,
+)
 
 
 MemoryEntry = tuple[torch.Tensor, int]
@@ -1497,6 +1501,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count-prior-storage", choices=["device", "cpu", "mmap"], default="device")
     parser.add_argument("--count-prior-log-prob-dtype", choices=["float32", "float16"], default="float32")
     parser.add_argument(
+        "--count-prior-train-folds",
+        type=int,
+        default=0,
+        help="cross-fit the training rows' prior over this many folds, so no training position's prior "
+        "counts its own passage (0: off, one count model for every row; 20 gives each row counts over "
+        "95%% of the training text, like the held-out prior)",
+    )
+    parser.add_argument(
+        "--count-prior-fold-chunk",
+        type=int,
+        default=0,
+        help="cross-fitting chunk size in characters; use the split's held-out chunk size",
+    )
+    parser.add_argument(
         "--count-prior-precompute-cache-clear-every",
         type=int,
         default=0,
@@ -2227,7 +2245,7 @@ def count_prior_cache_meta(args: argparse.Namespace, train_ids: list[int], eval_
     theta_json_digest = None
     if args.count_prior_theta_json is not None:
         theta_json_digest = hashlib.sha256(args.count_prior_theta_json.read_bytes()).hexdigest()
-    return {
+    meta = {
         "train_digest": ids_digest(train_ids),
         "eval_digest": ids_digest(eval_ids),
         "vocab_chars": vocab.chars,
@@ -2245,6 +2263,22 @@ def count_prior_cache_meta(args: argparse.Namespace, train_ids: list[int], eval_
         "storage": args.count_prior_storage,
         "schema": "log_probs_and_feature_rows_v1",
     }
+    if args.count_prior_train_folds > 0:  # only then, so existing caches still match
+        meta["train_folds"] = args.count_prior_train_folds
+        meta["fold_chunk"] = args.count_prior_fold_chunk
+    return meta
+
+
+def check_cross_fit_args(args: argparse.Namespace) -> None:
+    if args.count_prior_train_folds <= 0:
+        return
+    if args.count_prior_train_folds < 2 or args.count_prior_fold_chunk <= 0:
+        raise ValueError("--count-prior-train-folds needs at least 2 folds and a positive --count-prior-fold-chunk")
+    if (args.count_prior_storage, args.count_prior_precompute, args.count_prior_impl) != ("mmap", "numpy", "packed"):
+        raise ValueError("cross-fitting is implemented for --count-prior-storage mmap --count-prior-precompute numpy --count-prior-impl packed")
+    # These count the training text themselves and aren't cross-fitted
+    if args.skip_horizon_features != "none" or args.skip_horizon_prior != "none":
+        raise ValueError("cross-fitting doesn't cover skip-horizon features or priors")
 
 
 def count_prior_cache_matches(cache: dict, meta: dict[str, object]) -> bool:
@@ -2368,6 +2402,7 @@ def load_checkpoint(path: Path) -> dict:
 
 def main() -> None:
     args = parse_args()
+    check_cross_fit_args(args)
     args.run_id = resolve_run_id(args.run_id, resume=args.resume_checkpoint is not None)
     args.output = prefixed_path(args.output, args.run_id)
     if args.checkpoint_output is None:
@@ -2501,14 +2536,35 @@ def main() -> None:
                         prefix=f"{args.count_prior_cache.stem}.depth_cache.",
                     ) as depth_cache_dir:
                         depth_prior_tables = build_depth_prior_tables(count_model, count_theta, depth_cache_dir)
-                        train_prior_log_probs, train_prior_gate_features = compile_prior_rows_numpy_mmap(
-                            train_ids_list,
-                            count_model,
-                            depth_prior_tables,
-                            train_log_path,
-                            train_feature_path,
-                            log_dtype=numpy_dtype_for_torch(prior_log_prob_dtype),
-                        )
+                        if args.count_prior_train_folds > 0:
+                            fold_started = time.perf_counter()
+                            train_prior_log_probs, train_prior_gate_features = compile_cross_fit_rows_numpy_mmap(
+                                train_ids_list,
+                                vocab.size,
+                                args.count_prior_depth,
+                                expand_extra_features(args.count_prior_extra_features),
+                                count_theta,
+                                args.count_prior_train_folds,
+                                args.count_prior_fold_chunk,
+                                train_log_path,
+                                train_feature_path,
+                                log_dtype=numpy_dtype_for_torch(prior_log_prob_dtype),
+                                cache_dir=Path(depth_cache_dir) / "folds",
+                                progress=lambda fold, folds: print(
+                                    f"count_prior_cross_fit fold={fold + 1}/{folds} "
+                                    f"sec={time.perf_counter() - fold_started:.1f}",
+                                    flush=True,
+                                ),
+                            )
+                        else:
+                            train_prior_log_probs, train_prior_gate_features = compile_prior_rows_numpy_mmap(
+                                train_ids_list,
+                                count_model,
+                                depth_prior_tables,
+                                train_log_path,
+                                train_feature_path,
+                                log_dtype=numpy_dtype_for_torch(prior_log_prob_dtype),
+                            )
                         eval_prior_log_probs_mmap, eval_prior_gate_features_mmap = compile_prior_rows_numpy_mmap(
                             eval_ids_list,
                             count_model,

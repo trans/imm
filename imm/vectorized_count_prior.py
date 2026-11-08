@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -341,3 +342,105 @@ def _compile_prior_chunk(
 
     q /= q.sum(axis=1, keepdims=True)
     return np.log(np.maximum(q, EPS)), chunk_features
+
+
+def cross_fit_folds(n_tokens: int, folds: int, chunk_size: int) -> list[list[tuple[int, int]]]:
+    """The training text cut into chunks of chunk_size and dealt into folds in
+    turn: chunk j goes to fold j % folds. Returns each fold's chunks as
+    (start, end) token ranges."""
+    if folds < 2 or chunk_size < 1:
+        raise ValueError("cross-fitting needs at least 2 folds and a positive chunk size")
+    out: list[list[tuple[int, int]]] = [[] for _ in range(folds)]
+    for j, start in enumerate(range(0, n_tokens, chunk_size)):
+        out[j % folds].append((start, min(n_tokens, start + chunk_size)))
+    return out
+
+
+def cross_fit_count_model(
+    ids: np.ndarray,
+    held: list[tuple[int, int]],
+    vocab_size: int,
+    depth: int,
+    extra_features: list[str],
+) -> PackedCountModel:
+    """A count model of ids with the held chunks taken out; the stretches in
+    between are counted separately, so no n-gram spans a gap."""
+    kept, cursor = [], 0
+    for start, end in sorted(held):
+        if start > cursor:
+            kept.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < len(ids):
+        kept.append((cursor, len(ids)))
+    if not kept:
+        raise ValueError("cross-fitting would leave nothing to count")
+    tokens = np.concatenate([ids[s:e] for s, e in kept])
+    starts = np.cumsum([0] + [e - s for s, e in kept[:-1]]).tolist()
+    model = PackedCountModel(tokens.tobytes(), vocab_size, depth, extra_features, segment_starts=starts)
+    model.build()
+    return model
+
+
+def compile_cross_fit_rows_numpy_mmap(
+    ids: list[int],
+    vocab_size: int,
+    depth: int,
+    extra_features: list[str],
+    theta: list[float],
+    folds: int,
+    chunk_size: int,
+    log_path,
+    feature_path,
+    log_dtype=np.float16,
+    feature_dtype=np.float32,
+    cache_dir: Path | str | None = None,
+    block_size: int = 100_000,
+    progress=None,
+) -> tuple[np.memmap, np.memmap]:
+    """Prior rows for training text, cross-fitted: each row's prior comes from
+    counts that leave out the fold holding its target's chunk.
+
+    Row r predicts ids[r + 1], as in compile_prior_rows_numpy_mmap. Its
+    context is read from the full text, as at test time; only the counts
+    leave its passage out. With folds = 20 each row's counts cover 95% of
+    the text, as much as the held-out prior counts.
+    """
+    arr = np.asarray(ids, dtype=np.uint8)
+    row_count = max(0, len(arr) - 1)
+    log_path, feature_path = Path(log_path), Path(feature_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    log_rows = np.memmap(log_path, dtype=np.dtype(log_dtype), mode="w+", shape=(row_count, vocab_size))
+    feature_rows = None
+    for fold, held in enumerate(cross_fit_folds(len(arr), folds, chunk_size)):
+        if not held:
+            continue
+        model = cross_fit_count_model(arr, held, vocab_size, depth, extra_features)
+        fold_cache = Path(cache_dir) / f"fold{fold}" if cache_dir is not None else None
+        tables = build_depth_prior_tables(model, theta, fold_cache)
+        if feature_rows is None:
+            feature_shape = (row_count, len(model.feature_names()))
+            feature_rows = np.memmap(feature_path, dtype=np.dtype(feature_dtype), mode="w+", shape=feature_shape)
+        for start, end in held:
+            # targets start..end-1 are rows start-1..end-2
+            first, last = max(0, start - 1), min(row_count, end - 1)
+            for a in range(first, last, block_size):
+                b = min(last, a + block_size)
+                log_chunk, feature_chunk = _compile_prior_chunk(arr, model, tables, a, b)
+                log_rows[a:b] = log_chunk
+                feature_rows[a:b] = feature_chunk
+        if progress is not None:
+            progress(fold, folds)
+        del model, tables
+        if fold_cache is not None:  # one fold's tables at a time on disk
+            shutil.rmtree(fold_cache, ignore_errors=True)
+    if feature_rows is None:
+        raise ValueError("no rows to compile")
+    log_rows.flush()
+    feature_rows.flush()
+    shapes = (log_rows.shape, feature_rows.shape)
+    del log_rows, feature_rows
+    return (
+        np.memmap(log_path, dtype=np.dtype(log_dtype), mode="r", shape=shapes[0]),
+        np.memmap(feature_path, dtype=np.dtype(feature_dtype), mode="r", shape=shapes[1]),
+    )
