@@ -6,20 +6,27 @@
 # cross-fitted run builds its prior cache; the rest reuse it. After each
 # corpus, scripts/prior_row_ppl.py reports the prior on training rows
 # against held-out for both caches.
+#
+#   scripts/rerun_prior_leak.sh [tiny|gutenberg|all]   (default all)
 set -e
+which=${1:-all}
 cd "$(dirname "$0")/.."
 run() { python scripts/run_segment_memory_model.py --config "configs/$1.json"; }
 
+if [ "$which" = tiny ] || [ "$which" = all ]; then
 for c in tiny_canonical_leaky_ps075_e1 tiny_canonical_leaky_ps100_e1 \
          tiny_canonical_crossfit20_ps075_e1 tiny_canonical_crossfit20_ps100_e1; do
   run "$c"
 done
 python scripts/prior_row_ppl.py --config configs/tiny_canonical_leaky_ps075_e1.json
 python scripts/prior_row_ppl.py --config configs/tiny_canonical_crossfit20_ps075_e1.json
+fi
 
+if [ "$which" = gutenberg ] || [ "$which" = all ]; then
 for c in gutenberg5m_crossfit20_ps075_e1 gutenberg5m_crossfit20_ps100_e1 \
          gutenberg5m_leaky_ps100_e1 gutenberg5m_priorstrength075_residual025_l2_005_e1; do
   run "$c"
 done
 python scripts/prior_row_ppl.py --config configs/gutenberg5m_leaky_ps100_e1.json
 python scripts/prior_row_ppl.py --config configs/gutenberg5m_crossfit20_ps075_e1.json
+fi
