@@ -31,7 +31,7 @@ from imm.count_gate import (
     train_gate,
 )
 from imm.run_ids import prefixed_path, resolve_run_id
-from imm.segments import unique_segments
+from imm.segments import SEGMENT_RULES, rule_segments
 from imm.skip_horizon_features import (
     FEATURE_NAMES as SKIP_HORIZON_FEATURE_NAMES,
     blend_log_prob_rows,
@@ -1565,6 +1565,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-depth", type=int, default=16)
     parser.add_argument("--unique-threshold", type=int, default=1)
+    parser.add_argument(
+        "--segment-rule",
+        choices=list(SEGMENT_RULES),
+        default="unique",
+        help="Where segments end. unique: once their text occurs at most --unique-threshold times in the "
+        "training text. word: after each word and the whitespace that follows it. hybrid: the unique length, "
+        "extended to the next word boundary. All capped at --max-depth.",
+    )
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--embedding-size", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=128)
@@ -3086,7 +3094,10 @@ def main() -> None:
     if args.prior_residual_gate != "none" and args.count_prior != "frozen":
         raise ValueError("--prior-residual-gate requires --count-prior frozen")
 
-    train_segments, eval_segments = unique_segments(train_ids_list, eval_ids_list, args.max_depth, args.unique_threshold)
+    space_ids = [i for i, ch in enumerate(vocab.chars) if ch.isspace()]
+    train_segments, eval_segments = rule_segments(
+        args.segment_rule, train_ids_list, eval_ids_list, args.max_depth, args.unique_threshold, space_ids
+    )
     mean_segment_len, max_segment_len = segment_stats(train_segments)
 
     prior_residual_gate_max = (
