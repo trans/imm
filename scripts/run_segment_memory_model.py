@@ -1605,6 +1605,15 @@ def parse_args() -> argparse.Namespace:
         "cache). both: the two together.",
     )
     parser.add_argument(
+        "--prior-evidence-rows",
+        type=Path,
+        default=None,
+        help="Depth evidence written elsewhere (mobius, say), used by --prior-input depth-evidence or both in "
+        "place of imm's own: PREFIX.json, PREFIX.train_depth_evidence.dat and PREFIX.eval_depth_evidence.dat, "
+        "float16, shape (rows, depth, vocab + 1) in depth_evidence_chunk's layout. Any depth; the json's "
+        "digests must match this run's ids and vocabulary.",
+    )
+    parser.add_argument(
         "--prior-residual-gate-max",
         type=float,
         default=0.0,
@@ -2523,6 +2532,61 @@ def load_or_build_depth_evidence(
     return train_rows, prior_rows_to_device(eval_rows, 0, eval_rows.shape[0], device)
 
 
+def external_evidence_path(prefix: Path, meta: dict, split: str) -> Path:
+    """The .dat for split ("train" or "eval"): meta[split]["path"], relative to
+    the json, if the json names one, else PREFIX.<split>_depth_evidence.dat."""
+    named = meta.get(split, {}).get("path") if isinstance(meta.get(split), dict) else None
+    if named:
+        return prefix.parent / named
+    return prefix.parent / f"{prefix.name}.{split}_depth_evidence.dat"
+
+
+def load_external_depth_evidence(
+    prefix: Path,
+    train_ids: list[int],
+    eval_ids: list[int],
+    vocab: CharVocab,
+    device: torch.device,
+) -> tuple[np.memmap, torch.Tensor]:
+    """Depth evidence rows another program wrote (--prior-evidence-rows), in
+    depth_evidence_chunk's layout: row r predicts ids[r + 1]; [k - 1, :V] is
+    the next-ID distribution after the k IDs ending at r, [k - 1, V] is
+    log(1 + total). The depth is read from the files, so it may differ from
+    --count-prior-depth. Refuses rows made for other text or another
+    vocabulary."""
+    meta_path = prefix.parent / f"{prefix.name}.json"
+    meta = json.loads(meta_path.read_text())
+    for split, ids in (("train", train_ids), ("eval", eval_ids)):
+        digest = meta.get(f"{split}_digest")
+        if digest != ids_digest(ids):
+            raise ValueError(f"{meta_path}: {split}_digest {digest} doesn't match this run's {split} ids")
+    if meta.get("vocab_chars") != list(vocab.chars):
+        raise ValueError(f"{meta_path}: vocab_chars don't match this run's vocabulary")
+    width = vocab.size + 1
+    rows = {}
+    for split, ids in (("train", train_ids), ("eval", eval_ids)):
+        path = external_evidence_path(prefix, meta, split)
+        row_count = max(0, len(ids) - 1)
+        itemsize = np.dtype(np.float16).itemsize
+        size = path.stat().st_size
+        if row_count == 0 or size % (row_count * width * itemsize) != 0:
+            raise ValueError(f"{path}: {size} bytes isn't {row_count} rows x depth x {width} float16")
+        depth = size // (row_count * width * itemsize)
+        shape = (row_count, depth, width)
+        named = meta.get(split, {}).get("shape") if isinstance(meta.get(split), dict) else None
+        if named is not None and tuple(named) != shape:
+            raise ValueError(f"{meta_path}: {split} shape {tuple(named)} doesn't match the file's {shape}")
+        rows[split] = np.memmap(path, dtype=np.float16, mode="r", shape=shape)
+    if rows["train"].shape[1] != rows["eval"].shape[1]:
+        raise ValueError(f"{prefix}: train depth {rows['train'].shape[1]} != eval depth {rows['eval'].shape[1]}")
+    print(
+        f"depth_evidence external={prefix} train_shape={rows['train'].shape} eval_shape={rows['eval'].shape} "
+        f"builder={meta.get('builder')!r} cross_fit={json.dumps(meta.get('cross_fit'))}",
+        flush=True,
+    )
+    return rows["train"], prior_rows_to_device(rows["eval"], 0, rows["eval"].shape[0], device)
+
+
 def check_cross_fit_args(args: argparse.Namespace) -> None:
     if args.count_prior_train_folds <= 0:
         return
@@ -3051,10 +3115,17 @@ def main() -> None:
     train_prior_evidence: PriorRows | None = None
     eval_prior_evidence: torch.Tensor | None = None
     prior_evidence_width = 0
+    if args.prior_evidence_rows is not None and args.prior_input not in ("depth-evidence", "both"):
+        raise ValueError("--prior-evidence-rows needs --prior-input depth-evidence or both")
     if args.prior_input in ("depth-evidence", "both"):
-        train_prior_evidence, eval_prior_evidence = load_or_build_depth_evidence(
-            args, train_ids_list, eval_ids_list, vocab, device
-        )
+        if args.prior_evidence_rows is not None:
+            train_prior_evidence, eval_prior_evidence = load_external_depth_evidence(
+                args.prior_evidence_rows, train_ids_list, eval_ids_list, vocab, device
+            )
+        else:
+            train_prior_evidence, eval_prior_evidence = load_or_build_depth_evidence(
+                args, train_ids_list, eval_ids_list, vocab, device
+            )
         prior_evidence_width = int(train_prior_evidence.shape[1] * train_prior_evidence.shape[2])
     model = SegmentMemoryLM(
         vocab.size,
