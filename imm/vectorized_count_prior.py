@@ -293,6 +293,33 @@ def compile_prior_rows_numpy_mmap(
     )
 
 
+def _context_hits(arr: np.ndarray, table, depth: int, first: int, end: int):
+    """Rows first..end-1 whose context of the given depth (the depth tokens
+    ending at the row's own position) occurs in table. Returns the rows (from
+    first), their table rows, each one's number of distinct next tokens, and
+    each (row, next token) pair as its row and its index into table.tokens;
+    or None if no row's context occurs."""
+    keys = packed_keys_for_windows(arr, first + 1 - depth, end - first, depth)
+    idx = np.searchsorted(table.keys, keys)
+    mask = idx < len(table.keys)
+    if np.any(mask):
+        mask[mask] &= table.keys[idx[mask]] == keys[mask]
+    if not np.any(mask):
+        return None
+    local_rows = np.nonzero(mask)[0]
+    table_rows = idx[mask].astype(np.int64, copy=False)
+    repeat_counts = table.offsets[table_rows + 1].astype(np.int64) - table.offsets[table_rows].astype(np.int64)
+    expanded_local = np.repeat(local_rows, repeat_counts)
+    starts = table.offsets[table_rows].astype(np.int64)
+    pair_count = int(repeat_counts.sum())
+    pair_indices = (
+        np.repeat(starts, repeat_counts)
+        + np.arange(pair_count, dtype=np.int64)
+        - np.repeat(np.cumsum(repeat_counts) - repeat_counts, repeat_counts)
+    )
+    return local_rows, table_rows, repeat_counts, expanded_local, pair_indices
+
+
 def _compile_prior_chunk(
     arr: np.ndarray,
     model: PackedCountModel,
@@ -310,29 +337,15 @@ def _compile_prior_chunk(
         valid_start = max(start, depth - 1)
         if valid_start >= end:
             continue
-        keys = packed_keys_for_windows(arr, valid_start + 1 - depth, end - valid_start, depth)
         table = prior_table.table
-        idx = np.searchsorted(table.keys, keys)
-        mask = idx < len(table.keys)
-        if np.any(mask):
-            mask[mask] &= table.keys[idx[mask]] == keys[mask]
-        if not np.any(mask):
+        hits = _context_hits(arr, table, depth, valid_start, end)
+        if hits is None:
             continue
-        local_rows = np.nonzero(mask)[0] + (valid_start - start)
-        table_rows = idx[mask].astype(np.int64, copy=False)
+        local_rows, table_rows, repeat_counts, expanded_local, pair_indices = hits
+        local_rows = local_rows + (valid_start - start)
+        expanded_local = expanded_local + (valid_start - start)
         w = prior_table.gates[table_rows]
         q[local_rows] *= (1.0 - w[:, None])
-        repeat_counts = (
-            table.offsets[table_rows + 1].astype(np.int64) - table.offsets[table_rows].astype(np.int64)
-        )
-        expanded_local = np.repeat(local_rows, repeat_counts)
-        starts = table.offsets[table_rows].astype(np.int64)
-        pair_count = int(repeat_counts.sum())
-        pair_indices = (
-            np.repeat(starts, repeat_counts)
-            + np.arange(pair_count, dtype=np.int64)
-            - np.repeat(np.cumsum(repeat_counts) - repeat_counts, repeat_counts)
-        )
         additions = (
             np.repeat(w / table.totals[table_rows].astype(np.float32), repeat_counts)
             * table.counts[pair_indices].astype(np.float32)
@@ -444,3 +457,91 @@ def compile_cross_fit_rows_numpy_mmap(
         np.memmap(log_path, dtype=np.dtype(log_dtype), mode="r", shape=shapes[0]),
         np.memmap(feature_path, dtype=np.dtype(feature_dtype), mode="r", shape=shapes[1]),
     )
+
+
+def depth_evidence_chunk(arr: np.ndarray, model: PackedCountModel, start: int, end: int) -> np.ndarray:
+    """What each context length's counts say about rows start..end-1, before
+    any blending: shape (rows, depth, vocab + 1). For row r and depth d,
+    [d - 1, :vocab] is the next-token distribution after the d tokens ending
+    at position r (counts over their total), and [d - 1, vocab] is
+    log(1 + total). Zeros where that context never occurs, or would start
+    before the text does. Row r predicts arr[r + 1], as the prior rows do."""
+    vocab = model.vocab_size
+    out = np.zeros((end - start, model.depth, vocab + 1), dtype=np.float32)
+    for depth in range(1, model.depth + 1):
+        valid_start = max(start, depth - 1)
+        if valid_start >= end:
+            continue
+        table = model.tables[depth]
+        hits = _context_hits(arr, table, depth, valid_start, end)
+        if hits is None:
+            continue
+        local_rows, table_rows, repeat_counts, expanded_local, pair_indices = hits
+        shift = valid_start - start
+        totals = table.totals[table_rows].astype(np.float32)
+        out[expanded_local + shift, depth - 1, table.tokens[pair_indices]] = (
+            table.counts[pair_indices].astype(np.float32) / np.repeat(totals, repeat_counts)
+        )
+        out[local_rows + shift, depth - 1, vocab] = np.log1p(totals)
+    return out
+
+
+def compile_depth_evidence_mmap(
+    ids: list[int],
+    model: PackedCountModel,
+    path,
+    dtype=np.float16,
+    block_size: int = 50_000,
+) -> np.memmap:
+    """depth_evidence_chunk for every row of ids, from one count model (the
+    held-out rows', or leaky training rows)."""
+    arr = np.asarray(ids, dtype=np.uint8)
+    row_count = max(0, len(arr) - 1)
+    shape = (row_count, model.depth, model.vocab_size + 1)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = np.memmap(path, dtype=np.dtype(dtype), mode="w+", shape=shape)
+    for a in range(0, row_count, block_size):
+        b = min(row_count, a + block_size)
+        rows[a:b] = depth_evidence_chunk(arr, model, a, b)
+    rows.flush()
+    del rows
+    return np.memmap(path, dtype=np.dtype(dtype), mode="r", shape=shape)
+
+
+def compile_cross_fit_depth_evidence_mmap(
+    ids: list[int],
+    vocab_size: int,
+    depth: int,
+    extra_features: list[str],
+    folds: int,
+    chunk_size: int,
+    path,
+    dtype=np.float16,
+    block_size: int = 50_000,
+    progress=None,
+) -> np.memmap:
+    """depth_evidence_chunk for training rows, cross-fitted exactly as
+    compile_cross_fit_rows_numpy_mmap: each row's counts leave out the fold
+    holding its target's chunk."""
+    arr = np.asarray(ids, dtype=np.uint8)
+    row_count = max(0, len(arr) - 1)
+    shape = (row_count, depth, vocab_size + 1)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = np.memmap(path, dtype=np.dtype(dtype), mode="w+", shape=shape)
+    for fold, held in enumerate(cross_fit_folds(len(arr), folds, chunk_size)):
+        if not held:
+            continue
+        model = cross_fit_count_model(arr, held, vocab_size, depth, extra_features)
+        for start, end in held:
+            first, last = max(0, start - 1), min(row_count, end - 1)
+            for a in range(first, last, block_size):
+                b = min(last, a + block_size)
+                rows[a:b] = depth_evidence_chunk(arr, model, a, b)
+        if progress is not None:
+            progress(fold, folds)
+        del model
+    rows.flush()
+    del rows
+    return np.memmap(path, dtype=np.dtype(dtype), mode="r", shape=shape)

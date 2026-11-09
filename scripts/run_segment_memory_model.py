@@ -43,6 +43,8 @@ from imm.skip_horizon_features import (
     ensure_skip_horizon_count_artifact,
 )
 from imm.vectorized_count_prior import (
+    compile_cross_fit_depth_evidence_mmap,
+    compile_depth_evidence_mmap,
     build_depth_prior_tables,
     compile_cross_fit_rows_numpy_mmap,
     compile_prior_rows_numpy_mmap,
@@ -328,6 +330,7 @@ class SegmentMemoryLM(nn.Module):
         utility_aux_weight: float,
         utility_temperature: float,
         prior_input: str = "none",
+        prior_evidence_width: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -487,18 +490,26 @@ class SegmentMemoryLM(nn.Module):
             ** (torch.arange(0, self.embed_rope_dim, 2, dtype=torch.float32) / max(1, self.embed_rope_dim))
         )
         self.register_buffer("input_rope_inv_freq", input_inv_freq, persistent=False)
-        if prior_input == "log-probs":
-            # Built under a forked RNG and zeroed, so every other parameter
-            # starts as it would without it and the first forward pass is
-            # unchanged.
-            with torch.random.fork_rng(devices=[]):
-                self.prior_input_proj = nn.Sequential(nn.LayerNorm(vocab_size), nn.Linear(vocab_size, embedding_size))
-            nn.init.zeros_(self.prior_input_proj[-1].weight)
-            nn.init.zeros_(self.prior_input_proj[-1].bias)
-        elif prior_input == "none":
-            self.prior_input_proj = None
-        else:
+        if prior_input not in ("none", "log-probs", "depth-evidence", "both"):
             raise ValueError(f"unknown prior_input: {prior_input}")
+        if prior_input in ("depth-evidence", "both") and prior_evidence_width <= 0:
+            raise ValueError("depth evidence needs a positive prior_evidence_width")
+        # Built under a forked RNG and zeroed, so every other parameter starts
+        # as it would without them and the GRU's first inputs are unchanged.
+        with torch.random.fork_rng(devices=[]):
+            log_probs_proj = evidence_proj = None
+            if prior_input in ("log-probs", "both"):
+                log_probs_proj = nn.Sequential(nn.LayerNorm(vocab_size), nn.Linear(vocab_size, embedding_size))
+            if prior_input in ("depth-evidence", "both"):
+                evidence_proj = nn.Sequential(
+                    nn.LayerNorm(prior_evidence_width), nn.Linear(prior_evidence_width, embedding_size)
+                )
+        for proj in (log_probs_proj, evidence_proj):
+            if proj is not None:
+                nn.init.zeros_(proj[-1].weight)
+                nn.init.zeros_(proj[-1].bias)
+        self.prior_input_proj = log_probs_proj
+        self.prior_evidence_proj = evidence_proj
 
     def zero_prediction_heads(self) -> None:
         for head in [
@@ -994,6 +1005,7 @@ class SegmentMemoryLM(nn.Module):
         skip_prior_log_probs: torch.Tensor | None = None,
         skip_prior_strength: torch.Tensor | None = None,
         prior_offset: int = 0,
+        prior_evidence: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int, list[MemoryEntry], torch.Tensor | None, dict[str, float]]:
         if token_feedback != "none":
             return self.segment_loss_token_feedback(
@@ -1024,6 +1036,13 @@ class SegmentMemoryLM(nn.Module):
                     raise ValueError("--prior-input requires count-prior rows")
                 rows = prior_log_probs[start - prior_offset : end - prior_offset]
                 embeddings = embeddings + self.prior_input_proj(rows.to(dtype=embeddings.dtype).clamp(min=-18.0))
+            if self.prior_evidence_proj is not None:
+                if prior_evidence is None:
+                    raise ValueError("--prior-input depth-evidence requires depth-evidence rows")
+                evidence = prior_evidence[start - prior_offset : end - prior_offset]
+                embeddings = embeddings + self.prior_evidence_proj(
+                    evidence.reshape(evidence.shape[0], -1).to(dtype=embeddings.dtype)
+                )
             embeddings = self.apply_input_rope(embeddings, torch.arange(start, end, device=ids.device))
             hidden_seq, hidden = self.rnn(embeddings.unsqueeze(0), initial_hidden)
             hidden_seq = hidden_seq.squeeze(0)
@@ -1412,10 +1431,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prior-input",
-        choices=["none", "log-probs"],
+        choices=["none", "log-probs", "depth-evidence", "both"],
         default="none",
-        help="Show the residual what the prior predicts: log-probs adds a zero-initialized projection of each "
-        "position's prior log-probabilities to the GRU's input, so training starts from the model without it.",
+        help="Show the residual what the prior knows, through zero-initialized projections into the GRU's input "
+        "(training starts from the model without them). log-probs: each position's prior log-probabilities. "
+        "depth-evidence: what each context length's counts say, before blending (cached next to the prior "
+        "cache). both: the two together.",
     )
     parser.add_argument(
         "--prior-residual-gate-max",
@@ -1558,6 +1579,12 @@ def segment_stats(segments: list[tuple[int, int]]) -> tuple[float, int]:
     return sum(lengths) / max(1, len(lengths)), max(lengths, default=0)
 
 
+def count_split(n_train: int, depth: int, valid_ratio: float) -> int:
+    """Where the prior's counted text ends and the gate's fitting text starts."""
+    split = int(n_train * (1.0 - valid_ratio))
+    return max(depth + 1, min(split, n_train - depth - 1))
+
+
 def fit_count_gate_prior(
     train_ids: list[int],
     vocab_size: int,
@@ -1571,8 +1598,7 @@ def fit_count_gate_prior(
     impl: str,
     theta_json: Path | None,
 ) -> tuple[CountModel, list[float], list[dict[str, float]]]:
-    split = int(len(train_ids) * (1.0 - valid_ratio))
-    split = max(depth + 1, min(split, len(train_ids) - depth - 1))
+    split = count_split(len(train_ids), depth, valid_ratio)
     count_train = bytes(train_ids[:split])
     valid = bytes(train_ids[split:])
     model_classes = {
@@ -2242,6 +2268,86 @@ def count_prior_cache_meta(args: argparse.Namespace, train_ids: list[int], eval_
     return meta
 
 
+def depth_evidence_meta(args: argparse.Namespace, train_ids: list[int], eval_ids: list[int], vocab: CharVocab) -> dict:
+    return {
+        "schema": "depth_evidence_v1",
+        "train_digest": ids_digest(train_ids),
+        "eval_digest": ids_digest(eval_ids),
+        "vocab_chars": list(vocab.chars),
+        "depth": args.count_prior_depth,
+        "valid_ratio": args.count_prior_valid_ratio,
+        "extra_features": args.count_prior_extra_features,
+        "train_folds": args.count_prior_train_folds,
+        "fold_chunk": args.count_prior_fold_chunk if args.count_prior_train_folds > 0 else None,
+        "dtype": "float16",
+    }
+
+
+def load_or_build_depth_evidence(
+    args: argparse.Namespace,
+    train_ids: list[int],
+    eval_ids: list[int],
+    vocab: CharVocab,
+    device: torch.device,
+) -> tuple[np.memmap, torch.Tensor]:
+    """Per-depth evidence rows (vectorized_count_prior.depth_evidence_chunk),
+    cached beside the prior cache. Held-out rows count the same text as the
+    held-out prior; training rows are cross-fitted as the prior's are, or
+    counted like the held-out rows when there are no folds."""
+    if args.count_prior_cache is None:
+        raise ValueError("--prior-input depth-evidence requires --count-prior-cache")
+    meta = depth_evidence_meta(args, train_ids, eval_ids, vocab)
+    meta_path = prior_mmap_sidecar_path(args.count_prior_cache, "depth_evidence").with_suffix(".json")
+    train_path = prior_mmap_sidecar_path(args.count_prior_cache, "train_depth_evidence")
+    eval_path = prior_mmap_sidecar_path(args.count_prior_cache, "eval_depth_evidence")
+    width = vocab.size + 1
+    train_shape = (max(0, len(train_ids) - 1), args.count_prior_depth, width)
+    eval_shape = (max(0, len(eval_ids) - 1), args.count_prior_depth, width)
+    started = time.perf_counter()
+    if (
+        meta_path.exists()
+        and train_path.exists()
+        and eval_path.exists()
+        and json.loads(meta_path.read_text()) == meta
+    ):
+        train_rows = np.memmap(train_path, dtype=np.float16, mode="r", shape=train_shape)
+        eval_rows = np.memmap(eval_path, dtype=np.float16, mode="r", shape=eval_shape)
+        built = False
+    else:
+        meta_path.unlink(missing_ok=True)  # written last, once both files are whole
+        extra = expand_extra_features(args.count_prior_extra_features)
+        split = count_split(len(train_ids), args.count_prior_depth, args.count_prior_valid_ratio)
+        model = PackedCountModel(bytes(train_ids[:split]), vocab.size, args.count_prior_depth, extra)
+        model.build()
+        eval_rows = compile_depth_evidence_mmap(eval_ids, model, eval_path)
+        if args.count_prior_train_folds > 0:
+            del model
+            train_rows = compile_cross_fit_depth_evidence_mmap(
+                train_ids,
+                vocab.size,
+                args.count_prior_depth,
+                extra,
+                args.count_prior_train_folds,
+                args.count_prior_fold_chunk,
+                train_path,
+                progress=lambda fold, folds: print(
+                    f"depth_evidence_cross_fit fold={fold + 1}/{folds} sec={time.perf_counter() - started:.1f}",
+                    flush=True,
+                ),
+            )
+        else:
+            train_rows = compile_depth_evidence_mmap(train_ids, model, train_path)
+            del model
+        meta_path.write_text(json.dumps(meta))
+        built = True
+    print(
+        f"depth_evidence built={built} train_shape={train_rows.shape} eval_shape={eval_rows.shape} "
+        f"sec={time.perf_counter() - started:.1f} train_path={train_path}",
+        flush=True,
+    )
+    return train_rows, prior_rows_to_device(eval_rows, 0, eval_rows.shape[0], device)
+
+
 def check_cross_fit_args(args: argparse.Namespace) -> None:
     if args.count_prior_train_folds <= 0:
         return
@@ -2271,6 +2377,7 @@ def evaluate(
     prior_gate_features: torch.Tensor | None = None,
     skip_prior_log_probs: torch.Tensor | None = None,
     skip_prior_strength: torch.Tensor | None = None,
+    prior_evidence: torch.Tensor | None = None,
 ) -> tuple[float, float, float, dict[str, float]]:
     model.eval()
     memory: list[MemoryEntry] = []
@@ -2287,6 +2394,7 @@ def evaluate(
         prior_gate_features=prior_gate_features,
         skip_prior_log_probs=skip_prior_log_probs,
         skip_prior_strength=skip_prior_strength,
+        prior_evidence=prior_evidence,
     )
     if tokens == 0:
         raise ValueError("cannot evaluate no tokens")
@@ -2757,6 +2865,14 @@ def main() -> None:
         raise ValueError("--prior-input requires --count-prior frozen")
     if args.prior_input != "none" and args.token_feedback != "none":
         raise ValueError("--prior-input is not implemented for --token-feedback")
+    train_prior_evidence: PriorRows | None = None
+    eval_prior_evidence: torch.Tensor | None = None
+    prior_evidence_width = 0
+    if args.prior_input in ("depth-evidence", "both"):
+        train_prior_evidence, eval_prior_evidence = load_or_build_depth_evidence(
+            args, train_ids_list, eval_ids_list, vocab, device
+        )
+        prior_evidence_width = int(train_prior_evidence.shape[1] * train_prior_evidence.shape[2])
     model = SegmentMemoryLM(
         vocab.size,
         args.embedding_size,
@@ -2790,6 +2906,7 @@ def main() -> None:
         utility_aux_weight=args.utility_aux_weight,
         utility_temperature=args.utility_temperature,
         prior_input=args.prior_input,
+        prior_evidence_width=prior_evidence_width,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
@@ -2906,6 +3023,7 @@ def main() -> None:
                 prior_gate_features=eval_prior_gate_features,
                 skip_prior_log_probs=eval_skip_prior_log_probs,
                 skip_prior_strength=eval_skip_prior_strength,
+                prior_evidence=eval_prior_evidence,
             )
             mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
             mean_residual_alpha = mean_or_none(val_stats["residual_alpha_sum"], val_stats["residual_alpha_count"])
@@ -3021,6 +3139,7 @@ def main() -> None:
                     prior_end,
                     device,
                 )
+                batch_prior_evidence = prior_rows_to_device(train_prior_evidence, prior_offset, prior_end, device)
                 loss, tokens, memory, carried_hidden, train_stats = model.segment_loss(
                     train_ids,
                     batch_segments,
@@ -3035,6 +3154,7 @@ def main() -> None:
                     skip_prior_log_probs=batch_skip_prior_log_probs,
                     skip_prior_strength=batch_skip_prior_strength,
                     prior_offset=prior_offset,
+                    prior_evidence=batch_prior_evidence,
                 )
                 step_profile.forward_sec += time.perf_counter() - t0
                 if tokens == 0:
@@ -3079,6 +3199,7 @@ def main() -> None:
                         prior_gate_features=eval_prior_gate_features,
                         skip_prior_log_probs=eval_skip_prior_log_probs,
                         skip_prior_strength=eval_skip_prior_strength,
+                        prior_evidence=eval_prior_evidence,
                     )
                     epoch_profile.eval_sec += time.perf_counter() - t0
                     mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
@@ -3154,6 +3275,7 @@ def main() -> None:
                 prior_gate_features=eval_prior_gate_features,
                 skip_prior_log_probs=eval_skip_prior_log_probs,
                 skip_prior_strength=eval_skip_prior_strength,
+                prior_evidence=eval_prior_evidence,
             )
             epoch_profile.eval_sec += time.perf_counter() - t0
             mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
