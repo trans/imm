@@ -52,6 +52,7 @@ from imm.vectorized_count_prior import (
 
 
 MemoryEntry = tuple[torch.Tensor, int]
+StreamMemory = tuple[torch.Tensor, torch.Tensor]  # records [B, M, H], their positions [B, M]
 PriorRows = torch.Tensor | np.memmap
 
 
@@ -231,7 +232,9 @@ class GatedCrossAttentionBlock(nn.Module):
             return x
         rope_part = x[..., : self.rope_dim]
         pass_part = x[..., self.rope_dim :]
-        angles = positions.to(device=x.device, dtype=x.dtype).view(1, 1, -1, 1) * self.rope_inv_freq.to(
+        # positions: [T], shared by the batch, or [B, T], one row per stream
+        shape = (1, 1, -1, 1) if positions.dim() == 1 else (positions.shape[0], 1, positions.shape[1], 1)
+        angles = positions.to(device=x.device, dtype=x.dtype).view(*shape) * self.rope_inv_freq.to(
             dtype=x.dtype
         ).view(1, 1, 1, -1)
         cos = torch.cos(angles)
@@ -1301,6 +1304,169 @@ class SegmentMemoryLM(nn.Module):
             return torch.zeros((), device=ids.device), 0, memory, next_carried_hidden, stats
         return torch.stack(losses).sum(), token_count, memory, next_carried_hidden, stats
 
+    def check_streams_supported(self, token_feedback: str) -> None:
+        """segment_loss_streams covers gated-xattn without token feedback,
+        auxiliary losses or a skip-horizon prior; refuse anything else."""
+        unsupported = []
+        if self.mixing != "gated-xattn":
+            unsupported.append(f"--mixing {self.mixing}")
+        if token_feedback != "none":
+            unsupported.append(f"--token-feedback {token_feedback}")
+        for name in ("record_aux_weight", "terminal_record_aux_weight", "retrieval_aux_weight", "utility_aux_weight"):
+            if getattr(self, name) > 0.0:
+                unsupported.append("--" + name.replace("_", "-"))
+        if self.skip_prior_trust_gate is not None:
+            unsupported.append("--skip-horizon-prior")
+        if unsupported:
+            raise ValueError("--train-streams > 1 supports only --mixing gated-xattn without " + ", ".join(unsupported))
+
+    def segment_loss_streams(
+        self,
+        ids: torch.Tensor,
+        stream_segments: list[list[tuple[int, int]]],
+        memory: StreamMemory | None,
+        max_memory: int,
+        carried_hidden: torch.Tensor | None = None,
+        carry_hidden: bool = False,
+        feedback_state: str = "gru",
+        token_feedback: str = "none",
+        prior_log_probs: torch.Tensor | None = None,
+        prior_gate_features: torch.Tensor | None = None,
+        prior_evidence: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, int, StreamMemory, torch.Tensor, dict[str, float]]:
+        """segment_loss for B independent streams at once. Stream b runs the
+        segments stream_segments[b], in order, with its own memory and
+        carried state, as segment_loss would run them alone; the loss is the
+        sum over streams. Each segment index is one batched GRU call, padded to
+        the longest of the B segments.
+
+        Every stream has the same number of segments. Prior rows hold each
+        stream's span (its first segment's start to its last segment's end),
+        the streams' spans one after another (prior_rows_for_spans). memory is
+        (records [B, M, H], positions [B, M]) or None for empty; the carried
+        state is [1, B, H]."""
+        self.check_streams_supported(token_feedback)
+        device = ids.device
+        streams = len(stream_segments)
+        count = len(stream_segments[0]) if streams else 0
+        if streams == 0 or count == 0 or any(len(segs) != count for segs in stream_segments):
+            raise ValueError("segment_loss_streams needs streams with the same, nonzero number of segments")
+        starts = np.array([[start for start, _ in segs] for segs in stream_segments], dtype=np.int64)
+        ends = np.array([[end for _, end in segs] for segs in stream_segments], dtype=np.int64)
+        lengths = ends - starts  # [B, K]
+        if (lengths <= 0).any():
+            raise ValueError("segment_loss_streams got an empty segment")
+        longest = int(lengths.max())
+        offsets = np.arange(longest)
+        valid = offsets[None, None, :] < lengths[:, :, None]  # [B, K, L]: real positions, not padding
+        positions = starts[:, :, None] + offsets[None, None, :]
+        span_starts = starts[:, 0]
+        span_lengths = ends[:, -1] - span_starts
+        row_starts = np.concatenate([[0], np.cumsum(span_lengths)[:-1]])
+        rows = row_starts[:, None, None] + positions - span_starts[:, None, None]
+        valid_t = torch.from_numpy(valid).to(device)
+        flat_positions = torch.from_numpy(positions[valid]).to(device)  # in (stream, segment, offset) order
+        flat_rows = torch.from_numpy(rows[valid]).to(device)
+
+        embeddings = self.embed(ids[flat_positions])
+        if self.prior_input_proj is not None:
+            if prior_log_probs is None:
+                raise ValueError("--prior-input requires count-prior rows")
+            embeddings = embeddings + self.prior_input_proj(
+                prior_log_probs[flat_rows].to(dtype=embeddings.dtype).clamp(min=-18.0)
+            )
+        if self.prior_evidence_proj is not None:
+            if prior_evidence is None:
+                raise ValueError("--prior-input depth-evidence requires depth-evidence rows")
+            evidence = prior_evidence[flat_rows]
+            embeddings = embeddings + self.prior_evidence_proj(
+                evidence.reshape(evidence.shape[0], -1).to(dtype=embeddings.dtype)
+            )
+        embeddings = self.apply_input_rope(embeddings, flat_positions)
+        grid = embeddings.new_zeros((streams, count, longest, embeddings.shape[-1]))
+        grid[valid_t] = embeddings
+
+        if memory is None:
+            records = embeddings.new_zeros((streams, 0, self.hidden_size))
+            record_positions = torch.zeros((streams, 0), dtype=torch.long, device=device)
+        else:
+            records, record_positions = memory
+        zero_hidden = embeddings.new_zeros((1, streams, self.hidden_size))
+        next_hidden = carried_hidden if carried_hidden is not None else zero_hidden
+        lengths_t = torch.from_numpy(lengths).to(device)
+        positions_t = torch.from_numpy(positions).to(device)
+        record_ends_t = torch.from_numpy(ends - 1).to(device)
+        stream_index = torch.arange(streams, device=device)
+        states = []
+        for k in range(count):
+            width = int(lengths[:, k].max())
+            initial_hidden = next_hidden if carry_hidden else zero_hidden
+            hidden_seq, _ = self.rnn(grid[:, k, :width], initial_hidden.contiguous())
+            if self.rope_positions == "char":
+                query_positions, memory_positions = positions_t[:, k, :width], record_positions
+            else:
+                query_positions = torch.zeros(width, device=device)
+                memory_positions = torch.arange(-records.shape[1], 0, device=device)
+            mem = self.memory_interface_norm(records)
+            state = hidden_seq
+            for block in self.gated_xattn_blocks:
+                state = block(
+                    state, mem, query_positions=query_positions, memory_positions=memory_positions, use_rope=self.use_rope
+                )
+            last = lengths_t[:, k] - 1
+            terminal = state[stream_index, last]  # [B, H]
+            terminal_context = terminal - hidden_seq[stream_index, last]
+            if self.memory_state == "fused":
+                cap_input = torch.cat([hidden_seq[stream_index, last], terminal_context], dim=1)
+                cap_state = self.cap_norm(torch.tanh(self.cap_fuse(cap_input)))
+            else:
+                cap_state = terminal
+            records = torch.cat([records, self.write_memory(cap_state).unsqueeze(1)], dim=1)[:, -max_memory:]
+            record_positions = torch.cat([record_positions, record_ends_t[:, k : k + 1]], dim=1)[:, -max_memory:]
+            if feedback_state == "context":
+                next_state = terminal_context
+            elif feedback_state == "gated":
+                feedback_input = torch.cat([terminal, terminal_context], dim=1)
+                feedback_update = self.feedback_update(feedback_input)
+                next_state = terminal + torch.sigmoid(self.feedback_gate(feedback_input)) * feedback_update
+            else:
+                next_state = terminal
+            next_hidden = next_state.unsqueeze(0)
+            states.append(F.pad(state, (0, 0, 0, longest - width)))
+
+        logits = self.gru_head(torch.stack(states, dim=1)[valid_t])  # [N, V], (stream, segment, offset) order
+        logits, residual_logits, _, _ = self.apply_prior_residual(
+            logits,
+            prior_log_probs[flat_rows] if prior_log_probs is not None else None,
+            prior_gate_features[flat_rows] if prior_gate_features is not None else None,
+        )
+        loss = F.cross_entropy(logits, ids[flat_positions + 1], reduction="sum")
+        if self.training and residual_logits is not None and self.prior_residual_l2 > 0.0:
+            loss = loss + self.prior_residual_l2 * residual_logits.square().mean(dim=1).sum()
+        stats = empty_stats()
+        stats["token_count"] = float(flat_positions.numel())
+        return loss, int(flat_positions.numel()), (records, record_positions), next_hidden, stats
+
+
+def split_streams(segments: list[tuple[int, int]], streams: int) -> list[list[tuple[int, int]]]:
+    """Cut the segment list into `streams` contiguous runs of equal length;
+    the last len(segments) % streams segments are left out."""
+    per_stream = len(segments) // streams
+    if per_stream == 0:
+        raise ValueError(f"{len(segments)} segments can't make {streams} streams")
+    return [segments[b * per_stream : (b + 1) * per_stream] for b in range(streams)]
+
+
+def prior_rows_for_spans(
+    rows: PriorRows | None, spans: list[tuple[int, int]], device: torch.device
+) -> torch.Tensor | None:
+    """Rows start..end - 1 of each span, the spans one after another, on device."""
+    if rows is None:
+        return None
+    if isinstance(rows, torch.Tensor):
+        return torch.cat([rows[start:end] for start, end in spans]).to(device)
+    return torch.from_numpy(np.concatenate([np.asarray(rows[start:end]) for start, end in spans])).to(device)
+
 
 @dataclass(frozen=True)
 class SegmentMemoryRow:
@@ -1469,6 +1635,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-layers", type=int, default=2)
     parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--segments-per-update", type=int, default=64)
+    parser.add_argument(
+        "--train-streams",
+        type=int,
+        default=1,
+        help="Train on this many streams at once: the training segments are cut into equal contiguous runs, "
+        "each with its own memory and carried state, batched through one GRU call per segment index; an update "
+        "takes --segments-per-update segments from every stream. The last (segments mod streams) segments are "
+        "left out. Evaluation stays one stream. 1: one stream, as before.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -2918,6 +3093,11 @@ def main() -> None:
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
+    if args.train_streams < 1:
+        raise ValueError("--train-streams must be at least 1")
+    if args.train_streams > 1:
+        model.check_streams_supported(args.token_feedback)
+        stream_segments = split_streams(train_segments, args.train_streams)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start_epoch = 1
     step = 0
@@ -2988,7 +3168,7 @@ def main() -> None:
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} "
-            f"carry_hidden={args.carry_hidden} "
+            f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} "
             f"feedback_state={args.feedback_state} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
             f"prior_strength={args.prior_strength} "
@@ -3110,60 +3290,79 @@ def main() -> None:
                 )
         for epoch in range(start_epoch, args.epochs + 1):
             model.train()
-            memory: list[MemoryEntry] = []
+            memory: list[MemoryEntry] | StreamMemory | None = [] if args.train_streams == 1 else None
             carried_hidden: torch.Tensor | None = None
             epoch_profile = EpochProfile()
-            for offset in range(0, len(train_segments), args.segments_per_update):
+            stream_length = len(train_segments) if args.train_streams == 1 else len(stream_segments[0])
+            for offset in range(0, stream_length, args.segments_per_update):
                 step += 1
-                batch_segments = train_segments[offset : offset + args.segments_per_update]
                 step_profile = EpochProfile()
                 t0 = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
                 step_profile.zero_sec += time.perf_counter() - t0
                 t0 = time.perf_counter()
-                prior_offset = batch_segments[0][0]
-                prior_end = batch_segments[-1][1]
-                batch_prior_log_probs = prior_rows_to_device(
-                    train_prior_log_probs,
-                    prior_offset,
-                    prior_end,
-                    device,
-                )
-                batch_prior_gate_features = prior_rows_to_device(
-                    train_prior_gate_features,
-                    prior_offset,
-                    prior_end,
-                    device,
-                )
-                batch_skip_prior_log_probs = prior_rows_to_device(
-                    train_skip_prior_log_probs,
-                    prior_offset,
-                    prior_end,
-                    device,
-                )
-                batch_skip_prior_strength = prior_rows_to_device(
-                    train_skip_prior_strength,
-                    prior_offset,
-                    prior_end,
-                    device,
-                )
-                batch_prior_evidence = prior_rows_to_device(train_prior_evidence, prior_offset, prior_end, device)
-                loss, tokens, memory, carried_hidden, train_stats = model.segment_loss(
-                    train_ids,
-                    batch_segments,
-                    memory,
-                    args.max_memory,
-                    carried_hidden=carried_hidden,
-                    carry_hidden=args.carry_hidden,
-                    feedback_state=args.feedback_state,
-                    token_feedback=args.token_feedback,
-                    prior_log_probs=batch_prior_log_probs,
-                    prior_gate_features=batch_prior_gate_features,
-                    skip_prior_log_probs=batch_skip_prior_log_probs,
-                    skip_prior_strength=batch_skip_prior_strength,
-                    prior_offset=prior_offset,
-                    prior_evidence=batch_prior_evidence,
-                )
+                if args.train_streams > 1:
+                    batch_streams = [segs[offset : offset + args.segments_per_update] for segs in stream_segments]
+                    spans = [(segs[0][0], segs[-1][1]) for segs in batch_streams]
+                    loss, tokens, memory, carried_hidden, train_stats = model.segment_loss_streams(
+                        train_ids,
+                        batch_streams,
+                        memory,
+                        args.max_memory,
+                        carried_hidden=carried_hidden,
+                        carry_hidden=args.carry_hidden,
+                        feedback_state=args.feedback_state,
+                        token_feedback=args.token_feedback,
+                        prior_log_probs=prior_rows_for_spans(train_prior_log_probs, spans, device),
+                        prior_gate_features=prior_rows_for_spans(train_prior_gate_features, spans, device),
+                        prior_evidence=prior_rows_for_spans(train_prior_evidence, spans, device),
+                    )
+                    batch_segments = batch_streams[0]
+                else:
+                    batch_segments = train_segments[offset : offset + args.segments_per_update]
+                    prior_offset = batch_segments[0][0]
+                    prior_end = batch_segments[-1][1]
+                    batch_prior_log_probs = prior_rows_to_device(
+                        train_prior_log_probs,
+                        prior_offset,
+                        prior_end,
+                        device,
+                    )
+                    batch_prior_gate_features = prior_rows_to_device(
+                        train_prior_gate_features,
+                        prior_offset,
+                        prior_end,
+                        device,
+                    )
+                    batch_skip_prior_log_probs = prior_rows_to_device(
+                        train_skip_prior_log_probs,
+                        prior_offset,
+                        prior_end,
+                        device,
+                    )
+                    batch_skip_prior_strength = prior_rows_to_device(
+                        train_skip_prior_strength,
+                        prior_offset,
+                        prior_end,
+                        device,
+                    )
+                    batch_prior_evidence = prior_rows_to_device(train_prior_evidence, prior_offset, prior_end, device)
+                    loss, tokens, memory, carried_hidden, train_stats = model.segment_loss(
+                        train_ids,
+                        batch_segments,
+                        memory,
+                        args.max_memory,
+                        carried_hidden=carried_hidden,
+                        carry_hidden=args.carry_hidden,
+                        feedback_state=args.feedback_state,
+                        token_feedback=args.token_feedback,
+                        prior_log_probs=batch_prior_log_probs,
+                        prior_gate_features=batch_prior_gate_features,
+                        skip_prior_log_probs=batch_skip_prior_log_probs,
+                        skip_prior_strength=batch_skip_prior_strength,
+                        prior_offset=prior_offset,
+                        prior_evidence=batch_prior_evidence,
+                    )
                 step_profile.forward_sec += time.perf_counter() - t0
                 if tokens == 0:
                     continue
@@ -3182,14 +3381,17 @@ def main() -> None:
                 optimizer.step()
                 step_profile.optimizer_sec += time.perf_counter() - t0
                 t0 = time.perf_counter()
-                memory = [(state.detach(), position) for state, position in memory[-args.max_memory:]]
+                if args.train_streams > 1:
+                    memory = (memory[0].detach(), memory[1])
+                else:
+                    memory = [(state.detach(), position) for state, position in memory[-args.max_memory:]]
                 if carried_hidden is not None:
                     carried_hidden = carried_hidden.detach()
                 step_profile.detach_sec += time.perf_counter() - t0
                 epoch_profile.add(step_profile)
                 if args.progress_every_steps > 0 and step % args.progress_every_steps == 0:
                     print(
-                        f"progress epoch={epoch} step={step} offset={offset + len(batch_segments)}/{len(train_segments)} "
+                        f"progress epoch={epoch} step={step} offset={offset + len(batch_segments)}/{stream_length} "
                         f"train_nll={train_nll:.4f} {profile_summary(epoch_profile)}",
                         flush=True,
                     )
