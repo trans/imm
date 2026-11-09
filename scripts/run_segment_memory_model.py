@@ -327,6 +327,7 @@ class SegmentMemoryLM(nn.Module):
         retrieval_aux_weight: float,
         utility_aux_weight: float,
         utility_temperature: float,
+        prior_input: str = "none",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -486,6 +487,18 @@ class SegmentMemoryLM(nn.Module):
             ** (torch.arange(0, self.embed_rope_dim, 2, dtype=torch.float32) / max(1, self.embed_rope_dim))
         )
         self.register_buffer("input_rope_inv_freq", input_inv_freq, persistent=False)
+        if prior_input == "log-probs":
+            # Built under a forked RNG and zeroed, so every other parameter
+            # starts as it would without it and the first forward pass is
+            # unchanged.
+            with torch.random.fork_rng(devices=[]):
+                self.prior_input_proj = nn.Sequential(nn.LayerNorm(vocab_size), nn.Linear(vocab_size, embedding_size))
+            nn.init.zeros_(self.prior_input_proj[-1].weight)
+            nn.init.zeros_(self.prior_input_proj[-1].bias)
+        elif prior_input == "none":
+            self.prior_input_proj = None
+        else:
+            raise ValueError(f"unknown prior_input: {prior_input}")
 
     def zero_prediction_heads(self) -> None:
         for head in [
@@ -1006,6 +1019,11 @@ class SegmentMemoryLM(nn.Module):
             tokens = ids[start:end]
             initial_hidden = next_carried_hidden if carry_hidden and next_carried_hidden is not None else self.zero_state(ids.device)
             embeddings = self.embed(tokens)
+            if self.prior_input_proj is not None:
+                if prior_log_probs is None:
+                    raise ValueError("--prior-input requires count-prior rows")
+                rows = prior_log_probs[start - prior_offset : end - prior_offset]
+                embeddings = embeddings + self.prior_input_proj(rows.to(dtype=embeddings.dtype).clamp(min=-18.0))
             embeddings = self.apply_input_rope(embeddings, torch.arange(start, end, device=ids.device))
             hidden_seq, hidden = self.rnn(embeddings.unsqueeze(0), initial_hidden)
             hidden_seq = hidden_seq.squeeze(0)
@@ -1391,6 +1409,13 @@ def parse_args() -> argparse.Namespace:
         "--prior-residual-state-features",
         default="",
         help="Comma-separated prior feature columns to feed to an auxiliary residual-state MLP, e.g. 0,3.",
+    )
+    parser.add_argument(
+        "--prior-input",
+        choices=["none", "log-probs"],
+        default="none",
+        help="Show the residual what the prior predicts: log-probs adds a zero-initialized projection of each "
+        "position's prior log-probabilities to the GRU's input, so training starts from the model without it.",
     )
     parser.add_argument(
         "--prior-residual-gate-max",
@@ -2728,6 +2753,10 @@ def main() -> None:
             f"invalid --prior-residual-state-features {invalid_state_features}; "
             f"feature count is {prior_gate_feature_count}"
         )
+    if args.prior_input != "none" and args.count_prior != "frozen":
+        raise ValueError("--prior-input requires --count-prior frozen")
+    if args.prior_input != "none" and args.token_feedback != "none":
+        raise ValueError("--prior-input is not implemented for --token-feedback")
     model = SegmentMemoryLM(
         vocab.size,
         args.embedding_size,
@@ -2760,6 +2789,7 @@ def main() -> None:
         retrieval_aux_weight=args.retrieval_aux_weight,
         utility_aux_weight=args.utility_aux_weight,
         utility_temperature=args.utility_temperature,
+        prior_input=args.prior_input,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
