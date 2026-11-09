@@ -3293,6 +3293,7 @@ def main() -> None:
             memory: list[MemoryEntry] | StreamMemory | None = [] if args.train_streams == 1 else None
             carried_hidden: torch.Tensor | None = None
             epoch_profile = EpochProfile()
+            epoch_loss_sum = 0.0
             stream_length = len(train_segments) if args.train_streams == 1 else len(stream_segments[0])
             for offset in range(0, stream_length, args.segments_per_update):
                 step += 1
@@ -3368,7 +3369,9 @@ def main() -> None:
                     continue
                 step_profile.updates += 1
                 step_profile.tokens += tokens
-                train_nll = float(loss.item()) / tokens
+                loss_value = float(loss.item())
+                train_nll = loss_value / tokens
+                epoch_loss_sum += loss_value
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite training loss at epoch={epoch} step={step}")
                 t0 = time.perf_counter()
@@ -3509,7 +3512,7 @@ def main() -> None:
             row = SegmentMemoryRow(
                 epoch=epoch,
                 step=step,
-                train_nll=None,
+                train_nll=epoch_loss_sum / epoch_profile.tokens if epoch_profile.tokens else None,
                 val_nll=val_nll,
                 val_ppl=val_ppl,
                 val_bpc=val_bpc,
