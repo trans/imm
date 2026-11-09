@@ -1611,7 +1611,7 @@ def parse_args() -> argparse.Namespace:
         help="Depth evidence written elsewhere (mobius, say), used by --prior-input depth-evidence or both in "
         "place of imm's own: PREFIX.json, PREFIX.train_depth_evidence.dat and PREFIX.eval_depth_evidence.dat, "
         "float16, shape (rows, depth, vocab + 1) in depth_evidence_chunk's layout. Any depth; the json's "
-        "digests must match this run's ids and vocabulary.",
+        "digests must match this run's ids and vocabulary, and its depth_evidence section may name the files.",
     )
     parser.add_argument(
         "--prior-residual-gate-max",
@@ -2532,10 +2532,20 @@ def load_or_build_depth_evidence(
     return train_rows, prior_rows_to_device(eval_rows, 0, eval_rows.shape[0], device)
 
 
+def external_evidence_entry(meta: dict, split: str) -> dict:
+    """What the json says about split's ("train" or "eval") evidence file:
+    meta["depth_evidence"][split] (mobius_prior_rows_v2), else {}. Top-level
+    "train"/"eval" objects aren't read: in mobius's v1 json they named the
+    log-prob files."""
+    section = meta.get("depth_evidence")
+    entry = section.get(split) if isinstance(section, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
 def external_evidence_path(prefix: Path, meta: dict, split: str) -> Path:
-    """The .dat for split ("train" or "eval"): meta[split]["path"], relative to
-    the json, if the json names one, else PREFIX.<split>_depth_evidence.dat."""
-    named = meta.get(split, {}).get("path") if isinstance(meta.get(split), dict) else None
+    """The .dat for split: its "path" in the json, relative to the json, if
+    there is one, else PREFIX.<split>_depth_evidence.dat."""
+    named = external_evidence_entry(meta, split).get("path")
     if named:
         return prefix.parent / named
     return prefix.parent / f"{prefix.name}.{split}_depth_evidence.dat"
@@ -2573,12 +2583,15 @@ def load_external_depth_evidence(
             raise ValueError(f"{path}: {size} bytes isn't {row_count} rows x depth x {width} float16")
         depth = size // (row_count * width * itemsize)
         shape = (row_count, depth, width)
-        named = meta.get(split, {}).get("shape") if isinstance(meta.get(split), dict) else None
+        named = external_evidence_entry(meta, split).get("shape")
         if named is not None and tuple(named) != shape:
             raise ValueError(f"{meta_path}: {split} shape {tuple(named)} doesn't match the file's {shape}")
         rows[split] = np.memmap(path, dtype=np.float16, mode="r", shape=shape)
     if rows["train"].shape[1] != rows["eval"].shape[1]:
         raise ValueError(f"{prefix}: train depth {rows['train'].shape[1]} != eval depth {rows['eval'].shape[1]}")
+    named_depth = meta.get("depth_evidence", {}).get("depth") if isinstance(meta.get("depth_evidence"), dict) else None
+    if named_depth is not None and named_depth != rows["train"].shape[1]:
+        raise ValueError(f"{meta_path}: depth_evidence.depth {named_depth} != the files' {rows['train'].shape[1]}")
     print(
         f"depth_evidence external={prefix} train_shape={rows['train'].shape} eval_shape={rows['eval'].shape} "
         f"builder={meta.get('builder')!r} cross_fit={json.dumps(meta.get('cross_fit'))}",

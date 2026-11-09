@@ -83,14 +83,26 @@ class ExternalEvidenceTest(unittest.TestCase):
 
     def test_paths_and_shapes_named_in_the_json(self) -> None:
         (self.dir / "ext.train_depth_evidence.dat").rename(self.dir / "elsewhere.dat")
-        self.meta["train"] = {"path": "elsewhere.dat", "shape": [len(self.train_ids) - 1, DEPTH, self.vocab.size + 1]}
+        shape = [len(self.train_ids) - 1, DEPTH, self.vocab.size + 1]
+        self.meta["depth_evidence"] = {"depth": DEPTH, "train": {"path": "elsewhere.dat", "shape": shape}}
         self.write_meta()
         train, _ = self.load()
         self.assertEqual(train.shape[1], DEPTH)
-        self.meta["train"]["shape"] = [len(self.train_ids) - 1, DEPTH + 1, self.vocab.size + 1]
+        self.meta["depth_evidence"]["train"]["shape"] = [shape[0], DEPTH + 1, shape[2]]
         self.write_meta()
         with self.assertRaisesRegex(ValueError, "shape"):
             self.load()
+        self.meta["depth_evidence"] = {"depth": DEPTH + 1, "train": {"path": "elsewhere.dat"}}
+        self.write_meta()
+        with self.assertRaisesRegex(ValueError, "depth"):
+            self.load()
+
+    def test_top_level_train_and_eval_are_not_the_evidence(self) -> None:
+        # mobius_prior_rows_v1 named its log-prob files there.
+        self.meta["train"] = {"path": "log_probs.dat", "shape": [len(self.train_ids) - 1, self.vocab.size]}
+        self.write_meta()
+        train, _ = self.load()
+        self.assertEqual(train.shape[1], DEPTH)
 
     def test_refuses_rows_for_other_text(self) -> None:
         self.meta["eval_digest"] = digest(self.eval_ids[:-1])
