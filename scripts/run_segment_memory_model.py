@@ -2361,7 +2361,15 @@ def check_cross_fit_args(args: argparse.Namespace) -> None:
 
 
 def count_prior_cache_matches(cache: dict, meta: dict[str, object]) -> bool:
-    return cache.get("meta") == meta
+    stored = cache.get("meta")
+    if not isinstance(stored, dict):
+        return False
+    if meta.get("theta_json_digest") is not None:
+        # The seed only picks the positions the gate is fitted on, and with
+        # theta from a file there's no fitting: every seed builds the same rows.
+        stored = {k: v for k, v in stored.items() if k != "seed"}
+        meta = {k: v for k, v in meta.items() if k != "seed"}
+    return stored == meta
 
 
 @torch.no_grad()
