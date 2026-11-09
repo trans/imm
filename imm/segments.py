@@ -85,7 +85,8 @@ def rule_segments(
     - word: each segment is a word and the whitespace after it (the matches
       of the regex \\S+\\s*, with punctuation part of the word), split at
       max_depth;
-    - hybrid: the unique length, extended to the next word boundary.
+    - hybrid: the unique length, extended to the next word boundary, or cut
+      back to the last one within max_depth if the extension passes it.
     All are capped at max_depth and never cover a text's last character.
     space_ids are the IDs of whitespace characters."""
     if rule not in SEGMENT_RULES:
@@ -115,18 +116,29 @@ def word_lengths(
 ) -> np.ndarray:
     """For each position p, the length of a segment that starts at p, runs at
     least at_least[p] characters, and then ends where the next word begins
-    (or at the text's end), capped at max_depth and short of the last
-    character. With at_least all ones, that is the word rule."""
+    (or at the text's end). If that is more than max_depth characters, it
+    ends instead where the last word within max_depth begins, so it still
+    ends on a word; only a word longer than max_depth is cut. Never covers
+    the text's last character. With at_least all ones, that is the word
+    rule."""
     n = len(text)
     if n == 0:
         return np.zeros(0, dtype=np.int64)
     pos = np.arange(n)
     starts = word_starts(text, space_ids)
+    last = len(starts) - 1
     reach = pos + np.maximum(at_least, 1)  # the segment ends at or after here
     i = np.searchsorted(starts, reach, side="left")
-    end = np.where(i < len(starts), starts[np.minimum(i, len(starts) - 1)], n)
+    end = np.where(i <= last, starts[np.minimum(i, max(last, 0))], n) if len(starts) else np.full(n, n)
+    if len(starts):
+        j = np.searchsorted(starts, pos + max_depth, side="right") - 1  # the last word start within reach of the cap
+        back = starts[np.maximum(j, 0)]
+        backed = np.where((j >= 0) & (back > pos), back, pos + max_depth)
+    else:
+        backed = pos + max_depth
+    end = np.where(end - pos > max_depth, backed, end)
     cap = n - 1 - pos  # a segment may not cover the last character
-    return np.maximum(np.minimum(np.minimum(end - pos, max_depth), cap), 1)
+    return np.maximum(np.minimum(end - pos, cap), 1)
 
 
 def walk(lengths: np.ndarray) -> list[tuple[int, int]]:

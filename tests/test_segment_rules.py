@@ -51,13 +51,22 @@ class SegmentRuleTest(unittest.TestCase):
             self.assertEqual(segments[-1][1], len(ids) - 1)
             for (a, b), (c, _) in zip(segments, segments[1:]):
                 self.assertEqual(b, c)  # contiguous
+            word_start = [i for i in range(1, len(text)) if text[i - 1].isspace() and not text[i].isspace()]
             for a, b in segments:
                 length = b - a
                 self.assertLessEqual(length, max_depth)
-                if length < max_depth and b < len(ids) - 1:
-                    self.assertGreaterEqual(length, min(int(unique[a]), len(ids) - 1 - a))
+                if b == len(ids) - 1:
+                    continue  # the text's end
+                inside = [w for w in word_start if a < w <= a + max_depth]
+                if inside:
                     # ends where a word begins: a space, then a non-space
-                    self.assertTrue(text[b - 1].isspace() and not text[b].isspace(), (a, b, text[a:b + 1]))
+                    self.assertIn(b, word_start, (a, b, text[a:b + 1]))
+                    nxt = next(w for w in word_start if w >= a + int(unique[a]))
+                    # at the first word start past the unique length, or the
+                    # last one within the cap if that is too far
+                    self.assertEqual(b, nxt if nxt - a <= max_depth else inside[-1], (a, b, text[a:b + 1]))
+                else:
+                    self.assertEqual(length, max_depth)  # one word longer than the cap
 
     def test_unknown_rule(self) -> None:
         with self.assertRaises(ValueError):
