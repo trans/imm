@@ -31,6 +31,7 @@ from imm.count_gate import (
     train_gate,
 )
 from imm.run_ids import prefixed_path, resolve_run_id
+from imm.segments import unique_segments
 from imm.skip_horizon_features import (
     FEATURE_NAMES as SKIP_HORIZON_FEATURE_NAMES,
     blend_log_prob_rows,
@@ -290,59 +291,6 @@ class GatedCrossAttentionBlock(nn.Module):
         if return_diagnostics:
             return hidden, stats
         return hidden
-
-
-class PrefixCountTrie:
-    def __init__(self, vocab_size: int) -> None:
-        self.vocab_size = vocab_size
-        self.counts: list[int] = [0]
-        self.children: list[dict[int, int]] = [{}]
-
-    def insert_suffixes(self, ids: list[int], max_depth: int) -> None:
-        limit = len(ids)
-        for start in range(limit):
-            node = 0
-            self.counts[node] += 1
-            end = min(limit, start + max_depth)
-            for pos in range(start, end):
-                token = ids[pos]
-                child = self.children[node].get(token)
-                if child is None:
-                    child = len(self.counts)
-                    self.children[node][token] = child
-                    self.counts.append(0)
-                    self.children.append({})
-                node = child
-                self.counts[node] += 1
-
-
-def segment_ids(
-    ids: list[int],
-    trie: PrefixCountTrie,
-    max_depth: int,
-    unique_threshold: int,
-) -> list[tuple[int, int]]:
-    segments: list[tuple[int, int]] = []
-    pos = 0
-    input_limit = len(ids) - 1
-    while pos < input_limit:
-        start = pos
-        node = 0
-        depth = 0
-        while pos < input_limit and depth < max_depth:
-            token = ids[pos]
-            child = trie.children[node].get(token)
-            pos += 1
-            depth += 1
-            if child is None:
-                break
-            node = child
-            if trie.counts[node] <= unique_threshold:
-                break
-        if pos == start:
-            pos += 1
-        segments.append((start, pos))
-    return segments
 
 
 class SegmentMemoryLM(nn.Module):
@@ -2745,10 +2693,7 @@ def main() -> None:
     if args.prior_residual_gate != "none" and args.count_prior != "frozen":
         raise ValueError("--prior-residual-gate requires --count-prior frozen")
 
-    trie = PrefixCountTrie(vocab.size)
-    trie.insert_suffixes(train_ids_list, args.max_depth)
-    train_segments = segment_ids(train_ids_list, trie, args.max_depth, args.unique_threshold)
-    eval_segments = segment_ids(eval_ids_list, trie, args.max_depth, args.unique_threshold)
+    train_segments, eval_segments = unique_segments(train_ids_list, eval_ids_list, args.max_depth, args.unique_threshold)
     mean_segment_len, max_segment_len = segment_stats(train_segments)
 
     prior_residual_gate_max = (

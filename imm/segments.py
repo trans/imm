@@ -1,0 +1,81 @@
+"""Cut text into variable-length segments by how often each stretch occurs in
+the training text.
+
+A segment starting at position p runs to the first length L at which
+text[p:p+L] occurs at most `unique_threshold` times in the training text
+(or not at all). It stops sooner at `max_depth` characters, and it never
+covers a text's last character, which is only ever a target.
+
+This replaces a trie of every training substring up to `max_depth`
+characters, which took ~255 bytes a node and ~6-9 nodes a character (about
+8 GB for 4.75M characters). Here the substrings of each length are numbered
+with one `np.unique` per length. A position drops out once its substring is
+rare. Its longer substrings are rarer still, and no substring that is still
+common has it as a prefix, so dropping it changes no remaining count.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import numpy as np
+
+
+def unique_segments(
+    train_ids: Sequence[int],
+    eval_ids: Sequence[int],
+    max_depth: int,
+    unique_threshold: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Segments of the training and evaluation texts, both cut by counts in
+    the training text alone. Each is a list of (start, end) pairs."""
+    train = np.asarray(train_ids, dtype=np.int64)
+    held = np.asarray(eval_ids, dtype=np.int64)
+    train_lengths, eval_lengths = segment_lengths([train, held], max_depth, unique_threshold)
+    return walk(train_lengths), walk(eval_lengths)
+
+
+def segment_lengths(texts: list[np.ndarray], max_depth: int, unique_threshold: int) -> list[np.ndarray]:
+    """For each text, the length of a segment starting at each position.
+    Counts come from texts[0]; a substring is counted only where it lies
+    wholly inside it. Entries at a text's last position are meaningless."""
+    sizes = [len(t) for t in texts]
+    x = np.concatenate(texts) if sum(sizes) else np.zeros(0, dtype=np.int64)
+    n = len(x)
+    ends = np.repeat(np.cumsum(sizes), sizes)  # the end of each position's own text
+    cap = ends - 1 - np.arange(n)  # a segment may not cover the last character
+    lengths = np.minimum(cap, max_depth)  # if nothing ever becomes rare
+    rare_at_most = max(unique_threshold, 0)
+    base = int(x.max()) + 1 if n else 1
+
+    pos = np.arange(n)  # positions whose substring is still common
+    code = np.zeros(n, dtype=np.int64)  # dense number of text[p:p+L-1]
+    for depth in range(1, max_depth + 1):
+        fits = pos + depth <= ends[pos]
+        pos, code = pos[fits], code[fits]
+        if not len(pos):
+            break
+        keys = code * base + x[pos + depth - 1]
+        _, code = np.unique(keys, return_inverse=True)
+        counts = np.bincount(code[pos < sizes[0]], minlength=int(code.max()) + 1)
+        rare = counts[code] <= rare_at_most
+        hit = pos[rare]
+        lengths[hit] = np.minimum(depth, cap[hit])
+        pos, code = pos[~rare], code[~rare]
+
+    lengths = np.maximum(lengths, 1)
+    bounds = np.cumsum([0, *sizes])
+    return [lengths[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+
+
+def walk(lengths: np.ndarray) -> list[tuple[int, int]]:
+    """Segments from position 0, each starting where the last one ended."""
+    steps = lengths.tolist()
+    limit = len(steps) - 1
+    segments = []
+    pos = 0
+    while pos < limit:
+        end = pos + steps[pos]
+        segments.append((pos, end))
+        pos = end
+    return segments
