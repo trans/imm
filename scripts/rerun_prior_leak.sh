@@ -1,8 +1,8 @@
 #!/bin/sh
 # Rerun the residual with the training prior cross-fitted (5a49012), against
 # the leaky prior, at prior strength 1.0 and 0.75: a 2x2 on Tiny Shakespeare's
-# canonical split, then on Gutenberg 5M. One run at a time (Gutenberg peaks
-# near 9 GB of RAM and takes about an hour an epoch). Each corpus's first
+# canonical split, then on Gutenberg 5M. One run at a time (a Gutenberg run
+# peaks near 2.6 GB of RAM and takes about 20 minutes on a GPU). Each corpus's first
 # cross-fitted run builds its prior cache; the rest reuse it. After each
 # corpus, scripts/prior_row_ppl.py reports the prior on training rows
 # against held-out for both caches.
