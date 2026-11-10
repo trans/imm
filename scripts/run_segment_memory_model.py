@@ -1698,6 +1698,13 @@ def parse_args() -> argparse.Namespace:
         help="score held-out targets from this text (the clean original of a typo'd --eval-input); "
         "the model, prior and segments read --eval-input",
     )
+    parser.add_argument(
+        "--eval-residual-input",
+        type=Path,
+        default=None,
+        help="the residual's held-out characters come from this text (a typo'd copy of --eval-input); "
+        "the prior, evidence, segments and targets stay on --eval-input: a prior that repairs every typo",
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--progress-every-steps", type=int, default=0)
     parser.add_argument("--count-prior", choices=["none", "frozen"], default="none")
@@ -2828,19 +2835,26 @@ def main() -> None:
     # None for the targets themselves).
     eval_score_ids = eval_ids
     eval_input_ids: torch.Tensor | None = None
-    if args.eval_clean_targets is not None:
-        clean_source_text = read_text(args.eval_clean_targets)
-        clean_text = clean_source_text[: args.eval_max_chars] if args.eval_max_chars is not None else clean_source_text
-        clean_ids_list = vocab.encode(clean_text)
-        if len(clean_ids_list) != len(eval_ids_list):
+    if args.eval_clean_targets is not None and args.eval_residual_input is not None:
+        raise ValueError("--eval-clean-targets and --eval-residual-input are two different tests: give one")
+
+    def aligned_eval_ids(path: Path, flag: str) -> list[int]:
+        source = read_text(path)
+        other = vocab.encode(source[: args.eval_max_chars] if args.eval_max_chars is not None else source)
+        if len(other) != len(eval_ids_list):
             raise ValueError(
-                f"--eval-clean-targets has {len(clean_ids_list)} characters, --eval-input {len(eval_ids_list)}: "
+                f"{flag} has {len(other)} characters, --eval-input {len(eval_ids_list)}: "
                 "they must line up (substitutions only)"
             )
-        eval_score_ids = torch.tensor(clean_ids_list, dtype=torch.long, device=device)
+        changed = sum(a != b for a, b in zip(other, eval_ids_list))
+        print(f"{flag.lstrip('-').replace('-', '_')}={path} eval_chars_changed={changed}", flush=True)
+        return other
+
+    if args.eval_clean_targets is not None:
+        eval_score_ids = torch.tensor(aligned_eval_ids(args.eval_clean_targets, "--eval-clean-targets"), dtype=torch.long, device=device)
         eval_input_ids = eval_ids
-        changed = sum(a != b for a, b in zip(clean_ids_list, eval_ids_list))
-        print(f"eval_clean_targets={args.eval_clean_targets} eval_chars_changed={changed}", flush=True)
+    if args.eval_residual_input is not None:
+        eval_input_ids = torch.tensor(aligned_eval_ids(args.eval_residual_input, "--eval-residual-input"), dtype=torch.long, device=device)
     train_unigram = unigram_probs(train_ids_list, vocab.size) if args.input_noise > 0.0 else None
     train_prior_log_probs: PriorRows | None = None
     eval_prior_log_probs: torch.Tensor | None = None
