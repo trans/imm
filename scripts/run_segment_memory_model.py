@@ -1640,6 +1640,17 @@ def apply_config_defaults(parser: argparse.ArgumentParser, config_path: Path) ->
     parser.set_defaults(**defaults)
 
 
+def scheduled_lr(update: int, total: int, lr: float, min_lr: float, warmup: int) -> float:
+    """--lr-schedule cosine's learning rate for update `update` (0-based) of
+    `total`: a linear rise over the first `warmup` updates, then a cosine from lr
+    down toward min_lr over the rest. transformer_baseline.py's lr_at, so imm and
+    the transformer decay alike."""
+    if update < warmup:
+        return lr * (update + 1) / (warmup + 1)
+    frac = min(1.0, (update - warmup) / max(1, total - warmup))
+    return min_lr + 0.5 * (1.0 + math.cos(math.pi * frac)) * (lr - min_lr)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a char LM with trie-derived variable segments and attention over segment states.")
     parser.add_argument("--config", type=Path, default=None, help="Load JSON defaults before parsing CLI overrides.")
@@ -1758,6 +1769,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("constant", "cosine"),
+        default="constant",
+        help="constant: --lr throughout, as before. cosine: --lr-warmup updates rising to --lr, then a cosine "
+        "fall toward --min-lr, reached at the end of --epochs (transformer_baseline.py's schedule). It follows "
+        "the update count, so a resumed run continues it when given the same --epochs",
+    )
+    parser.add_argument("--min-lr", type=float, default=1e-4, help="where --lr-schedule cosine ends")
+    parser.add_argument("--lr-warmup", type=int, default=0, help="updates of linear warm-up for --lr-schedule cosine")
     parser.add_argument(
         "--dropout",
         type=float,
@@ -3778,6 +3799,12 @@ def main() -> None:
                     f"best_epoch={best_epoch} best_step={best_step} best_val_ppl={best_val_ppl:.3f}",
                     flush=True,
                 )
+        if args.lr_schedule == "cosine" and not (0.0 <= args.min_lr <= args.lr and args.lr_warmup >= 0):
+            raise ValueError("--lr-schedule cosine needs 0 <= --min-lr <= --lr and --lr-warmup >= 0")
+        updates_per_epoch = math.ceil(
+            (len(train_segments) if args.train_streams == 1 else len(stream_segments[0])) / args.segments_per_update
+        )
+        total_updates = args.epochs * updates_per_epoch
         for epoch in range(start_epoch, args.epochs + 1):
             model.train()
             memory: list[MemoryEntry] | StreamMemory | None = [] if args.train_streams == 1 else None
@@ -3810,6 +3837,9 @@ def main() -> None:
                 pending = prefetcher.submit(update_spans(0))
             for offset in range(0, stream_length, args.segments_per_update):
                 step += 1
+                if args.lr_schedule == "cosine":
+                    for group in optimizer.param_groups:
+                        group["lr"] = scheduled_lr(step - 1, total_updates, args.lr, args.min_lr, args.lr_warmup)
                 step_profile = EpochProfile()
                 t0 = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
@@ -4087,7 +4117,8 @@ def main() -> None:
                 f"attn_top={mean_attn_top_weight if mean_attn_top_weight is not None else float('nan'):.3f} "
                 f"prev_w={mean_attn_prev_weight if mean_attn_prev_weight is not None else float('nan'):.3f} "
                 f"top_prev={mean_attn_top_is_prev if mean_attn_top_is_prev is not None else float('nan'):.3f} "
-                f"runtime_sec={row.runtime_sec:.2f} peak_rss_mb={row.peak_rss_kb / 1024:.1f}",
+                f"runtime_sec={row.runtime_sec:.2f} peak_rss_mb={row.peak_rss_kb / 1024:.1f} "
+                f"lr={optimizer.param_groups[0]['lr']:.4g}",
                 flush=True,
             )
             t0 = time.perf_counter()
