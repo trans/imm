@@ -2771,7 +2771,8 @@ def load_prior_rows(
     log_probs = rows_section_memmaps(prefix, meta, meta_path, "log_probs", rows, vocab.size)
     features, names = None, None
     if meta.get("gate_features") is not None:
-        names = meta["gate_features"].get("feature_names")
+        section = meta["gate_features"]
+        names = section.get("feature_names", section.get("names"))  # mobius's first port wrote "names"
         if not isinstance(names, list) or not names:
             raise ValueError(f"{meta_path}: gate_features needs feature_names")
         features = rows_section_memmaps(prefix, meta, meta_path, "gate_features", rows, len(names))

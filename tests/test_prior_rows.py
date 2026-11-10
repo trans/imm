@@ -77,6 +77,13 @@ class PriorRowsTest(unittest.TestCase):
         self.assertEqual(names, NAMES)
         self.assertEqual(meta["builder"], "a")
 
+    def test_feature_names_under_names(self) -> None:
+        prefix, _ = self.write_prefix("n")
+        meta = json.loads((self.dir / "n.json").read_text())
+        meta["gate_features"]["names"] = meta["gate_features"].pop("feature_names")
+        (self.dir / "n.json").write_text(json.dumps(meta))
+        self.assertEqual(self.load(prefix)[4], NAMES)
+
     def test_features_are_optional(self) -> None:
         prefix, _ = self.write_prefix("b", features=False)
         *_, train_f, eval_f, names, _ = self.load(prefix)
