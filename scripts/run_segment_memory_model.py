@@ -1370,6 +1370,8 @@ class SegmentMemoryLM(nn.Module):
         prior_gate_features: torch.Tensor | None = None,
         prior_evidence: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
+        score_mask: np.ndarray | None = None,
+        collect_stats: bool = False,
     ) -> tuple[torch.Tensor, int, StreamMemory, torch.Tensor, dict[str, float]]:
         """segment_loss for B independent streams at once. Stream b runs the
         segments stream_segments[b], in order, with its own memory and
@@ -1381,7 +1383,13 @@ class SegmentMemoryLM(nn.Module):
         stream's span (its first segment's start to its last segment's end),
         the streams' spans one after another (prior_rows_for_spans). memory is
         (records [B, M, H], positions [B, M]) or None for empty; the carried
-        state is [1, B, H]."""
+        state is [1, B, H].
+
+        score_mask ([B, K] bool), if given, scores only the segments it marks;
+        the rest are run, feeding memory and the carried state, unscored (the
+        burn-in of evaluate's streams). collect_stats adds what evaluate's
+        rows report and this path can give: the residual gate, the gates of
+        the attention blocks, first-token and later-token losses."""
         self.check_streams_supported(token_feedback)
         device = ids.device
         streams = len(stream_segments)
@@ -1436,6 +1444,8 @@ class SegmentMemoryLM(nn.Module):
         record_ends_t = torch.from_numpy(ends - 1).to(device)
         stream_index = torch.arange(streams, device=device)
         states = []
+        context_norm_sum = 0.0
+        scored_k = None if score_mask is None else torch.from_numpy(np.ascontiguousarray(score_mask)).to(device)
         for k in range(count):
             width = int(lengths[:, k].max())
             initial_hidden = next_hidden if carry_hidden else zero_hidden
@@ -1451,6 +1461,9 @@ class SegmentMemoryLM(nn.Module):
                 state = block(
                     state, mem, query_positions=query_positions, memory_positions=memory_positions, use_rope=self.use_rope
                 )
+            if collect_stats:
+                counted = valid_t[:, k, :width] if scored_k is None else valid_t[:, k, :width] & scored_k[:, k, None]
+                context_norm_sum += float((state - hidden_seq).norm(dim=-1)[counted].sum().item())
             last = lengths_t[:, k] - 1
             terminal = state[stream_index, last]  # [B, H]
             terminal_context = terminal - hidden_seq[stream_index, last]
@@ -1473,17 +1486,46 @@ class SegmentMemoryLM(nn.Module):
             states.append(F.pad(state, (0, 0, 0, longest - width)))
 
         logits = self.gru_head(self.drop(torch.stack(states, dim=1)[valid_t]))  # [N, V], (stream, segment, offset) order
-        logits, residual_logits, _, _ = self.apply_prior_residual(
+        logits, residual_logits, residual_alpha, _ = self.apply_prior_residual(
             logits,
             prior_log_probs[flat_rows] if prior_log_probs is not None else None,
             prior_gate_features[flat_rows] if prior_gate_features is not None else None,
         )
-        loss = F.cross_entropy(logits, ids[flat_positions + 1], reduction="sum")
-        if self.training and residual_logits is not None and self.prior_residual_l2 > 0.0:
-            loss = loss + self.prior_residual_l2 * residual_logits.square().mean(dim=1).sum()
+        targets = ids[flat_positions + 1]
         stats = empty_stats()
-        stats["token_count"] = float(flat_positions.numel())
-        return loss, int(flat_positions.numel()), (records, record_positions), next_hidden, stats
+        if score_mask is None and not collect_stats:
+            loss = F.cross_entropy(logits, targets, reduction="sum")
+            if self.training and residual_logits is not None and self.prior_residual_l2 > 0.0:
+                loss = loss + self.prior_residual_l2 * residual_logits.square().mean(dim=1).sum()
+            stats["token_count"] = float(flat_positions.numel())
+            return loss, int(flat_positions.numel()), (records, record_positions), next_hidden, stats
+
+        if score_mask is None:
+            keep = torch.ones(flat_positions.numel(), dtype=torch.bool, device=device)
+        else:
+            if score_mask.shape != (streams, count):
+                raise ValueError(f"score_mask must be {(streams, count)}, got {score_mask.shape}")
+            keep = torch.from_numpy(np.broadcast_to(score_mask[:, :, None], valid.shape)[valid]).to(device)
+        first = torch.from_numpy(np.broadcast_to(offsets[None, None, :] == 0, valid.shape)[valid]).to(device)[keep]
+        token_losses = F.cross_entropy(logits[keep], targets[keep], reduction="none")
+        loss = token_losses.sum()
+        if self.training and residual_logits is not None and self.prior_residual_l2 > 0.0:
+            loss = loss + self.prior_residual_l2 * residual_logits[keep].square().mean(dim=1).sum()
+        scored = int(keep.sum().item())
+        stats["token_count"] = float(scored)
+        if collect_stats:
+            stats["context_norm_sum"] = context_norm_sum
+            stats["first_token_loss"] = float(token_losses[first].sum().item())
+            stats["first_token_count"] = float(first.sum().item())
+            stats["later_token_loss"] = float(token_losses[~first].sum().item())
+            stats["later_token_count"] = float((~first).sum().item())
+            if residual_alpha is not None:
+                stats["residual_alpha_sum"] = float(residual_alpha[keep].sum().item())
+                stats["residual_alpha_count"] = float(residual_alpha[keep].numel())
+            for block in self.gated_xattn_blocks:
+                stats["gate_sum"] += float(torch.tanh(block.gate_attn).abs().item() + torch.tanh(block.gate_mlp).abs().item())
+                stats["gate_count"] += 2.0
+        return loss, scored, (records, record_positions), next_hidden, stats
 
 
 def split_streams(segments: list[tuple[int, int]], streams: int) -> list[list[tuple[int, int]]]:
@@ -1713,6 +1755,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-max-chars", type=int, default=20000)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-initial", action="store_true")
+    parser.add_argument(
+        "--eval-streams",
+        type=int,
+        default=1,
+        help="score the held-out text as this many batched streams, each warmed up on --eval-burn-in unscored "
+        "segments first (1: one stream, with every diagnostic)",
+    )
+    parser.add_argument("--eval-burn-in", type=int, default=256, help="unscored segments before each stream's own")
     parser.add_argument("--checkpoint-output", type=Path, default=None)
     parser.add_argument("--best-checkpoint-output", type=Path, default=None)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
@@ -2718,8 +2768,22 @@ def evaluate(
     skip_prior_strength: torch.Tensor | None = None,
     prior_evidence: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
+    streams: int = 1,
+    burn_in: int = 0,
+    chunk: int = 64,
 ) -> tuple[float, float, float, dict[str, float]]:
+    """Score the held-out segments. streams > 1 runs them as that many
+    batched streams (eval_stream_windows), each warmed up on burn_in unscored
+    segments before its own; with burn_in at least the segment count every
+    stream reads the whole text and the score is the one-stream score. The
+    batched rows leave the attention and no-memory diagnostics empty."""
     model.eval()
+    if streams > 1:
+        return evaluate_streams(
+            model, ids, segments, max_memory, carry_hidden, feedback_state, token_feedback, streams, burn_in, chunk,
+            prior_log_probs=prior_log_probs, prior_gate_features=prior_gate_features, prior_evidence=prior_evidence,
+            input_ids=input_ids, skip_prior=skip_prior_log_probs is not None or skip_prior_strength is not None,
+        )
     memory: list[MemoryEntry] = []
     loss, tokens, _, _, stats = model.segment_loss(
         ids,
@@ -2740,6 +2804,93 @@ def evaluate(
     if tokens == 0:
         raise ValueError("cannot evaluate no tokens")
     nll = float(loss.item()) / tokens
+    return nll, math.exp(nll) if nll <= 700.0 else float("inf"), nll / math.log(2.0), stats
+
+
+def eval_stream_windows(count: int, streams: int, burn_in: int) -> list[tuple[int, int, int, int]]:
+    """(lo, hi, score_lo, score_hi) for each stream: it runs segments lo..hi-1
+    and scores score_lo..score_hi-1. The scored ranges cut 0..count into
+    `streams` contiguous runs (lengths differing by at most one); every window
+    has the same length, the longest run plus burn_in (at most count), and
+    starts at least burn_in segments before its run, or at 0."""
+    if count <= 0 or streams < 1 or burn_in < 0:
+        raise ValueError("eval_stream_windows needs segments, at least one stream and burn_in >= 0")
+    streams = min(streams, count)
+    base, extra = divmod(count, streams)
+    bounds = np.concatenate([[0], np.cumsum([base + (i < extra) for i in range(streams)])])
+    width = min(count, base + (extra > 0) + burn_in)
+    windows = []
+    for i in range(streams):
+        score_lo, score_hi = int(bounds[i]), int(bounds[i + 1])
+        lo = max(0, score_lo - burn_in)
+        if lo + width > count:
+            lo = count - width
+        windows.append((lo, lo + width, score_lo, score_hi))
+    return windows
+
+
+@torch.no_grad()
+def evaluate_streams(
+    model: SegmentMemoryLM,
+    ids: torch.Tensor,
+    segments: list[tuple[int, int]],
+    max_memory: int,
+    carry_hidden: bool,
+    feedback_state: str,
+    token_feedback: str,
+    streams: int,
+    burn_in: int,
+    chunk: int,
+    prior_log_probs: PriorRows | None = None,
+    prior_gate_features: PriorRows | None = None,
+    prior_evidence: PriorRows | None = None,
+    input_ids: torch.Tensor | None = None,
+    skip_prior: bool = False,
+) -> tuple[float, float, float, dict[str, float]]:
+    if skip_prior:
+        raise ValueError("--eval-streams > 1 doesn't support the skip prior")
+    if chunk < 1:
+        raise ValueError("evaluate_streams needs chunk >= 1")
+    model.check_streams_supported(token_feedback)
+    windows = eval_stream_windows(len(segments), streams, burn_in)
+    width = windows[0][1] - windows[0][0]
+    index = np.arange(width)
+    score_mask = np.stack([(lo + index >= s_lo) & (lo + index < s_hi) for lo, _, s_lo, s_hi in windows])
+    device = ids.device
+    memory: StreamMemory | None = None
+    hidden: torch.Tensor | None = None
+    total_loss = 0.0
+    stats = empty_stats()
+    gates = (0.0, 0.0)
+    for c0 in range(0, width, chunk):
+        c1 = min(width, c0 + chunk)
+        stream_segments = [segments[lo + c0 : lo + c1] for lo, _, _, _ in windows]
+        spans = [(segs[0][0], segs[-1][1]) for segs in stream_segments]
+        loss, _, memory, hidden, chunk_stats = model.segment_loss_streams(
+            ids,
+            stream_segments,
+            memory,
+            max_memory,
+            carried_hidden=hidden,
+            carry_hidden=carry_hidden,
+            feedback_state=feedback_state,
+            token_feedback=token_feedback,
+            prior_log_probs=prior_rows_for_spans(prior_log_probs, spans, device),
+            prior_gate_features=prior_rows_for_spans(prior_gate_features, spans, device),
+            prior_evidence=prior_rows_for_spans(prior_evidence, spans, device),
+            input_ids=input_ids,
+            score_mask=score_mask[:, c0:c1],
+            collect_stats=True,
+        )
+        total_loss += float(loss.item())
+        gates = (chunk_stats.pop("gate_sum"), chunk_stats.pop("gate_count"))
+        merge_stats(stats, chunk_stats)
+    stats["gate_sum"], stats["gate_count"] = gates  # the blocks' gates are parameters: the same every chunk
+    tokens = stats["token_count"]
+    want = sum(end - start for start, end in segments)
+    if tokens != want:
+        raise RuntimeError(f"evaluate_streams scored {tokens} characters, expected {want}")
+    nll = total_loss / tokens
     return nll, math.exp(nll) if nll <= 700.0 else float("inf"), nll / math.log(2.0), stats
 
 
@@ -3411,6 +3562,8 @@ def main() -> None:
                 skip_prior_strength=eval_skip_prior_strength,
                 prior_evidence=eval_prior_evidence,
                 input_ids=eval_input_ids,
+                streams=args.eval_streams,
+                burn_in=args.eval_burn_in,
             )
             mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
             mean_residual_alpha = mean_or_none(val_stats["residual_alpha_sum"], val_stats["residual_alpha_count"])
@@ -3625,6 +3778,8 @@ def main() -> None:
                         skip_prior_strength=eval_skip_prior_strength,
                         prior_evidence=eval_prior_evidence,
                         input_ids=eval_input_ids,
+                        streams=args.eval_streams,
+                        burn_in=args.eval_burn_in,
                     )
                     epoch_profile.eval_sec += time.perf_counter() - t0
                     mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
@@ -3702,6 +3857,8 @@ def main() -> None:
                 skip_prior_strength=eval_skip_prior_strength,
                 prior_evidence=eval_prior_evidence,
                 input_ids=eval_input_ids,
+                streams=args.eval_streams,
+                burn_in=args.eval_burn_in,
             )
             epoch_profile.eval_sec += time.perf_counter() - t0
             mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
