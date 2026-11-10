@@ -1646,6 +1646,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=Path("data/input.txt"))
     parser.add_argument("--train-input", type=Path, default=None)
     parser.add_argument("--eval-input", type=Path, default=None)
+    parser.add_argument(
+        "--prior-rows",
+        type=Path,
+        default=None,
+        help="PREFIX of prior rows another program wrote (PREFIX.json, mobius_prior_rows_v2): its log-probs, and "
+        "gate features if it has them, replace imm's count prior; the --count-prior-* build and cache aren't used",
+    )
     parser.add_argument("--vocab-input", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("runs/segment_memory_model.csv"))
     parser.add_argument("--run-id", type=str, default=None)
@@ -1901,10 +1908,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_feature_indices(raw: str) -> list[int]:
-    if not raw.strip():
-        return []
-    return [int(part.strip()) for part in raw.split(",") if part.strip()]
+def parse_feature_indices(raw: str, names: list[str] | None = None) -> list[int]:
+    """Comma-separated feature columns, each an index or, when the rows name
+    their features, a name."""
+    out = []
+    for part in [part.strip() for part in raw.split(",") if part.strip()]:
+        if part.lstrip("-").isdigit():
+            out.append(int(part))
+        elif names is not None and part in names:
+            out.append(names.index(part))
+        else:
+            raise ValueError(f"feature {part!r} is neither an index nor one of the rows' features {names}")
+    return out
 
 
 def segment_stats(segments: list[tuple[int, int]]) -> tuple[float, int]:
@@ -2700,6 +2715,76 @@ def external_evidence_path(prefix: Path, meta: dict, split: str) -> Path:
     return prefix.parent / f"{prefix.name}.{split}_depth_evidence.dat"
 
 
+def check_rows_meta(meta: dict, meta_path: Path, train_ids: list[int], eval_ids: list[int], vocab: CharVocab) -> None:
+    """Refuses rows made for other text or another vocabulary."""
+    for split, ids in (("train", train_ids), ("eval", eval_ids)):
+        digest = meta.get(f"{split}_digest")
+        if digest != ids_digest(ids):
+            raise ValueError(f"{meta_path}: {split}_digest {digest} doesn't match this run's {split} ids")
+    if meta.get("vocab_chars") != list(vocab.chars):
+        raise ValueError(f"{meta_path}: vocab_chars don't match this run's vocabulary")
+
+
+def rows_section_memmaps(
+    prefix: Path, meta: dict, meta_path: Path, section: str, rows: dict[str, int], width: int | None
+) -> dict[str, np.memmap]:
+    """meta[section]["train"/"eval"] = {path, shape, dtype}: the two files as
+    read-only memmaps, after checking each file's size against its shape,
+    the shape against the row count, and (if given) the width. A relative
+    path is relative to the json."""
+    out = {}
+    for split, row_count in rows.items():
+        entry = meta[section].get(split)
+        if not isinstance(entry, dict) or not {"path", "shape", "dtype"} <= set(entry):
+            raise ValueError(f"{meta_path}: {section}.{split} needs path, shape and dtype")
+        path = prefix.parent / entry["path"]
+        shape, dtype = tuple(int(n) for n in entry["shape"]), np.dtype(entry["dtype"])
+        if shape[0] != row_count or (width is not None and shape[1:] != (width,)):
+            raise ValueError(f"{meta_path}: {section}.{split} shape {shape} isn't ({row_count}, {width})")
+        if path.stat().st_size != int(np.prod(shape)) * dtype.itemsize:
+            raise ValueError(f"{path}: {path.stat().st_size} bytes isn't {shape} {dtype}")
+        out[split] = np.memmap(path, dtype=dtype, mode="r", shape=shape)
+    return out
+
+
+def load_prior_rows(
+    prefix: Path,
+    train_ids: list[int],
+    eval_ids: list[int],
+    vocab: CharVocab,
+    device: torch.device,
+) -> tuple[np.memmap, torch.Tensor, np.memmap | None, torch.Tensor | None, list[str] | None, dict]:
+    """The frozen prior's rows from another program (--prior-rows), in place
+    of imm's count prior: PREFIX.json (mobius_prior_rows_v2's layout) names
+    log-prob files (log_probs: row r predicts ids[r + 1], natural log, over
+    the vocabulary) and, optionally, gate-feature files (gate_features, with
+    feature_names: what the residual's trust gate reads). Training rows stay
+    memmaps; held-out rows go to the device. Returns train and eval log-probs,
+    train and eval gate features (None without them), the feature names, and
+    the json."""
+    meta_path = prefix.parent / f"{prefix.name}.json"
+    meta = json.loads(meta_path.read_text())
+    check_rows_meta(meta, meta_path, train_ids, eval_ids, vocab)
+    rows = {"train": max(0, len(train_ids) - 1), "eval": max(0, len(eval_ids) - 1)}
+    if not isinstance(meta.get("log_probs"), dict):
+        raise ValueError(f"{meta_path}: no log_probs section")
+    log_probs = rows_section_memmaps(prefix, meta, meta_path, "log_probs", rows, vocab.size)
+    features, names = None, None
+    if meta.get("gate_features") is not None:
+        names = meta["gate_features"].get("feature_names")
+        if not isinstance(names, list) or not names:
+            raise ValueError(f"{meta_path}: gate_features needs feature_names")
+        features = rows_section_memmaps(prefix, meta, meta_path, "gate_features", rows, len(names))
+    return (
+        log_probs["train"],
+        prior_rows_to_device(log_probs["eval"], 0, rows["eval"], device),
+        None if features is None else features["train"],
+        None if features is None else prior_rows_to_device(features["eval"], 0, rows["eval"], device),
+        names,
+        meta,
+    )
+
+
 def load_external_depth_evidence(
     prefix: Path,
     train_ids: list[int],
@@ -3073,12 +3158,29 @@ def main() -> None:
     train_skip_prior_strength: PriorRows | None = None
     eval_skip_prior_strength: torch.Tensor | None = None
     prior_gate_feature_count = 0
+    prior_feature_names: list[str] | None = None
+    if args.prior_rows is not None:
+        if args.count_prior != "frozen":
+            raise ValueError("--prior-rows replaces the frozen count prior: it needs --count-prior frozen")
+        if args.skip_horizon_prior != "none" or args.skip_horizon_features != "none" or args.transition_category_features != "none":
+            raise ValueError("--prior-rows doesn't support skip-horizon or transition-category features")
     if args.count_prior == "frozen":
         prior_started = time.perf_counter()
         count_history: list[dict[str, float]] = []
         cache_meta = count_prior_cache_meta(args, train_ids_list, eval_ids_list, vocab)
         cache_loaded = False
-        if args.count_prior_cache is not None and args.count_prior_cache.exists():
+        if args.prior_rows is not None:
+            (
+                train_prior_log_probs,
+                eval_prior_log_probs,
+                train_prior_gate_features,
+                eval_prior_gate_features,
+                prior_feature_names,
+                prior_rows_meta,
+            ) = load_prior_rows(args.prior_rows, train_ids_list, eval_ids_list, vocab, device)
+            if train_prior_gate_features is not None:
+                prior_gate_feature_count = int(train_prior_gate_features.shape[1])
+        elif args.count_prior_cache is not None and args.count_prior_cache.exists():
             cache = torch.load(args.count_prior_cache, map_location="cpu", weights_only=False)
             if count_prior_cache_matches(cache, cache_meta):
                 if cache.get("format") == "mmap":
@@ -3301,16 +3403,24 @@ def main() -> None:
             train_prior_gate_features is None or eval_prior_gate_features is None
         ):
             raise ValueError("context residual gate requires count-prior feature rows; rebuild the count prior cache")
-        print(
-            f"count_prior=frozen depth={args.count_prior_depth} "
-            f"impl={args.count_prior_impl} "
-            f"theta_json={args.count_prior_theta_json} "
-            f"features={args.count_prior_extra_features} "
-            f"fit_ppl={count_history[-1]['ppl'] if count_history else float('nan'):.3f} "
-            f"cache_loaded={cache_loaded} cache={args.count_prior_cache} "
-            f"build_precompute_sec={time.perf_counter() - prior_started:.2f}",
-            flush=True,
-        )
+        if args.prior_rows is not None:
+            print(
+                f"prior_rows={args.prior_rows} builder={prior_rows_meta.get('builder')!r} "
+                f"train_shape={tuple(train_prior_log_probs.shape)} eval_shape={tuple(eval_prior_log_probs.shape)} "
+                f"gate_features={prior_feature_names} cross_fit={json.dumps(prior_rows_meta.get('cross_fit'))}",
+                flush=True,
+            )
+        else:
+            print(
+                f"count_prior=frozen depth={args.count_prior_depth} "
+                f"impl={args.count_prior_impl} "
+                f"theta_json={args.count_prior_theta_json} "
+                f"features={args.count_prior_extra_features} "
+                f"fit_ppl={count_history[-1]['ppl'] if count_history else float('nan'):.3f} "
+                f"cache_loaded={cache_loaded} cache={args.count_prior_cache} "
+                f"build_precompute_sec={time.perf_counter() - prior_started:.2f}",
+                flush=True,
+            )
         if args.skip_horizon_prior != "none":
             if train_prior_log_probs is None or eval_prior_log_probs is None:
                 raise ValueError("skip horizon prior requires count-prior log-prob rows")
@@ -3376,9 +3486,13 @@ def main() -> None:
     prior_residual_gate_max = (
         args.prior_residual_gate_max if args.prior_residual_gate_max > 0.0 else 2.0 * args.prior_residual_scale
     )
-    prior_residual_state_features = parse_feature_indices(args.prior_residual_state_features)
+    prior_residual_state_features = parse_feature_indices(args.prior_residual_state_features, prior_feature_names)
     if prior_residual_state_features and prior_gate_feature_count <= 0:
         raise ValueError("--prior-residual-state-features requires count-prior feature rows")
+    if any(not 0 <= i < prior_gate_feature_count for i in prior_residual_state_features):
+        raise ValueError(
+            f"--prior-residual-state-features {prior_residual_state_features} outside the {prior_gate_feature_count} feature columns"
+        )
     learned_skip_prior_modes = {"learned-distribution", "learned-horizon-distribution"}
     if args.skip_horizon_prior in learned_skip_prior_modes and prior_gate_feature_count <= 0:
         raise ValueError(f"--skip-horizon-prior {args.skip_horizon_prior} requires count-prior feature rows")
