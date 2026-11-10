@@ -32,6 +32,7 @@ from imm.count_gate import (
 )
 from imm.run_ids import prefixed_path, resolve_run_id
 from imm.segments import SEGMENT_RULES, rule_segments
+from imm.typo_noise import substitute, unigram_probs
 from imm.skip_horizon_features import (
     FEATURE_NAMES as SKIP_HORIZON_FEATURE_NAMES,
     blend_log_prob_rows,
@@ -1009,8 +1010,13 @@ class SegmentMemoryLM(nn.Module):
         skip_prior_strength: torch.Tensor | None = None,
         prior_offset: int = 0,
         prior_evidence: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int, list[MemoryEntry], torch.Tensor | None, dict[str, float]]:
+        """input_ids, if given, is what the model reads (a noisy copy of ids,
+        say); the targets are always ids."""
         if token_feedback != "none":
+            if input_ids is not None:
+                raise ValueError("input_ids isn't supported with token feedback")
             return self.segment_loss_token_feedback(
                 ids,
                 segments,
@@ -1030,8 +1036,9 @@ class SegmentMemoryLM(nn.Module):
         token_count = 0
         stats = empty_stats()
         next_carried_hidden = carried_hidden
+        source = ids if input_ids is None else input_ids
         for start, end in segments:
-            tokens = ids[start:end]
+            tokens = source[start:end]
             initial_hidden = next_carried_hidden if carry_hidden and next_carried_hidden is not None else self.zero_state(ids.device)
             embeddings = self.embed(tokens)
             if self.prior_input_proj is not None:
@@ -1333,6 +1340,7 @@ class SegmentMemoryLM(nn.Module):
         prior_log_probs: torch.Tensor | None = None,
         prior_gate_features: torch.Tensor | None = None,
         prior_evidence: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int, StreamMemory, torch.Tensor, dict[str, float]]:
         """segment_loss for B independent streams at once. Stream b runs the
         segments stream_segments[b], in order, with its own memory and
@@ -1368,7 +1376,7 @@ class SegmentMemoryLM(nn.Module):
         flat_positions = torch.from_numpy(positions[valid]).to(device)  # in (stream, segment, offset) order
         flat_rows = torch.from_numpy(rows[valid]).to(device)
 
-        embeddings = self.embed(ids[flat_positions])
+        embeddings = self.embed((ids if input_ids is None else input_ids)[flat_positions])
         if self.prior_input_proj is not None:
             if prior_log_probs is None:
                 raise ValueError("--prior-input requires count-prior rows")
@@ -1671,6 +1679,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-output", type=Path, default=None)
     parser.add_argument("--best-checkpoint-output", type=Path, default=None)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="with --resume-checkpoint: score the checkpoint on the held-out text once, write one row, and stop",
+    )
+    parser.add_argument(
+        "--input-noise",
+        type=float,
+        default=0.0,
+        help="substitute this fraction of the residual's training input characters, fresh each epoch "
+        "(unigram replacements); targets and prior rows stay clean",
+    )
+    parser.add_argument(
+        "--eval-clean-targets",
+        type=Path,
+        default=None,
+        help="score held-out targets from this text (the clean original of a typo'd --eval-input); "
+        "the model, prior and segments read --eval-input",
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--progress-every-steps", type=int, default=0)
     parser.add_argument("--count-prior", choices=["none", "frozen"], default="none")
@@ -2646,6 +2673,7 @@ def evaluate(
     skip_prior_log_probs: torch.Tensor | None = None,
     skip_prior_strength: torch.Tensor | None = None,
     prior_evidence: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
 ) -> tuple[float, float, float, dict[str, float]]:
     model.eval()
     memory: list[MemoryEntry] = []
@@ -2663,6 +2691,7 @@ def evaluate(
         skip_prior_log_probs=skip_prior_log_probs,
         skip_prior_strength=skip_prior_strength,
         prior_evidence=prior_evidence,
+        input_ids=input_ids,
     )
     if tokens == 0:
         raise ValueError("cannot evaluate no tokens")
@@ -2752,6 +2781,10 @@ def load_checkpoint(path: Path) -> dict:
 def main() -> None:
     args = parse_args()
     check_cross_fit_args(args)
+    if args.eval_only:
+        if args.resume_checkpoint is None:
+            raise ValueError("--eval-only scores a trained model: give --resume-checkpoint")
+        args.eval_initial = True
     args.run_id = resolve_run_id(args.run_id, resume=args.resume_checkpoint is not None)
     args.output = prefixed_path(args.output, args.run_id)
     if args.checkpoint_output is None:
@@ -2791,6 +2824,24 @@ def main() -> None:
     )
     train_ids = torch.tensor(train_ids_list, dtype=torch.long, device=device)
     eval_ids = torch.tensor(eval_ids_list, dtype=torch.long, device=device)
+    # What held-out scoring predicts (eval_score_ids) and reads (eval_input_ids,
+    # None for the targets themselves).
+    eval_score_ids = eval_ids
+    eval_input_ids: torch.Tensor | None = None
+    if args.eval_clean_targets is not None:
+        clean_source_text = read_text(args.eval_clean_targets)
+        clean_text = clean_source_text[: args.eval_max_chars] if args.eval_max_chars is not None else clean_source_text
+        clean_ids_list = vocab.encode(clean_text)
+        if len(clean_ids_list) != len(eval_ids_list):
+            raise ValueError(
+                f"--eval-clean-targets has {len(clean_ids_list)} characters, --eval-input {len(eval_ids_list)}: "
+                "they must line up (substitutions only)"
+            )
+        eval_score_ids = torch.tensor(clean_ids_list, dtype=torch.long, device=device)
+        eval_input_ids = eval_ids
+        changed = sum(a != b for a, b in zip(clean_ids_list, eval_ids_list))
+        print(f"eval_clean_targets={args.eval_clean_targets} eval_chars_changed={changed}", flush=True)
+    train_unigram = unigram_probs(train_ids_list, vocab.size) if args.input_noise > 0.0 else None
     train_prior_log_probs: PriorRows | None = None
     eval_prior_log_probs: torch.Tensor | None = None
     train_prior_gate_features: PriorRows | None = None
@@ -3296,7 +3347,7 @@ def main() -> None:
             t0 = time.perf_counter()
             val_nll, val_ppl, val_bpc, val_stats = evaluate(
                 model,
-                eval_ids,
+                eval_score_ids,
                 eval_segments,
                 args.max_memory,
                 carry_hidden=args.carry_hidden,
@@ -3307,6 +3358,7 @@ def main() -> None:
                 skip_prior_log_probs=eval_skip_prior_log_probs,
                 skip_prior_strength=eval_skip_prior_strength,
                 prior_evidence=eval_prior_evidence,
+                input_ids=eval_input_ids,
             )
             mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
             mean_residual_alpha = mean_or_none(val_stats["residual_alpha_sum"], val_stats["residual_alpha_count"])
@@ -3327,7 +3379,7 @@ def main() -> None:
                 later_token_ppl,
             ) = diagnostic_row_stats(val_stats)
             row = SegmentMemoryRow(
-                epoch=0,
+                epoch=start_epoch - 1 if args.eval_only else 0,
                 step=step,
                 train_nll=None,
                 val_nll=val_nll,
@@ -3362,6 +3414,9 @@ def main() -> None:
                 f"peak_rss_mb={row.peak_rss_kb / 1024:.1f}",
                 flush=True,
             )
+            if args.eval_only:
+                print(f"eval_only checkpoint={args.resume_checkpoint} val_ppl={val_ppl:.4f}", flush=True)
+                return
             if best_val_ppl is None or val_ppl < best_val_ppl:
                 best_val_ppl = val_ppl
                 best_epoch = 0
@@ -3389,6 +3444,13 @@ def main() -> None:
             carried_hidden: torch.Tensor | None = None
             epoch_profile = EpochProfile()
             epoch_loss_sum = 0.0
+            train_input_ids: torch.Tensor | None = None
+            if train_unigram is not None:
+                noisy, changed = substitute(
+                    train_ids_list, args.input_noise, train_unigram, np.random.default_rng([args.seed, epoch])
+                )
+                train_input_ids = torch.from_numpy(noisy).to(device)
+                print(f"epoch={epoch} input_noise={args.input_noise} chars_changed={changed}", flush=True)
             stream_length = len(train_segments) if args.train_streams == 1 else len(stream_segments[0])
             for offset in range(0, stream_length, args.segments_per_update):
                 step += 1
@@ -3412,6 +3474,7 @@ def main() -> None:
                         prior_log_probs=prior_rows_for_spans(train_prior_log_probs, spans, device),
                         prior_gate_features=prior_rows_for_spans(train_prior_gate_features, spans, device),
                         prior_evidence=prior_rows_for_spans(train_prior_evidence, spans, device),
+                        input_ids=train_input_ids,
                     )
                     batch_segments = batch_streams[0]
                 else:
@@ -3458,6 +3521,7 @@ def main() -> None:
                         skip_prior_strength=batch_skip_prior_strength,
                         prior_offset=prior_offset,
                         prior_evidence=batch_prior_evidence,
+                        input_ids=train_input_ids,
                     )
                 step_profile.forward_sec += time.perf_counter() - t0
                 if tokens == 0:
@@ -3497,7 +3561,7 @@ def main() -> None:
                     t0 = time.perf_counter()
                     val_nll, val_ppl, val_bpc, val_stats = evaluate(
                         model,
-                        eval_ids,
+                        eval_score_ids,
                         eval_segments,
                         args.max_memory,
                         carry_hidden=args.carry_hidden,
@@ -3508,6 +3572,7 @@ def main() -> None:
                         skip_prior_log_probs=eval_skip_prior_log_probs,
                         skip_prior_strength=eval_skip_prior_strength,
                         prior_evidence=eval_prior_evidence,
+                        input_ids=eval_input_ids,
                     )
                     epoch_profile.eval_sec += time.perf_counter() - t0
                     mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
@@ -3573,7 +3638,7 @@ def main() -> None:
             t0 = time.perf_counter()
             val_nll, val_ppl, val_bpc, val_stats = evaluate(
                 model,
-                eval_ids,
+                eval_score_ids,
                 eval_segments,
                 args.max_memory,
                 carry_hidden=args.carry_hidden,
@@ -3584,6 +3649,7 @@ def main() -> None:
                 skip_prior_log_probs=eval_skip_prior_log_probs,
                 skip_prior_strength=eval_skip_prior_strength,
                 prior_evidence=eval_prior_evidence,
+                input_ids=eval_input_ids,
             )
             epoch_profile.eval_sec += time.perf_counter() - t0
             mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
