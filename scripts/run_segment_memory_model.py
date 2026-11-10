@@ -21,6 +21,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from imm.data import CharVocab, read_text
+from imm.row_prefetch import RowPrefetcher, rows_to_device
 from imm.eval import split_text
 from imm.count_gate import (
     CountModel,
@@ -60,7 +61,9 @@ PriorRows = torch.Tensor | np.memmap
 @dataclass
 class EpochProfile:
     zero_sec: float = 0.0
+    rows_sec: float = 0.0  # gathering prior rows (from memmaps) and copying them to the device
     forward_sec: float = 0.0
+    wait_sec: float = 0.0  # loss.item(): waiting for the device to finish the forward pass
     backward_sec: float = 0.0
     clip_sec: float = 0.0
     optimizer_sec: float = 0.0
@@ -76,7 +79,10 @@ class EpochProfile:
 
     @property
     def train_sec(self) -> float:
-        return self.zero_sec + self.forward_sec + self.backward_sec + self.clip_sec + self.optimizer_sec + self.detach_sec
+        return (
+            self.zero_sec + self.rows_sec + self.forward_sec + self.wait_sec + self.backward_sec + self.clip_sec
+            + self.optimizer_sec + self.detach_sec
+        )
 
 
 def profile_summary(profile: EpochProfile) -> str:
@@ -85,7 +91,9 @@ def profile_summary(profile: EpochProfile) -> str:
         f"profile updates={profile.updates} tokens={profile.tokens} train_sec={train_sec:.2f} "
         f"tok_per_sec={profile.tokens / train_sec if profile.tokens else 0.0:.1f} "
         f"zero={profile.zero_sec:.2f}s/{100.0 * profile.zero_sec / train_sec:.1f}% "
+        f"rows={profile.rows_sec:.2f}s/{100.0 * profile.rows_sec / train_sec:.1f}% "
         f"forward={profile.forward_sec:.2f}s/{100.0 * profile.forward_sec / train_sec:.1f}% "
+        f"wait={profile.wait_sec:.2f}s/{100.0 * profile.wait_sec / train_sec:.1f}% "
         f"backward={profile.backward_sec:.2f}s/{100.0 * profile.backward_sec / train_sec:.1f}% "
         f"clip={profile.clip_sec:.2f}s/{100.0 * profile.clip_sec / train_sec:.1f}% "
         f"optim={profile.optimizer_sec:.2f}s/{100.0 * profile.optimizer_sec / train_sec:.1f}% "
@@ -1763,6 +1771,18 @@ def parse_args() -> argparse.Namespace:
         "segments first (1: one stream, with every diagnostic)",
     )
     parser.add_argument("--eval-burn-in", type=int, default=256, help="unscored segments before each stream's own")
+    parser.add_argument(
+        "--prefetch-rows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --train-streams > 1, read the next update's prior rows in a background thread (same rows)",
+    )
+    parser.add_argument(
+        "--drop-evidence-cache",
+        action="store_true",
+        help="with --prefetch-rows, drop the training depth evidence's pages from the page cache once read: for "
+        "an evidence file too big to stay cached, so reading it each epoch doesn't push other memory into swap",
+    )
     parser.add_argument("--checkpoint-output", type=Path, default=None)
     parser.add_argument("--best-checkpoint-output", type=Path, default=None)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
@@ -3657,6 +3677,22 @@ def main() -> None:
                 train_input_ids = torch.from_numpy(noisy).to(device)
                 print(f"epoch={epoch} input_noise={args.input_noise} chars_changed={changed}", flush=True)
             stream_length = len(train_segments) if args.train_streams == 1 else len(stream_segments[0])
+            prefetcher = None
+            if args.train_streams > 1 and args.prefetch_rows:
+                prefetcher = RowPrefetcher(
+                    {
+                        "prior_log_probs": train_prior_log_probs,
+                        "prior_gate_features": train_prior_gate_features,
+                        "prior_evidence": train_prior_evidence,
+                    },
+                    drop_cache=("prior_evidence",) if args.drop_evidence_cache else (),
+                )
+
+                def update_spans(at: int) -> list[tuple[int, int]]:
+                    last = min(at + args.segments_per_update, stream_length) - 1
+                    return [(segs[at][0], segs[last][1]) for segs in stream_segments]
+
+                pending = prefetcher.submit(update_spans(0))
             for offset in range(0, stream_length, args.segments_per_update):
                 step += 1
                 step_profile = EpochProfile()
@@ -3667,6 +3703,19 @@ def main() -> None:
                 if args.train_streams > 1:
                     batch_streams = [segs[offset : offset + args.segments_per_update] for segs in stream_segments]
                     spans = [(segs[0][0], segs[-1][1]) for segs in batch_streams]
+                    if prefetcher is not None:
+                        host_rows = pending.result()
+                        if offset + args.segments_per_update < stream_length:
+                            pending = prefetcher.submit(update_spans(offset + args.segments_per_update))
+                        batch_rows = {name: rows_to_device(rows, device) for name, rows in host_rows.items()}
+                    else:
+                        batch_rows = {
+                            "prior_log_probs": prior_rows_for_spans(train_prior_log_probs, spans, device),
+                            "prior_gate_features": prior_rows_for_spans(train_prior_gate_features, spans, device),
+                            "prior_evidence": prior_rows_for_spans(train_prior_evidence, spans, device),
+                        }
+                    step_profile.rows_sec += time.perf_counter() - t0
+                    t0 = time.perf_counter()
                     loss, tokens, memory, carried_hidden, train_stats = model.segment_loss_streams(
                         train_ids,
                         batch_streams,
@@ -3676,10 +3725,8 @@ def main() -> None:
                         carry_hidden=args.carry_hidden,
                         feedback_state=args.feedback_state,
                         token_feedback=args.token_feedback,
-                        prior_log_probs=prior_rows_for_spans(train_prior_log_probs, spans, device),
-                        prior_gate_features=prior_rows_for_spans(train_prior_gate_features, spans, device),
-                        prior_evidence=prior_rows_for_spans(train_prior_evidence, spans, device),
                         input_ids=train_input_ids,
+                        **batch_rows,
                     )
                     batch_segments = batch_streams[0]
                 else:
@@ -3733,7 +3780,9 @@ def main() -> None:
                     continue
                 step_profile.updates += 1
                 step_profile.tokens += tokens
+                t0 = time.perf_counter()
                 loss_value = float(loss.item())
+                step_profile.wait_sec += time.perf_counter() - t0
                 train_nll = loss_value / tokens
                 epoch_loss_sum += loss_value
                 if not torch.isfinite(loss):
@@ -3842,6 +3891,8 @@ def main() -> None:
                         f"peak_rss_mb={row.peak_rss_kb / 1024:.1f}",
                         flush=True,
                     )
+            if prefetcher is not None:
+                prefetcher.close()
             t0 = time.perf_counter()
             val_nll, val_ppl, val_bpc, val_stats = evaluate(
                 model,
