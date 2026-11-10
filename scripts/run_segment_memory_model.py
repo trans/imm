@@ -199,9 +199,15 @@ class LMATokenBlock(nn.Module):
 
 
 class GatedCrossAttentionBlock(nn.Module):
-    def __init__(self, hidden_size: int, heads: int, memory_size: int | None = None, mlp_mult: int = 4) -> None:
+    def __init__(
+        self, hidden_size: int, heads: int, memory_size: int | None = None, mlp_mult: int = 4, dropout: float = 0.0
+    ) -> None:
         super().__init__()
         memory_size = memory_size or hidden_size
+        # As the transformer baseline places it: on the attention weights, the
+        # attention output, inside the MLP and on its output. Applied in
+        # forward, so the parameter names (and old checkpoints) don't change.
+        self.dropout = dropout
         if hidden_size % heads != 0:
             raise ValueError(f"hidden_size {hidden_size} must be divisible by heads {heads}")
         self.hidden_size = hidden_size
@@ -227,6 +233,10 @@ class GatedCrossAttentionBlock(nn.Module):
             nn.Linear(mlp_mult * hidden_size, hidden_size),
         )
         self.gate_mlp = nn.Parameter(torch.zeros(1))
+
+    def drop(self, x: torch.Tensor) -> torch.Tensor:
+        # Skipped at 0, so a run without dropout draws no random numbers for it.
+        return F.dropout(x, self.dropout, self.training) if self.dropout > 0.0 else x
 
     def apply_rope(self, x: torch.Tensor, positions: torch.Tensor, use_rope: bool) -> torch.Tensor:
         if not use_rope or self.rope_dim == 0:
@@ -287,13 +297,14 @@ class GatedCrossAttentionBlock(nn.Module):
                 stats["attn_token_count"] = float(query_count)
                 stats["attn_prev_weight_sum"] = float(mean_weights.detach().sum().item())
                 stats["attn_top_is_prev_sum"] = float(torch.ones_like(top_indices, dtype=mean_weights.dtype).sum().item())
-            attn_out = weights @ value
+            attn_out = self.drop(weights) @ value
             attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, query_count, self.hidden_size)
-            attn_out = self.out_proj(attn_out)
+            attn_out = self.drop(self.out_proj(attn_out))
         else:
             attn_out = torch.zeros_like(hidden)
         hidden = hidden + torch.tanh(self.gate_attn) * attn_out
-        hidden = hidden + torch.tanh(self.gate_mlp) * self.mlp(self.ln_mlp(hidden))
+        up, act, down = self.mlp
+        hidden = hidden + torch.tanh(self.gate_mlp) * self.drop(down(self.drop(act(up(self.ln_mlp(hidden))))))
         if return_diagnostics:
             return hidden, stats
         return hidden
@@ -335,8 +346,19 @@ class SegmentMemoryLM(nn.Module):
         utility_temperature: float,
         prior_input: str = "none",
         prior_evidence_width: int = 0,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+        if dropout > 0.0 and mixing != "gated-xattn":
+            raise ValueError("dropout is built for --mixing gated-xattn only")
+        # Zaremba et al.'s placement for recurrent LMs, on the connections that
+        # aren't recurrent: the GRU's input (embedding plus prior inputs) and
+        # the state the head reads; inside the attention blocks as the
+        # transformer baseline has it. Not on the carried state or the memory
+        # records. The prior's own log-probs are never dropped.
+        self.dropout = dropout
         self.hidden_size = hidden_size
         self.use_rope = use_rope
         self.rope_positions = rope_positions
@@ -409,7 +431,7 @@ class SegmentMemoryLM(nn.Module):
         self.decision_blocks = nn.ModuleList([AttentionDecisionBlock(hidden_size) for _ in range(attention_layers)])
         self.lma_blocks = nn.ModuleList([LMATokenBlock(hidden_size, attention_heads) for _ in range(attention_layers)])
         self.gated_xattn_blocks = nn.ModuleList(
-            [GatedCrossAttentionBlock(hidden_size, attention_heads) for _ in range(attention_layers)]
+            [GatedCrossAttentionBlock(hidden_size, attention_heads, dropout=dropout) for _ in range(attention_layers)]
         )
         self.gate_update = nn.Sequential(
             nn.Linear(2 * hidden_size, 4 * hidden_size),
@@ -529,6 +551,10 @@ class SegmentMemoryLM(nn.Module):
 
     def zero_state(self, device: torch.device) -> torch.Tensor:
         return torch.zeros(1, 1, self.hidden_size, device=device)
+
+    def drop(self, x: torch.Tensor) -> torch.Tensor:
+        # Skipped at 0, so a run without dropout draws no random numbers for it.
+        return F.dropout(x, self.dropout, self.training) if self.dropout > 0.0 else x
 
     def apply_prior_residual(
         self,
@@ -1017,6 +1043,8 @@ class SegmentMemoryLM(nn.Module):
         if token_feedback != "none":
             if input_ids is not None:
                 raise ValueError("input_ids isn't supported with token feedback")
+            if self.dropout > 0.0:
+                raise ValueError("dropout isn't supported with token feedback")
             return self.segment_loss_token_feedback(
                 ids,
                 segments,
@@ -1053,6 +1081,7 @@ class SegmentMemoryLM(nn.Module):
                 embeddings = embeddings + self.prior_evidence_proj(
                     evidence.reshape(evidence.shape[0], -1).to(dtype=embeddings.dtype)
                 )
+            embeddings = self.drop(embeddings)
             embeddings = self.apply_input_rope(embeddings, torch.arange(start, end, device=ids.device))
             hidden_seq, hidden = self.rnn(embeddings.unsqueeze(0), initial_hidden)
             hidden_seq = hidden_seq.squeeze(0)
@@ -1200,7 +1229,7 @@ class SegmentMemoryLM(nn.Module):
                         state_batch = block_out
                 state = state_batch.squeeze(0)
                 context = state - hidden_seq
-                logits = self.gru_head(state)
+                logits = self.gru_head(self.drop(state))
                 for block in self.gated_xattn_blocks:
                     stats["gate_sum"] += float(torch.tanh(block.gate_attn).detach().abs().item())
                     stats["gate_sum"] += float(torch.tanh(block.gate_mlp).detach().abs().item())
@@ -1390,6 +1419,7 @@ class SegmentMemoryLM(nn.Module):
             embeddings = embeddings + self.prior_evidence_proj(
                 evidence.reshape(evidence.shape[0], -1).to(dtype=embeddings.dtype)
             )
+        embeddings = self.drop(embeddings)
         embeddings = self.apply_input_rope(embeddings, flat_positions)
         grid = embeddings.new_zeros((streams, count, longest, embeddings.shape[-1]))
         grid[valid_t] = embeddings
@@ -1442,7 +1472,7 @@ class SegmentMemoryLM(nn.Module):
             next_hidden = next_state.unsqueeze(0)
             states.append(F.pad(state, (0, 0, 0, longest - width)))
 
-        logits = self.gru_head(torch.stack(states, dim=1)[valid_t])  # [N, V], (stream, segment, offset) order
+        logits = self.gru_head(self.drop(torch.stack(states, dim=1)[valid_t]))  # [N, V], (stream, segment, offset) order
         logits, residual_logits, _, _ = self.apply_prior_residual(
             logits,
             prior_log_probs[flat_rows] if prior_log_probs is not None else None,
@@ -1671,6 +1701,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="dropout in the residual (gated-xattn only): its GRU input, the state its head reads, and inside "
+        "the attention blocks; never on the carried state, the memory records or the prior",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-train-chars", type=int, default=None)
     parser.add_argument("--eval-max-chars", type=int, default=20000)
@@ -3250,6 +3287,7 @@ def main() -> None:
         utility_temperature=args.utility_temperature,
         prior_input=args.prior_input,
         prior_evidence_width=prior_evidence_width,
+        dropout=args.dropout,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()

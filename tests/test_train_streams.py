@@ -52,6 +52,7 @@ def make_model(seed=0, layers=1, **overrides):
         skip_prior_gate_max=0.5, skip_prior_gate_bias=0.0, skip_prior_channels=0, record_aux_weight=0.0,
         terminal_record_aux_weight=0.0, retrieval_aux_weight=0.0, utility_aux_weight=0.0, utility_temperature=1.0,
         prior_input=o["prior_input"], prior_evidence_width=D * (V + 1) if o["prior_input"] in ("depth-evidence", "both") else 0,
+        dropout=o.get("dropout", 0.0),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():
