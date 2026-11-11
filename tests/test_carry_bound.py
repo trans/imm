@@ -38,7 +38,7 @@ class CarryBoundTest(unittest.TestCase):
 
     def test_parameters_unchanged(self) -> None:
         names = list(make_model().state_dict())
-        for bound in ("tanh", "gru"):
+        for bound in ("tanh", "norm", "gru"):
             self.assertEqual(list(make_model(carry_bound=bound).state_dict()), names)
 
     def test_none_is_the_old_carry(self) -> None:
@@ -72,10 +72,33 @@ class CarryBoundTest(unittest.TestCase):
             model = make_model(carry_bound=bound).eval()
             model.load_state_dict(base.state_dict())
             self.assertLessEqual(carried_max(model), 1.0, bound)
+        capped = make_model(carry_bound="norm", carry_scale=2.0).eval()
+        capped.load_state_dict(base.state_dict())
+        with torch.no_grad():
+            hidden = None
+            for _ in range(4):
+                _, hidden = self.streams(capped, hidden)
+                self.assertLessEqual(float(hidden.norm(dim=-1).max()), 2.0 + 1e-5)
+
+    def test_scaled_tanh_and_norm_cap(self) -> None:
+        """tanh with scale c bounds every value by c and leaves small ones
+        nearly as they were; norm caps the length at c and leaves shorter
+        states alone."""
+        x = torch.tensor([[0.1, -0.2, 40.0, -7.0]])
+        small = torch.tensor([[0.3, -0.4, 0.0, 0.0]])  # length 0.5
+        tanh3 = make_model(carry_bound="tanh", carry_scale=3.0)
+        y = tanh3.bound_carry(x, x)
+        self.assertLessEqual(float(y.abs().max()), 3.0)
+        self.assertAlmostEqual(float(y[0, 0]), 0.1, places=3)
+        cap = make_model(carry_bound="norm", carry_scale=5.0)
+        self.assertAlmostEqual(float(cap.bound_carry(x, x).norm()), 5.0, places=4)
+        self.assertTrue(torch.allclose(cap.bound_carry(x, x) / 5.0, x / x.norm()))
+        self.assertTrue(torch.equal(cap.bound_carry(small, small), small))
+        self.assertTrue(torch.equal(make_model(carry_bound="tanh").bound_carry(x, x), torch.tanh(x)))
 
     def test_single_and_batched_paths_agree(self) -> None:
-        for bound in ("tanh", "gru"):
-            model = make_model(carry_bound=bound).eval()
+        for bound in ("tanh", "norm", "gru"):
+            model = make_model(carry_bound=bound, carry_scale=3.0 if bound == "tanh" else 2.0).eval()
             stream_segments = runner.split_streams(self.segments, STREAMS)
             with torch.no_grad():
                 batched_loss, batched_hidden = self.streams(model)

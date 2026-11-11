@@ -356,17 +356,22 @@ class SegmentMemoryLM(nn.Module):
         prior_evidence_width: int = 0,
         dropout: float = 0.0,
         carry_bound: str = "none",
+        carry_scale: float = 1.0,
     ) -> None:
         super().__init__()
-        if carry_bound not in ("none", "tanh", "gru"):
+        if carry_bound not in ("none", "tanh", "norm", "gru"):
             raise ValueError(f"unknown carry_bound: {carry_bound}")
+        if not carry_scale > 0.0:
+            raise ValueError(f"carry_scale must be positive, got {carry_scale}")
         # What a stream carries into its next segment's GRU. "none": the state
         # after the attention block, as before; the block adds to it, so a
         # stream whose GRU keeps passing it on grows it without bound.
-        # "tanh": that state squashed into the GRU's own range. "gru": the
-        # GRU's own last state; the block reaches the next segment only
-        # through the memory records.
+        # "tanh": that state squashed, c * tanh(x / c) with c = carry_scale
+        # (1: the GRU's own range). "norm": its length capped at
+        # carry_scale, direction kept. "gru": the GRU's own last state; the
+        # block reaches the next segment only through the memory records.
         self.carry_bound = carry_bound
+        self.carry_scale = carry_scale
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         if dropout > 0.0 and mixing != "gated-xattn":
@@ -576,7 +581,11 @@ class SegmentMemoryLM(nn.Module):
 
     def bound_carry(self, next_state: torch.Tensor, gru_last: torch.Tensor) -> torch.Tensor:
         if self.carry_bound == "tanh":
-            return torch.tanh(next_state)
+            c = self.carry_scale
+            return torch.tanh(next_state) if c == 1.0 else c * torch.tanh(next_state / c)
+        if self.carry_bound == "norm":
+            norm = next_state.norm(dim=-1, keepdim=True)
+            return next_state * (self.carry_scale / norm.clamp_min(self.carry_scale))
         if self.carry_bound == "gru":
             return gru_last
         return next_state
@@ -1718,11 +1727,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feedback-state", choices=["gru", "context", "gated"], default="gru")
     parser.add_argument(
         "--carry-bound",
-        choices=["none", "tanh", "gru"],
+        choices=["none", "tanh", "norm", "gru"],
         default="none",
         help="what a stream carries into its next segment's GRU: none, the state after the attention block as "
-        "before (unbounded: the block adds to it every segment); tanh, that state squashed into the GRU's range; "
-        "gru, the GRU's own last state",
+        "before (unbounded: the block adds to it every segment); tanh, that state squashed, c * tanh(x / c) with "
+        "c = --carry-scale; norm, its length capped at --carry-scale; gru, the GRU's own last state",
+    )
+    parser.add_argument(
+        "--carry-scale",
+        type=float,
+        default=1.0,
+        help="for --carry-bound tanh, the bound c of c * tanh(x / c) (1: the GRU's range); for norm, the longest "
+        "carried state (a healthy stream's runs about 8-26 at hidden 256)",
     )
     parser.add_argument("--token-feedback", choices=["none", "context", "gated", "dual-gated"], default="none")
     parser.add_argument("--feedback-gate-bias", type=float, default=-6.0)
@@ -3604,6 +3620,7 @@ def main() -> None:
         feedback_gate_bias=args.feedback_gate_bias,
         feedback_delta_cap=args.feedback_delta_cap,
         carry_bound=args.carry_bound,
+        carry_scale=args.carry_scale,
         prior_strength=args.prior_strength,
         prior_residual_scale=args.prior_residual_scale,
         prior_residual_l2=args.prior_residual_l2,
@@ -3702,7 +3719,7 @@ def main() -> None:
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} "
-            f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} token_feedback={args.token_feedback} input_rope={args.input_rope} "
+            f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
             f"prior_strength={args.prior_strength} "
             f"prior_residual_scale={args.prior_residual_scale} prior_residual_l2={args.prior_residual_l2} "

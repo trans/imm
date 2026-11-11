@@ -54,6 +54,7 @@ def make_model(seed=0, layers=1, **overrides):
         prior_input=o["prior_input"], prior_evidence_width=D * (V + 1) if o["prior_input"] in ("depth-evidence", "both") else 0,
         dropout=o.get("dropout", 0.0),
         carry_bound=o.get("carry_bound", "none"),
+        carry_scale=o.get("carry_scale", 1.0),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():
