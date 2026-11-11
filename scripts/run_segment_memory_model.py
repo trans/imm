@@ -355,8 +355,18 @@ class SegmentMemoryLM(nn.Module):
         prior_input: str = "none",
         prior_evidence_width: int = 0,
         dropout: float = 0.0,
+        carry_bound: str = "none",
     ) -> None:
         super().__init__()
+        if carry_bound not in ("none", "tanh", "gru"):
+            raise ValueError(f"unknown carry_bound: {carry_bound}")
+        # What a stream carries into its next segment's GRU. "none": the state
+        # after the attention block, as before; the block adds to it, so a
+        # stream whose GRU keeps passing it on grows it without bound.
+        # "tanh": that state squashed into the GRU's own range. "gru": the
+        # GRU's own last state; the block reaches the next segment only
+        # through the memory records.
+        self.carry_bound = carry_bound
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         if dropout > 0.0 and mixing != "gated-xattn":
@@ -563,6 +573,13 @@ class SegmentMemoryLM(nn.Module):
     def drop(self, x: torch.Tensor) -> torch.Tensor:
         # Skipped at 0, so a run without dropout draws no random numbers for it.
         return F.dropout(x, self.dropout, self.training) if self.dropout > 0.0 else x
+
+    def bound_carry(self, next_state: torch.Tensor, gru_last: torch.Tensor) -> torch.Tensor:
+        if self.carry_bound == "tanh":
+            return torch.tanh(next_state)
+        if self.carry_bound == "gru":
+            return gru_last
+        return next_state
 
     def apply_prior_residual(
         self,
@@ -1343,6 +1360,7 @@ class SegmentMemoryLM(nn.Module):
                 next_state = terminal + feedback_gate * feedback_update
             else:
                 next_state = terminal
+            next_state = self.bound_carry(next_state, hidden_seq[-1:].contiguous())
             next_carried_hidden = next_state.unsqueeze(0)
         if not losses:
             return torch.zeros((), device=ids.device), 0, memory, next_carried_hidden, stats
@@ -1490,6 +1508,7 @@ class SegmentMemoryLM(nn.Module):
                 next_state = terminal + torch.sigmoid(self.feedback_gate(feedback_input)) * feedback_update
             else:
                 next_state = terminal
+            next_state = self.bound_carry(next_state, hidden_seq[stream_index, last])
             next_hidden = next_state.unsqueeze(0)
             states.append(F.pad(state, (0, 0, 0, longest - width)))
 
@@ -1697,6 +1716,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--utility-temperature", type=float, default=1.0)
     parser.add_argument("--carry-hidden", action="store_true")
     parser.add_argument("--feedback-state", choices=["gru", "context", "gated"], default="gru")
+    parser.add_argument(
+        "--carry-bound",
+        choices=["none", "tanh", "gru"],
+        default="none",
+        help="what a stream carries into its next segment's GRU: none, the state after the attention block as "
+        "before (unbounded: the block adds to it every segment); tanh, that state squashed into the GRU's range; "
+        "gru, the GRU's own last state",
+    )
     parser.add_argument("--token-feedback", choices=["none", "context", "gated", "dual-gated"], default="none")
     parser.add_argument("--feedback-gate-bias", type=float, default=-6.0)
     parser.add_argument("--feedback-delta-cap", type=float, default=1.0)
@@ -3576,6 +3603,7 @@ def main() -> None:
         input_rope=args.input_rope,
         feedback_gate_bias=args.feedback_gate_bias,
         feedback_delta_cap=args.feedback_delta_cap,
+        carry_bound=args.carry_bound,
         prior_strength=args.prior_strength,
         prior_residual_scale=args.prior_residual_scale,
         prior_residual_l2=args.prior_residual_l2,
@@ -3674,7 +3702,7 @@ def main() -> None:
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} "
-            f"feedback_state={args.feedback_state} token_feedback={args.token_feedback} input_rope={args.input_rope} "
+            f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
             f"prior_strength={args.prior_strength} "
             f"prior_residual_scale={args.prior_residual_scale} prior_residual_l2={args.prior_residual_l2} "
