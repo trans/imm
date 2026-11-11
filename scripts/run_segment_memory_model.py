@@ -44,6 +44,7 @@ from imm.skip_horizon_features import (
     ensure_skip_horizon_artifact,
     ensure_skip_horizon_count_artifact,
 )
+from imm.compact_evidence import CompactEvidenceRows, load_compact
 from imm.vectorized_count_prior import (
     compile_cross_fit_depth_evidence_mmap,
     compile_depth_evidence_mmap,
@@ -55,7 +56,7 @@ from imm.vectorized_count_prior import (
 
 MemoryEntry = tuple[torch.Tensor, int]
 StreamMemory = tuple[torch.Tensor, torch.Tensor]  # records [B, M, H], their positions [B, M]
-PriorRows = torch.Tensor | np.memmap
+PriorRows = torch.Tensor | np.memmap | CompactEvidenceRows
 
 
 @dataclass
@@ -2856,6 +2857,25 @@ def load_external_depth_evidence(
     if meta.get("vocab_chars") != list(vocab.chars):
         raise ValueError(f"{meta_path}: vocab_chars don't match this run's vocabulary")
     width = vocab.size + 1
+    if "compact_evidence" in meta:
+        # imm/compact_evidence.py's layout: the same rows, rebuilt dense per slice
+        compact = load_compact(prefix, meta)
+        for split, ids in (("train", train_ids), ("eval", eval_ids)):
+            rows_expected = max(0, len(ids) - 1)
+            if compact[split].shape[0] != rows_expected or compact[split].shape[2] != width:
+                raise ValueError(
+                    f"{meta_path}: compact {split} shape {compact[split].shape} isn't {rows_expected} rows x depth x {width}"
+                )
+        if compact["train"].shape[1] != compact["eval"].shape[1]:
+            raise ValueError(f"{prefix}: train depth {compact['train'].shape[1]} != eval depth {compact['eval'].shape[1]}")
+        section = meta["compact_evidence"]
+        print(
+            f"depth_evidence external={prefix} layout=compact shallow={section.get('shallow')} "
+            f"train_shape={compact['train'].shape} eval_shape={compact['eval'].shape} "
+            f"builder={meta.get('builder')!r} cross_fit={json.dumps(meta.get('cross_fit'))}",
+            flush=True,
+        )
+        return compact["train"], prior_rows_to_device(compact["eval"], 0, compact["eval"].shape[0], device)
     rows = {}
     for split, ids in (("train", train_ids), ("eval", eval_ids)):
         path = external_evidence_path(prefix, meta, split)
