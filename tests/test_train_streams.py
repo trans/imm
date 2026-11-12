@@ -55,6 +55,7 @@ def make_model(seed=0, layers=1, **overrides):
         dropout=o.get("dropout", 0.0),
         carry_bound=o.get("carry_bound", "none"),
         carry_scale=o.get("carry_scale", 1.0),
+        prior_dropout=o.get("prior_dropout", 0.0),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():

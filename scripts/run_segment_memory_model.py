@@ -358,8 +358,20 @@ class SegmentMemoryLM(nn.Module):
         dropout: float = 0.0,
         carry_bound: str = "none",
         carry_scale: float = 1.0,
+        prior_dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if not 0.0 <= prior_dropout < 1.0:
+            raise ValueError(f"prior_dropout must be in [0, 1), got {prior_dropout}")
+        # Prior dropout, in training on the batched path only: each stream
+        # loses the prior with this probability, drawn anew for every call
+        # (one update's segments), from its input and its output. A stream
+        # without it predicts from its own head alone (gru_head of the
+        # final state), with no gate or state features either, since those
+        # are the prior's too. Held-out scoring always has the prior. @air's
+        # --prior-dropout for the transformer baseline does the same per
+        # sequence (air 47b1711).
+        self.prior_dropout = prior_dropout
         if carry_bound not in ("none", "tanh", "norm", "gru"):
             raise ValueError(f"unknown carry_bound: {carry_bound}")
         if not carry_scale > 0.0:
@@ -1461,18 +1473,30 @@ class SegmentMemoryLM(nn.Module):
         if self.prior_ablation not in ("none", "output", "all"):
             raise ValueError(f"unknown prior_ablation: {self.prior_ablation}")
         input_prior = self.prior_ablation != "all"
+        # prior_kept [N, 1]: whether each character's stream keeps the prior
+        # this call (prior dropout); None when every stream does. No random
+        # draw at 0 or in eval mode.
+        prior_kept = None
+        if self.training and self.prior_dropout > 0.0 and prior_log_probs is not None:
+            stream_kept = torch.rand(streams, device=device) >= self.prior_dropout
+            flat_streams = np.broadcast_to(np.arange(streams)[:, None, None], valid.shape)[valid]
+            prior_kept = stream_kept[torch.from_numpy(flat_streams).to(device)].unsqueeze(1)
+
+        def kept(x: torch.Tensor) -> torch.Tensor:
+            return x if prior_kept is None else x * prior_kept.to(x.dtype)
+
         if self.prior_input_proj is not None and input_prior:
             if prior_log_probs is None:
                 raise ValueError("--prior-input requires count-prior rows")
-            embeddings = embeddings + self.prior_input_proj(
-                prior_log_probs[flat_rows].to(dtype=embeddings.dtype).clamp(min=-18.0)
+            embeddings = embeddings + kept(
+                self.prior_input_proj(prior_log_probs[flat_rows].to(dtype=embeddings.dtype).clamp(min=-18.0))
             )
         if self.prior_evidence_proj is not None and input_prior:
             if prior_evidence is None:
                 raise ValueError("--prior-input depth-evidence requires depth-evidence rows")
             evidence = prior_evidence[flat_rows]
-            embeddings = embeddings + self.prior_evidence_proj(
-                evidence.reshape(evidence.shape[0], -1).to(dtype=embeddings.dtype)
+            embeddings = embeddings + kept(
+                self.prior_evidence_proj(evidence.reshape(evidence.shape[0], -1).to(dtype=embeddings.dtype))
             )
         embeddings = self.drop(embeddings)
         embeddings = self.apply_input_rope(embeddings, flat_positions)
@@ -1534,12 +1558,17 @@ class SegmentMemoryLM(nn.Module):
             states.append(F.pad(state, (0, 0, 0, longest - width)))
 
         final_states = torch.stack(states, dim=1)[valid_t]  # [N, H], (stream, segment, offset) order
-        logits = self.gru_head(self.drop(final_states))  # [N, V]
+        own_logits = self.gru_head(self.drop(final_states))  # [N, V]
         logits, residual_logits, residual_alpha, _ = self.apply_prior_residual(
-            logits,
+            own_logits,
             prior_log_probs[flat_rows] if prior_log_probs is not None else None,
             prior_gate_features[flat_rows] if prior_gate_features is not None else None,
         )
+        if prior_kept is not None:
+            # Streams without the prior score their own head; the residual's
+            # L2 leash is for streams with it.
+            logits = torch.where(prior_kept, logits, own_logits)
+            residual_logits = kept(residual_logits)
         if self.prior_ablation != "none" and residual_logits is not None:
             logits = residual_logits
         targets = ids[flat_positions + 1]
@@ -1843,6 +1872,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-lr", type=float, default=1e-4, help="where --lr-schedule cosine ends")
     parser.add_argument("--lr-warmup", type=int, default=0, help="updates of linear warm-up for --lr-schedule cosine")
+    parser.add_argument(
+        "--prior-dropout",
+        type=float,
+        default=0.0,
+        help="with --train-streams > 1: in training, each stream loses the prior, from its input and its output, "
+        "with this probability, drawn anew for each update; it then predicts from its own head alone. Held-out "
+        "scoring always has the prior",
+    )
     parser.add_argument(
         "--dropout",
         type=float,
@@ -3907,11 +3944,14 @@ def main() -> None:
         prior_input=args.prior_input,
         prior_evidence_width=prior_evidence_width,
         dropout=args.dropout,
+        prior_dropout=args.prior_dropout,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
     if args.train_streams < 1:
         raise ValueError("--train-streams must be at least 1")
+    if args.prior_dropout > 0.0 and args.train_streams < 2:
+        raise ValueError("--prior-dropout is built for the batched path: give --train-streams > 1")
     if args.train_streams > 1:
         model.check_streams_supported(args.token_feedback)
         stream_segments = split_streams(train_segments, args.train_streams)
