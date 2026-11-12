@@ -544,6 +544,14 @@ class SegmentMemoryLM(nn.Module):
                 nn.init.zeros_(proj[-1].bias)
         self.prior_input_proj = log_probs_proj
         self.prior_evidence_proj = evidence_proj
+        # Scoring switches for the take-the-prior-away test (prior_ablation),
+        # read by segment_loss_streams only: "none" scores the model as
+        # trained; "output" scores its residual logits alone, with the prior
+        # still in the input; "all" also leaves the prior out of the input.
+        # state_sink, a list, collects (final state, target) for each scored
+        # character. Neither is a parameter or saved.
+        self.prior_ablation = "none"
+        self.state_sink: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
     def zero_prediction_heads(self) -> None:
         for head in [
@@ -1422,13 +1430,16 @@ class SegmentMemoryLM(nn.Module):
         flat_rows = torch.from_numpy(rows[valid]).to(device)
 
         embeddings = self.embed((ids if input_ids is None else input_ids)[flat_positions])
-        if self.prior_input_proj is not None:
+        if self.prior_ablation not in ("none", "output", "all"):
+            raise ValueError(f"unknown prior_ablation: {self.prior_ablation}")
+        input_prior = self.prior_ablation != "all"
+        if self.prior_input_proj is not None and input_prior:
             if prior_log_probs is None:
                 raise ValueError("--prior-input requires count-prior rows")
             embeddings = embeddings + self.prior_input_proj(
                 prior_log_probs[flat_rows].to(dtype=embeddings.dtype).clamp(min=-18.0)
             )
-        if self.prior_evidence_proj is not None:
+        if self.prior_evidence_proj is not None and input_prior:
             if prior_evidence is None:
                 raise ValueError("--prior-input depth-evidence requires depth-evidence rows")
             evidence = prior_evidence[flat_rows]
@@ -1493,13 +1504,22 @@ class SegmentMemoryLM(nn.Module):
             next_hidden = next_state.unsqueeze(0)
             states.append(F.pad(state, (0, 0, 0, longest - width)))
 
-        logits = self.gru_head(self.drop(torch.stack(states, dim=1)[valid_t]))  # [N, V], (stream, segment, offset) order
+        final_states = torch.stack(states, dim=1)[valid_t]  # [N, H], (stream, segment, offset) order
+        logits = self.gru_head(self.drop(final_states))  # [N, V]
         logits, residual_logits, residual_alpha, _ = self.apply_prior_residual(
             logits,
             prior_log_probs[flat_rows] if prior_log_probs is not None else None,
             prior_gate_features[flat_rows] if prior_gate_features is not None else None,
         )
+        if self.prior_ablation != "none" and residual_logits is not None:
+            logits = residual_logits
         targets = ids[flat_positions + 1]
+        if self.state_sink is not None:
+            if score_mask is None:
+                sink_keep = slice(None)
+            else:
+                sink_keep = torch.from_numpy(np.broadcast_to(score_mask[:, :, None], valid.shape)[valid]).to(device)
+            self.state_sink.append((final_states[sink_keep].detach().to("cpu", torch.float16), targets[sink_keep].cpu()))
         stats = empty_stats()
         if score_mask is None and not collect_stats:
             loss = F.cross_entropy(logits, targets, reduction="sum")
@@ -1799,6 +1819,26 @@ def parse_args() -> argparse.Namespace:
         "segments first (1: one stream, with every diagnostic)",
     )
     parser.add_argument("--eval-burn-in", type=int, default=256, help="unscored segments before each stream's own")
+    parser.add_argument(
+        "--prior-ablation-output",
+        type=Path,
+        default=None,
+        help="with --eval-only and --eval-streams > 1: the take-the-prior-away test. Score the checkpoint in full, "
+        "on its residual logits alone, and also without the prior in its input; then train a fresh output layer "
+        "on its frozen final state (no prior in the output) with the prior in the input and without, and score "
+        "those. Writes this JSON and stops",
+    )
+    parser.add_argument(
+        "--probe-train-chars",
+        type=int,
+        default=1_000_000,
+        help="training characters whose final states the fresh output layer learns from, read as --train-streams "
+        "streams spread over the training text",
+    )
+    parser.add_argument("--probe-steps", type=int, default=3000)
+    parser.add_argument("--probe-batch", type=int, default=4096)
+    parser.add_argument("--probe-lr", type=float, default=3e-3)
+    parser.add_argument("--probe-seed", type=int, default=7)
     parser.add_argument(
         "--prefetch-rows",
         action=argparse.BooleanOptionalAction,
@@ -3021,6 +3061,209 @@ def evaluate_streams(
     return nll, math.exp(nll) if nll <= 700.0 else float("inf"), nll / math.log(2.0), stats
 
 
+@torch.no_grad()
+def collect_train_states(
+    model: SegmentMemoryLM,
+    ids: torch.Tensor,
+    segments: list[tuple[int, int]],
+    streams: int,
+    chunk: int,
+    chars: int,
+    max_memory: int,
+    carry_hidden: bool,
+    feedback_state: str,
+    token_feedback: str,
+    prior_log_probs: PriorRows | None,
+    prior_gate_features: PriorRows | None,
+    prior_evidence: PriorRows | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Final states and targets of about `chars` training characters, read as
+    `streams` streams that start evenly through the training text (the
+    training loop's split_streams), each warmed up on one unscored chunk of
+    segments first. Run in eval mode, as the model scores held-out text."""
+    model.eval()
+    stream_segments = split_streams(segments, streams)
+    mean_len = sum(end - start for start, end in segments) / len(segments)
+    count = min(len(stream_segments[0]), chunk + math.ceil(chars / streams / mean_len))
+    memory: StreamMemory | None = None
+    hidden: torch.Tensor | None = None
+    sink: list[tuple[torch.Tensor, torch.Tensor]] = []
+    device = ids.device
+    try:
+        for c0 in range(0, count, chunk):
+            c1 = min(count, c0 + chunk)
+            batch = [segs[c0:c1] for segs in stream_segments]
+            spans = [(segs[0][0], segs[-1][1]) for segs in batch]
+            model.state_sink = sink if c0 > 0 else None
+            _, _, memory, hidden, _ = model.segment_loss_streams(
+                ids,
+                batch,
+                memory,
+                max_memory,
+                carried_hidden=hidden,
+                carry_hidden=carry_hidden,
+                feedback_state=feedback_state,
+                token_feedback=token_feedback,
+                prior_log_probs=prior_rows_for_spans(prior_log_probs, spans, device),
+                prior_gate_features=prior_rows_for_spans(prior_gate_features, spans, device),
+                prior_evidence=prior_rows_for_spans(prior_evidence, spans, device),
+            )
+    finally:
+        model.state_sink = None
+    if not sink:
+        raise ValueError("--probe-train-chars read no characters past the warm-up chunk")
+    return torch.cat([s for s, _ in sink]), torch.cat([t for _, t in sink])
+
+
+def probe_nll(head: nn.Linear, states: torch.Tensor, targets: torch.Tensor, batch: int = 65536) -> float:
+    total = 0.0
+    with torch.no_grad():
+        for i in range(0, len(states), batch):
+            logits = head(states[i : i + batch].float())
+            total += float(F.cross_entropy(logits, targets[i : i + batch], reduction="sum"))
+    return total / len(states)
+
+
+def train_probe(
+    trained_head: nn.Linear,
+    train_states: torch.Tensor,
+    train_targets: torch.Tensor,
+    eval_states: torch.Tensor,
+    eval_targets: torch.Tensor,
+    steps: int,
+    batch: int,
+    lr: float,
+    seed: int,
+) -> dict:
+    """A fresh output layer on frozen final states, with no prior in the
+    output: started from the trained head, Adam with cosine lr to 1e-4 (as
+    @air's probe.py does for the transformers), scored on the held-out
+    states."""
+    head = nn.Linear(trained_head.in_features, trained_head.out_features)
+    with torch.no_grad():
+        head.weight.copy_(trained_head.weight.detach().float().cpu())
+        head.bias.copy_(trained_head.bias.detach().float().cpu())
+    start = probe_nll(head, eval_states, eval_targets)
+    curve = [{"step": 0, "heldout_nll": start, "heldout_ppl": math.exp(start)}]
+    gen = torch.Generator().manual_seed(seed)
+    opt = torch.optim.Adam(head.parameters(), lr=lr)
+    for step in range(1, steps + 1):
+        for group in opt.param_groups:
+            group["lr"] = 1e-4 + 0.5 * (1 + math.cos(math.pi * step / steps)) * (lr - 1e-4)
+        pick = torch.randint(0, len(train_states), (batch,), generator=gen)
+        loss = F.cross_entropy(head(train_states[pick].float()), train_targets[pick])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if step % 500 == 0 or step == steps:
+            nll = probe_nll(head, eval_states, eval_targets)
+            curve.append({"step": step, "train_loss": float(loss), "heldout_nll": nll, "heldout_ppl": math.exp(nll)})
+            print(f"probe step={step} train_loss={float(loss):.4f} heldout_ppl={math.exp(nll):.4f}", flush=True)
+    final = curve[-1]["heldout_nll"]
+    return {
+        "heldout_ppl": math.exp(final),
+        "heldout_bpc": final / math.log(2.0),
+        "trained_head_alone_ppl": math.exp(start),
+        "train_states": len(train_states),
+        "curve": curve,
+    }
+
+
+def run_prior_ablation(
+    model: SegmentMemoryLM,
+    args: argparse.Namespace,
+    eval_ids: torch.Tensor,
+    eval_segments: list[tuple[int, int]],
+    eval_rows: dict[str, PriorRows | None],
+    eval_input_ids: torch.Tensor | None,
+    train_ids: torch.Tensor,
+    train_segments: list[tuple[int, int]],
+    train_rows: dict[str, PriorRows | None],
+) -> dict:
+    """The take-the-prior-away test (the user, 2026-11-11, via @air): how much
+    has the residual learned of the text itself, and how much does it lean on
+    the prior? Scores the held-out text three ways (prior_ablation none,
+    output, all), then a fresh output layer on the frozen final states with
+    the prior in the input and without."""
+    if args.eval_streams < 2:
+        raise ValueError("--prior-ablation-output needs --eval-streams > 1")
+    if eval_rows["prior_log_probs"] is None:
+        raise ValueError("--prior-ablation-output needs a model with a prior")
+    common = dict(
+        max_memory=args.max_memory,
+        carry_hidden=args.carry_hidden,
+        feedback_state=args.feedback_state,
+        token_feedback=args.token_feedback,
+    )
+    scores: dict[str, dict] = {}
+    eval_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    names = {"none": "full", "output": "residual_only_prior_in_input", "all": "no_prior"}
+    for mode, name in names.items():
+        t0 = time.perf_counter()
+        sink: list[tuple[torch.Tensor, torch.Tensor]] = []
+        model.prior_ablation = mode
+        model.state_sink = sink if mode != "output" else None  # "output" reads the same states as "none"
+        try:
+            nll, ppl, bpc, stats = evaluate(
+                model, eval_ids, eval_segments, input_ids=eval_input_ids, streams=args.eval_streams,
+                burn_in=args.eval_burn_in, **common, **eval_rows,
+            )
+        finally:
+            model.prior_ablation = "none"
+            model.state_sink = None
+        first = mean_or_none(stats["first_token_loss"], stats["first_token_count"])
+        later = mean_or_none(stats["later_token_loss"], stats["later_token_count"])
+        scores[name] = {
+            "heldout_ppl": ppl,
+            "heldout_bpc": bpc,
+            "first_token_ppl": math.exp(first) if first is not None else None,
+            "later_token_ppl": math.exp(later) if later is not None else None,
+            "eval_sec": time.perf_counter() - t0,
+        }
+        if sink:
+            eval_states["prior_in_input" if mode == "none" else "no_prior"] = (
+                torch.cat([s for s, _ in sink]),
+                torch.cat([t for _, t in sink]),
+            )
+        print(f"prior_ablation {name}: heldout_ppl={ppl:.4f} bpc={bpc:.4f} sec={scores[name]['eval_sec']:.1f}", flush=True)
+
+    targets = eval_states["no_prior"][1]
+    counts = torch.bincount(train_ids.cpu(), minlength=model.gru_head.out_features).double() + 1.0
+    unigram = float(-(counts / counts.sum()).log()[targets].mean())
+    result = {
+        "checkpoint": str(args.resume_checkpoint),
+        "eval_chars": int(len(targets)),
+        "scores": scores,
+        "char_frequency_ppl": math.exp(unigram),
+        "probe": {
+            "train_chars": args.probe_train_chars,
+            "streams": args.train_streams,
+            "steps": args.probe_steps,
+            "batch": args.probe_batch,
+            "lr": args.probe_lr,
+            "seed": args.probe_seed,
+        },
+        "probes": {},
+    }
+    for name, mode in (("prior_in_input", "none"), ("no_prior", "all")):
+        t0 = time.perf_counter()
+        model.prior_ablation = mode
+        try:
+            train_states, train_targets = collect_train_states(
+                model, train_ids, train_segments, args.train_streams, 64, args.probe_train_chars, **common,
+                **train_rows,
+            )
+        finally:
+            model.prior_ablation = "none"
+        print(f"probe {name}: {len(train_states)} training states in {time.perf_counter() - t0:.1f}s", flush=True)
+        result["probes"][name] = train_probe(
+            model.gru_head, train_states, train_targets.cpu(), eval_states[name][0], eval_states[name][1].cpu(),
+            args.probe_steps, args.probe_batch, args.probe_lr, args.probe_seed,
+        )
+        del train_states, train_targets
+    return result
+
+
 def row_stats(stats: dict[str, float]) -> tuple[float | None, float | None, float | None]:
     return (
         mean_or_none(stats["gate_sum"], stats["gate_count"]),
@@ -3107,6 +3350,8 @@ def main() -> None:
         if args.resume_checkpoint is None:
             raise ValueError("--eval-only scores a trained model: give --resume-checkpoint")
         args.eval_initial = True
+    if args.prior_ablation_output is not None and not args.eval_only:
+        raise ValueError("--prior-ablation-output scores a trained model: give --eval-only and --resume-checkpoint")
     args.run_id = resolve_run_id(args.run_id, resume=args.resume_checkpoint is not None)
     args.output = prefixed_path(args.output, args.run_id)
     if args.checkpoint_output is None:
@@ -3628,6 +3873,36 @@ def main() -> None:
             f"start_epoch={start_epoch} step={step}",
             flush=True,
         )
+
+    if args.prior_ablation_output is not None:
+        t0 = time.perf_counter()
+        result = run_prior_ablation(
+            model,
+            args,
+            eval_score_ids,
+            eval_segments,
+            {
+                "prior_log_probs": eval_prior_log_probs,
+                "prior_gate_features": eval_prior_gate_features,
+                "prior_evidence": eval_prior_evidence,
+            },
+            eval_input_ids,
+            train_ids,
+            train_segments,
+            {
+                "prior_log_probs": train_prior_log_probs,
+                "prior_gate_features": train_prior_gate_features,
+                "prior_evidence": train_prior_evidence,
+            },
+        )
+        result["run_id"] = args.run_id
+        result["runtime_sec"] = time.perf_counter() - t0
+        args.prior_ablation_output.parent.mkdir(parents=True, exist_ok=True)
+        args.prior_ablation_output.write_text(json.dumps(result, indent=2))
+        summary = {k: round(v["heldout_ppl"], 4) for k, v in result["scores"].items()}
+        summary.update({f"probe_{k}": round(v["heldout_ppl"], 4) for k, v in result["probes"].items()})
+        print(f"prior_ablation {summary} -> {args.prior_ablation_output}", flush=True)
+        return
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fields = list(
