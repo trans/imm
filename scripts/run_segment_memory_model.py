@@ -3497,7 +3497,9 @@ def main() -> None:
     if args.count_prior == "frozen":
         prior_started = time.perf_counter()
         count_history: list[dict[str, float]] = []
-        cache_meta = count_prior_cache_meta(args, train_ids_list, eval_ids_list, vocab)
+        # Only imm's own prior is cached; with --prior-rows its theta file
+        # (a config default) needn't exist.
+        cache_meta = None if args.prior_rows is not None else count_prior_cache_meta(args, train_ids_list, eval_ids_list, vocab)
         cache_loaded = False
         if args.prior_rows is not None:
             (
