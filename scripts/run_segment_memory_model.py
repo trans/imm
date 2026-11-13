@@ -390,13 +390,14 @@ class SegmentMemoryLM(nn.Module):
         self.carry_scale = carry_scale
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}")
-        if dropout > 0.0 and mixing != "gated-xattn":
-            raise ValueError("dropout is built for --mixing gated-xattn only")
+        if dropout > 0.0 and mixing not in ("gated-xattn", "none"):
+            raise ValueError("dropout is built for --mixing gated-xattn and none only")
         # Zaremba et al.'s placement for recurrent LMs, on the connections that
         # aren't recurrent: the GRU's input (embedding plus prior inputs) and
         # the state the head reads; inside the attention blocks as the
-        # transformer baseline has it. Not on the carried state or the memory
-        # records. The prior's own log-probs are never dropped.
+        # transformer baseline has it (memory off has no blocks). Not on the
+        # carried state or the memory records. The prior's own log-probs are
+        # never dropped.
         self.dropout = dropout
         self.hidden_size = hidden_size
         self.use_rope = use_rope
@@ -1151,7 +1152,7 @@ class SegmentMemoryLM(nn.Module):
                 context = torch.zeros_like(hidden_seq)
                 attn_stats = empty_stats()
                 state = hidden_seq
-                logits = self.gru_head(hidden_seq)
+                logits = self.gru_head(self.drop(hidden_seq))
             elif self.mixing == "cross":
                 state = hidden_seq
                 for block in self.cross_blocks:
@@ -1400,10 +1401,12 @@ class SegmentMemoryLM(nn.Module):
         return torch.stack(losses).sum(), token_count, memory, next_carried_hidden, stats
 
     def check_streams_supported(self, token_feedback: str) -> None:
-        """segment_loss_streams covers gated-xattn without token feedback,
-        auxiliary losses or a skip-horizon prior; refuse anything else."""
+        """segment_loss_streams covers gated-xattn, and none (memory off: no
+        records, no cross-attention, the head on the GRU state), without
+        token feedback, auxiliary losses or a skip-horizon prior; refuse
+        anything else."""
         unsupported = []
-        if self.mixing != "gated-xattn":
+        if self.mixing not in ("gated-xattn", "none"):
             unsupported.append(f"--mixing {self.mixing}")
         if token_feedback != "none":
             unsupported.append(f"--token-feedback {token_feedback}")
@@ -1413,7 +1416,19 @@ class SegmentMemoryLM(nn.Module):
         if self.skip_prior_trust_gate is not None:
             unsupported.append("--skip-horizon-prior")
         if unsupported:
-            raise ValueError("--train-streams > 1 supports only --mixing gated-xattn without " + ", ".join(unsupported))
+            raise ValueError("--train-streams > 1 supports only --mixing gated-xattn or none without " + ", ".join(unsupported))
+
+    def whole_span_gru(self, carry_hidden: bool, feedback_state: str) -> bool:
+        """Whether memory-off streams can run the GRU over each stream's whole
+        span in one call and give what the per-segment loop gives: the state
+        is carried from segment to segment unchanged (the GRU's own, and a
+        carry bound that never binds: GRU and tanh states lie in (-1, 1), so
+        their norm stays under sqrt(hidden_size))."""
+        if self.mixing != "none" or not carry_hidden or feedback_state != "gru":
+            return False
+        if self.carry_bound in ("none", "gru"):
+            return True
+        return self.carry_bound == "norm" and self.carry_scale**2 >= self.hidden_size
 
     def segment_loss_streams(
         self,
@@ -1436,7 +1451,9 @@ class SegmentMemoryLM(nn.Module):
         segments stream_segments[b], in order, with its own memory and
         carried state, as segment_loss would run them alone; the loss is the
         sum over streams. Each segment index is one batched GRU call, padded to
-        the longest of the B segments.
+        the longest of the B segments. With memory off (--mixing none) and the
+        state carried unchanged (whole_span_gru), one GRU call runs each
+        stream's whole span instead.
 
         Every stream has the same number of segments. Prior rows hold each
         stream's span (its first segment's start to its last segment's end),
@@ -1503,15 +1520,6 @@ class SegmentMemoryLM(nn.Module):
             )
         embeddings = self.drop(embeddings)
         embeddings = self.apply_input_rope(embeddings, flat_positions)
-        grid = embeddings.new_zeros((streams, count, longest, embeddings.shape[-1]))
-        grid[valid_t] = embeddings
-        # One view per segment index. Slicing grid[:, k] inside the loop
-        # instead made the backward pass build a full-size zero gradient of
-        # grid for every k and add them up (64 x 67 MB at h256: about 100 ms
-        # of GPU time an update); unbind's backward stacks the K gradients
-        # once. The same values.
-        grid_steps = grid.unbind(1)
-
         if memory is None:
             records = embeddings.new_zeros((streams, 0, self.hidden_size))
             record_positions = torch.zeros((streams, 0), dtype=torch.long, device=device)
@@ -1519,54 +1527,23 @@ class SegmentMemoryLM(nn.Module):
             records, record_positions = memory
         zero_hidden = embeddings.new_zeros((1, streams, self.hidden_size))
         next_hidden = carried_hidden if carried_hidden is not None else zero_hidden
-        lengths_t = torch.from_numpy(lengths).to(device)
-        positions_t = torch.from_numpy(positions).to(device)
-        record_ends_t = torch.from_numpy(ends - 1).to(device)
-        stream_index = torch.arange(streams, device=device)
-        states = []
         context_norm_sum = 0.0
-        scored_k = None if score_mask is None else torch.from_numpy(np.ascontiguousarray(score_mask)).to(device)
-        for k in range(count):
-            width = int(lengths[:, k].max())
-            initial_hidden = next_hidden if carry_hidden else zero_hidden
-            hidden_seq, _ = self.rnn(grid_steps[k][:, :width], initial_hidden.contiguous())
-            if self.rope_positions == "char":
-                query_positions, memory_positions = positions_t[:, k, :width], record_positions
-            else:
-                query_positions = torch.zeros(width, device=device)
-                memory_positions = torch.arange(-records.shape[1], 0, device=device)
-            mem = self.memory_interface_norm(records)
-            state = hidden_seq
-            for block in self.gated_xattn_blocks:
-                state = block(
-                    state, mem, query_positions=query_positions, memory_positions=memory_positions, use_rope=self.use_rope
-                )
-            if collect_stats:
-                counted = valid_t[:, k, :width] if scored_k is None else valid_t[:, k, :width] & scored_k[:, k, None]
-                context_norm_sum += float((state - hidden_seq).norm(dim=-1)[counted].sum().item())
-            last = lengths_t[:, k] - 1
-            terminal = state[stream_index, last]  # [B, H]
-            terminal_context = terminal - hidden_seq[stream_index, last]
-            if self.memory_state == "fused":
-                cap_input = torch.cat([hidden_seq[stream_index, last], terminal_context], dim=1)
-                cap_state = self.cap_norm(torch.tanh(self.cap_fuse(cap_input)))
-            else:
-                cap_state = terminal
-            records = torch.cat([records, self.write_memory(cap_state).unsqueeze(1)], dim=1)[:, -max_memory:]
-            record_positions = torch.cat([record_positions, record_ends_t[:, k : k + 1]], dim=1)[:, -max_memory:]
-            if feedback_state == "context":
-                next_state = terminal_context
-            elif feedback_state == "gated":
-                feedback_input = torch.cat([terminal, terminal_context], dim=1)
-                feedback_update = self.feedback_update(feedback_input)
-                next_state = terminal + torch.sigmoid(self.feedback_gate(feedback_input)) * feedback_update
-            else:
-                next_state = terminal
-            next_state = self.bound_carry(next_state, hidden_seq[stream_index, last])
-            next_hidden = next_state.unsqueeze(0)
-            states.append(F.pad(state, (0, 0, 0, longest - width)))
-
-        final_states = torch.stack(states, dim=1)[valid_t]  # [N, H], (stream, segment, offset) order
+        if self.whole_span_gru(carry_hidden, feedback_state):
+            # Each stream's characters, in order, one row a stream: the flat
+            # (stream, segment, offset) order is row-major order here too.
+            stream_lengths = lengths.sum(axis=1)
+            span_valid = torch.from_numpy(np.arange(int(stream_lengths.max()))[None, :] < stream_lengths[:, None]).to(device)
+            span_grid = embeddings.new_zeros((streams, span_valid.shape[1], embeddings.shape[-1]))
+            span_grid[span_valid] = embeddings
+            span_out, _ = self.rnn(span_grid, next_hidden.contiguous())
+            final_states = span_out[span_valid]  # [N, H]
+            terminal = span_out[torch.arange(streams, device=device), torch.from_numpy(stream_lengths - 1).to(device)]
+            next_hidden = self.bound_carry(terminal, terminal).unsqueeze(0)
+        else:
+            final_states, records, record_positions, next_hidden, context_norm_sum = self.segment_steps_streams(
+                embeddings, valid, valid_t, lengths, positions, ends, records, record_positions, next_hidden,
+                zero_hidden, carry_hidden, feedback_state, max_memory, score_mask, collect_stats,
+            )
         own_logits = self.gru_head(self.drop(final_states))  # [N, V]
         logits, residual_logits, residual_alpha, _ = self.apply_prior_residual(
             own_logits,
@@ -1617,10 +1594,98 @@ class SegmentMemoryLM(nn.Module):
             if residual_alpha is not None:
                 stats["residual_alpha_sum"] = float(residual_alpha[keep].sum().item())
                 stats["residual_alpha_count"] = float(residual_alpha[keep].numel())
-            for block in self.gated_xattn_blocks:
+            for block in self.gated_xattn_blocks if self.mixing != "none" else ():
                 stats["gate_sum"] += float(torch.tanh(block.gate_attn).abs().item() + torch.tanh(block.gate_mlp).abs().item())
                 stats["gate_count"] += 2.0
         return loss, scored, (records, record_positions), next_hidden, stats
+
+    def segment_steps_streams(
+        self,
+        embeddings: torch.Tensor,
+        valid: np.ndarray,
+        valid_t: torch.Tensor,
+        lengths: np.ndarray,
+        positions: np.ndarray,
+        ends: np.ndarray,
+        records: torch.Tensor,
+        record_positions: torch.Tensor,
+        next_hidden: torch.Tensor,
+        zero_hidden: torch.Tensor,
+        carry_hidden: bool,
+        feedback_state: str,
+        max_memory: int,
+        score_mask: np.ndarray | None,
+        collect_stats: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """segment_loss_streams' loop over segment indices: one batched GRU
+        call each, the attention blocks over the records, then the record
+        written and the state carried. With memory off there are no blocks
+        and no records. Returns the final states [N, H] in (stream, segment,
+        offset) order, the records and their positions, the carried state and
+        the context norm sum (collect_stats)."""
+        device = embeddings.device
+        streams, count, longest = valid.shape
+        grid = embeddings.new_zeros((streams, count, longest, embeddings.shape[-1]))
+        grid[valid_t] = embeddings
+        # One view per segment index. Slicing grid[:, k] inside the loop
+        # instead made the backward pass build a full-size zero gradient of
+        # grid for every k and add them up (64 x 67 MB at h256: about 100 ms
+        # of GPU time an update); unbind's backward stacks the K gradients
+        # once. The same values.
+        grid_steps = grid.unbind(1)
+
+        memory_on = self.mixing != "none"
+        blocks = self.gated_xattn_blocks if memory_on else ()
+        lengths_t = torch.from_numpy(lengths).to(device)
+        positions_t = torch.from_numpy(positions).to(device)
+        record_ends_t = torch.from_numpy(ends - 1).to(device)
+        stream_index = torch.arange(streams, device=device)
+        states = []
+        context_norm_sum = 0.0
+        scored_k = None if score_mask is None else torch.from_numpy(np.ascontiguousarray(score_mask)).to(device)
+        for k in range(count):
+            width = int(lengths[:, k].max())
+            initial_hidden = next_hidden if carry_hidden else zero_hidden
+            hidden_seq, _ = self.rnn(grid_steps[k][:, :width], initial_hidden.contiguous())
+            if self.rope_positions == "char":
+                query_positions, memory_positions = positions_t[:, k, :width], record_positions
+            else:
+                query_positions = torch.zeros(width, device=device)
+                memory_positions = torch.arange(-records.shape[1], 0, device=device)
+            mem = self.memory_interface_norm(records)
+            state = hidden_seq
+            for block in blocks:
+                state = block(
+                    state, mem, query_positions=query_positions, memory_positions=memory_positions, use_rope=self.use_rope
+                )
+            if collect_stats:
+                counted = valid_t[:, k, :width] if scored_k is None else valid_t[:, k, :width] & scored_k[:, k, None]
+                context_norm_sum += float((state - hidden_seq).norm(dim=-1)[counted].sum().item())
+            last = lengths_t[:, k] - 1
+            terminal = state[stream_index, last]  # [B, H]
+            terminal_context = terminal - hidden_seq[stream_index, last]
+            if self.memory_state == "fused":
+                cap_input = torch.cat([hidden_seq[stream_index, last], terminal_context], dim=1)
+                cap_state = self.cap_norm(torch.tanh(self.cap_fuse(cap_input)))
+            else:
+                cap_state = terminal
+            if memory_on:
+                records = torch.cat([records, self.write_memory(cap_state).unsqueeze(1)], dim=1)[:, -max_memory:]
+                record_positions = torch.cat([record_positions, record_ends_t[:, k : k + 1]], dim=1)[:, -max_memory:]
+            if feedback_state == "context":
+                next_state = terminal_context
+            elif feedback_state == "gated":
+                feedback_input = torch.cat([terminal, terminal_context], dim=1)
+                feedback_update = self.feedback_update(feedback_input)
+                next_state = terminal + torch.sigmoid(self.feedback_gate(feedback_input)) * feedback_update
+            else:
+                next_state = terminal
+            next_state = self.bound_carry(next_state, hidden_seq[stream_index, last])
+            next_hidden = next_state.unsqueeze(0)
+            states.append(F.pad(state, (0, 0, 0, longest - width)))
+
+        final_states = torch.stack(states, dim=1)[valid_t]  # [N, H], (stream, segment, offset) order
+        return final_states, records, record_positions, next_hidden, context_norm_sum
 
 
 def split_streams(segments: list[tuple[int, int]], streams: int) -> list[list[tuple[int, int]]]:
@@ -1893,7 +1958,7 @@ def parse_args() -> argparse.Namespace:
         "--dropout",
         type=float,
         default=0.0,
-        help="dropout in the residual (gated-xattn only): its GRU input, the state its head reads, and inside "
+        help="dropout in the residual (gated-xattn or none): its GRU input, the state its head reads, and inside "
         "the attention blocks; never on the carried state, the memory records or the prior",
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)

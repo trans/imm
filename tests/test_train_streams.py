@@ -1,6 +1,7 @@
 """--train-streams: B streams batched through one GRU call per segment index
 give what B separate single-stream runs of segment_loss give (losses,
-gradients, memory, carried state)."""
+gradients, memory, carried state). With memory off (--mixing none), one GRU
+call over each stream's whole span gives the same."""
 
 import importlib.util
 import sys
@@ -44,7 +45,7 @@ def make_model(seed=0, layers=1, **overrides):
     model = runner.SegmentMemoryLM(
         V, H, H,
         use_rope=o["use_rope"], rope_positions=o["rope_positions"], memory_state=o["memory_state"],
-        memory_record=o["memory_record"], rnn_core="gru", attn_interface_norm="none", mixing="gated-xattn",
+        memory_record=o["memory_record"], rnn_core="gru", attn_interface_norm="none", mixing=o.get("mixing", "gated-xattn"),
         attention_layers=layers, attention_heads=2, input_rope=o["input_rope"], feedback_gate_bias=-1.0,
         feedback_delta_cap=1.0, prior_strength=1.0, prior_residual_scale=1.0, prior_residual_l2=o["prior_residual_l2"],
         prior_residual_gate=o["prior_residual_gate"], prior_residual_gate_max=2.0, prior_residual_gate_features=3,
@@ -150,8 +151,12 @@ class TrainStreamsTest(unittest.TestCase):
         for name in want_grads:
             torch.testing.assert_close(got_grads[name], want_grads[name], rtol=1e-4, atol=1e-5, msg=name)
         # stream 0's memory and carried state, as its own run left them
-        torch.testing.assert_close(memory[0][0], torch.cat([s for s, _ in want_memory0]), rtol=1e-5, atol=1e-5)
-        self.assertEqual(memory[1][0].tolist(), [p for _, p in want_memory0])
+        if model.mixing == "none":  # segment_loss writes records nothing reads; the batched path writes none
+            self.assertEqual(memory[0].shape[1], 0)
+            self.assertEqual(memory[1].shape[1], 0)
+        else:
+            torch.testing.assert_close(memory[0][0], torch.cat([s for s, _ in want_memory0]), rtol=1e-5, atol=1e-5)
+            self.assertEqual(memory[1][0].tolist(), [p for _, p in want_memory0])
         torch.testing.assert_close(hidden[:, 0], want_hidden0[:, 0], rtol=1e-5, atol=1e-5)
         return got_losses
 
@@ -174,6 +179,68 @@ class TrainStreamsTest(unittest.TestCase):
     def test_memory_longer_than_max_memory(self) -> None:
         # 3 updates of 5 segments against max_memory 4: memory rolls over
         self.run_both(2, updates=3, per_update=5)
+
+    def test_memory_off_is_segment_loss(self) -> None:
+        # The carried state is the GRU's own, so one call runs each stream's
+        # whole span; it must match segment_loss segment by segment.
+        for name, variant in VARIANTS.items():
+            for streams in (1, 3):
+                with self.subTest(name, streams=streams):
+                    model = make_model(mixing="none", **variant)
+                    self.assertTrue(model.whole_span_gru(True, "gru"))
+                    self.run_both(streams, mixing="none", **variant)
+
+    def test_memory_off_whole_span_only_when_the_carry_is_unchanged(self) -> None:
+        # H = 8: a norm bound of 3 (9 >= 8) never binds a GRU state, 2 can.
+        self.assertTrue(make_model(mixing="none", carry_bound="norm", carry_scale=3.0).whole_span_gru(True, "gru"))
+        self.assertTrue(make_model(mixing="none", carry_bound="gru").whole_span_gru(True, "gru"))
+        for overrides, carry_hidden, feedback_state in (
+            (dict(carry_bound="norm", carry_scale=2.0), True, "gru"),
+            (dict(carry_bound="tanh", carry_scale=1.0), True, "gru"),
+            ({}, False, "gru"),
+            ({}, True, "gated"),
+        ):
+            self.assertFalse(make_model(mixing="none", **overrides).whole_span_gru(carry_hidden, feedback_state))
+        self.assertFalse(make_model().whole_span_gru(True, "gru"))  # memory on
+
+    def test_memory_off_per_segment_loop(self) -> None:
+        # Where the carry changes the state, the per-segment loop runs, with
+        # no records and no attention, and still matches segment_loss.
+        for overrides, feedback_state in (
+            (dict(carry_bound="tanh", carry_scale=1.0), "gru"),
+            (dict(carry_bound="norm", carry_scale=0.5), "gru"),
+            ({}, "gated"),
+        ):
+            with self.subTest(**overrides, feedback_state=feedback_state):
+                self.run_both(3, mixing="none", feedback_state=feedback_state, **overrides)
+
+    def test_memory_off_whole_span_with_dropout_is_the_loop(self) -> None:
+        # Both forms draw their dropout masks in the same calls (the GRU's
+        # input, then the head's), so the same seed gives the same masks.
+        ids, rows = corpus()
+        segs = runner.split_streams(ragged_segments(len(ids) - 1), 3)
+        model = make_model(mixing="none", dropout=0.3)
+        model.train()
+        got = []
+        for whole in (True, False):
+            model.whole_span_gru = lambda carry_hidden, feedback_state, whole=whole: whole
+            model.zero_grad()
+            torch.manual_seed(5)
+            hidden = None
+            losses = []
+            for u in range(2):
+                part = [s[u * 5 : (u + 1) * 5] for s in segs]
+                loss, _, _, hidden, _ = batched(model, ids, rows, part, None, hidden, "gru")
+                loss.backward()
+                losses.append(loss.detach())
+                hidden = hidden.detach()
+            got.append((torch.stack(losses), grads(model), hidden))
+        (la, ga, ha), (lb, gb, hb) = got
+        torch.testing.assert_close(la, lb, rtol=1e-5, atol=1e-5)
+        self.assertEqual(set(ga), set(gb))
+        for name in ga:
+            torch.testing.assert_close(ga[name], gb[name], rtol=1e-4, atol=1e-5, msg=name)
+        torch.testing.assert_close(ha, hb, rtol=1e-5, atol=1e-5)
 
     def test_eval_mode_has_no_l2_term(self) -> None:
         ids, rows = corpus()
