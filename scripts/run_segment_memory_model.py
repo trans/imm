@@ -277,8 +277,14 @@ class GatedCrossAttentionBlock(nn.Module):
         memory_positions: torch.Tensor | None = None,
         use_rope: bool = True,
         return_diagnostics: bool = False,
+        memory_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+        """memory_mask ([B, T, M] bool), if given, says which records each
+        query may see; a query that sees none gets no attention output, as
+        with an empty memory."""
         stats = empty_stats()
+        if memory_mask is not None and return_diagnostics:
+            raise ValueError("memory_mask has no diagnostics")
         if memory.shape[1] > 0:
             batch_size, query_count, _ = hidden.shape
             memory_count = memory.shape[1]
@@ -294,6 +300,11 @@ class GatedCrossAttentionBlock(nn.Module):
             query = self.apply_rope(query, query_positions, use_rope)
             key = self.apply_rope(key, memory_positions, use_rope)
             scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_dim)
+            if memory_mask is not None:
+                # The lowest finite value, not -inf: a query that sees nothing
+                # gets even weights instead of NaN, and its output is zeroed
+                # below. Elsewhere exp(lowest - max) is exactly 0.
+                scores = scores.masked_fill(~memory_mask[:, None], torch.finfo(scores.dtype).min)
             weights = torch.softmax(scores, dim=-1)
             if return_diagnostics:
                 mean_weights = weights.mean(dim=1).squeeze(0)
@@ -312,6 +323,8 @@ class GatedCrossAttentionBlock(nn.Module):
             attn_out = self.drop(weights) @ value
             attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, query_count, self.hidden_size)
             attn_out = self.drop(self.out_proj(attn_out))
+            if memory_mask is not None:
+                attn_out = attn_out * memory_mask.any(dim=-1, keepdim=True).to(attn_out.dtype)
         else:
             attn_out = torch.zeros_like(hidden)
         hidden = hidden + torch.tanh(self.gate_attn) * attn_out
@@ -402,6 +415,12 @@ class SegmentMemoryLM(nn.Module):
         self.hidden_size = hidden_size
         self.use_rope = use_rope
         self.rope_positions = rope_positions
+        if memory_state not in ("terminal", "fused", "gru"):
+            raise ValueError(f"unknown memory_state: {memory_state}")
+        # What a segment's record is written from: "terminal", the state after
+        # the attention blocks at its last character; "fused", that and the
+        # GRU's state, fused; "gru", the GRU's own state there, so records
+        # never hold what the attention read.
         self.memory_state = memory_state
         self.memory_record = memory_record
         self.rnn_core = rnn_core
@@ -1068,6 +1087,8 @@ class SegmentMemoryLM(nn.Module):
             if self.memory_state == "fused":
                 cap_input = torch.cat([final_state, final_context], dim=1)
                 cap_state = self.cap_norm(torch.tanh(self.cap_fuse(cap_input)))
+            elif self.memory_state == "gru":
+                raise ValueError("--memory-state gru isn't supported with token feedback")
             else:
                 cap_state = final_state
             memory.append((self.write_memory(cap_state), end - 1))
@@ -1374,6 +1395,8 @@ class SegmentMemoryLM(nn.Module):
             if self.memory_state == "fused":
                 cap_input = torch.cat([hidden_seq[-1:].contiguous(), context[-1:].contiguous()], dim=1)
                 cap_state = self.cap_norm(torch.tanh(self.cap_fuse(cap_input)))
+            elif self.memory_state == "gru":
+                cap_state = hidden_seq[-1:].contiguous()
             else:
                 cap_state = terminal
             memory_record = self.write_memory(cap_state)
@@ -1430,6 +1453,98 @@ class SegmentMemoryLM(nn.Module):
             return True
         return self.carry_bound == "norm" and self.carry_scale**2 >= self.hidden_size
 
+    def parallel_memory(self, carry_hidden: bool) -> bool:
+        """Whether the batched path can run a whole update at once with the
+        memory on: the attention never reaches the GRU (it carries its own
+        state, --carry-bound gru) and records are the GRU's own states
+        (--memory-state gru), so one GRU call gives every state and every
+        record, and each attention block runs over all positions with a mask
+        over the records. Positions are characters (--rope-positions char)."""
+        return (
+            self.mixing == "gated-xattn"
+            and carry_hidden
+            and self.carry_bound == "gru"
+            and self.memory_state == "gru"
+            and self.rope_positions == "char"
+        )
+
+    def span_gru(
+        self, embeddings: torch.Tensor, lengths: np.ndarray, initial_hidden: torch.Tensor
+    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+        """One GRU call over each stream's characters in order, one row a
+        stream, from initial_hidden: the flat (stream, segment, offset) order
+        of embeddings is the rows' row-major order. Returns the rows' real
+        positions ([B, T] bool, numpy and on the device) and the GRU's
+        states [B, T, H]."""
+        stream_lengths = lengths.sum(axis=1)
+        span_valid = np.arange(int(stream_lengths.max()))[None, :] < stream_lengths[:, None]
+        span_valid_t = torch.from_numpy(span_valid).to(embeddings.device)
+        span_grid = embeddings.new_zeros((lengths.shape[0], span_valid.shape[1], embeddings.shape[-1]))
+        span_grid[span_valid_t] = embeddings
+        span_out, _ = self.rnn(span_grid, initial_hidden.contiguous())
+        return span_valid, span_valid_t, span_out
+
+    def parallel_memory_streams(
+        self,
+        embeddings: torch.Tensor,
+        valid: np.ndarray,
+        lengths: np.ndarray,
+        positions: np.ndarray,
+        ends: np.ndarray,
+        records: torch.Tensor,
+        record_positions: torch.Tensor,
+        next_hidden: torch.Tensor,
+        max_memory: int,
+        score_mask: np.ndarray | None,
+        collect_stats: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """segment_steps_streams' result, all at once (parallel_memory): one
+        GRU call; segment k's record from the GRU's state at its last
+        character; each attention block over every position, a position in
+        segment k seeing the records the loop would hold there: those carried
+        in and those of segments before k, the last max_memory of them."""
+        device = embeddings.device
+        streams, count, _ = valid.shape
+        span_valid, span_valid_t, gru_states = self.span_gru(embeddings, lengths, next_hidden)
+        span_length = span_valid.shape[1]
+        stream_index = torch.arange(streams, device=device)
+        last = torch.from_numpy(np.cumsum(lengths, axis=1) - 1).to(device)  # [B, K]: each segment's last character
+        gru_terminal = gru_states[stream_index[:, None], last]  # [B, K, H]
+        held = records.shape[1]
+        records = torch.cat([records, self.write_memory(gru_terminal)], dim=1)  # [B, held + K, H]
+        record_positions = torch.cat([record_positions, torch.from_numpy(ends - 1).to(device)], dim=1)
+        # Each row position's segment and character position. Padding takes
+        # the last segment and position 0; its outputs are dropped.
+        segment_of = np.full((streams, span_length), count - 1, dtype=np.int64)
+        segment_of[span_valid] = np.broadcast_to(np.arange(count)[None, :, None], valid.shape)[valid]
+        char_position = np.zeros((streams, span_length), dtype=np.int64)
+        char_position[span_valid] = positions[valid]
+        seen_until = held + torch.from_numpy(segment_of).to(device)  # [B, T]: records before this one are written
+        record_index = torch.arange(records.shape[1], device=device)
+        visible = (record_index < seen_until[..., None]) & (record_index >= seen_until[..., None] - max_memory)
+        mem = self.memory_interface_norm(records)
+        query_positions = torch.from_numpy(char_position).to(device)
+        state = gru_states
+        for block in self.gated_xattn_blocks:
+            state = block(
+                state, mem, query_positions=query_positions, memory_positions=record_positions,
+                use_rope=self.use_rope, memory_mask=visible,
+            )
+        context_norm_sum = 0.0
+        if collect_stats:
+            counted = span_valid if score_mask is None else span_valid & score_mask[np.arange(streams)[:, None], segment_of]
+            counted_t = torch.from_numpy(counted).to(device)
+            context_norm_sum = float((state - gru_states).norm(dim=-1)[counted_t].sum().item())
+        stream_last = gru_terminal[:, -1]
+        next_hidden = self.bound_carry(stream_last, stream_last).unsqueeze(0)
+        return (
+            state[span_valid_t],
+            records[:, -max_memory:],
+            record_positions[:, -max_memory:],
+            next_hidden,
+            context_norm_sum,
+        )
+
     def segment_loss_streams(
         self,
         ids: torch.Tensor,
@@ -1453,7 +1568,8 @@ class SegmentMemoryLM(nn.Module):
         sum over streams. Each segment index is one batched GRU call, padded to
         the longest of the B segments. With memory off (--mixing none) and the
         state carried unchanged (whole_span_gru), one GRU call runs each
-        stream's whole span instead.
+        stream's whole span instead; with the attention kept out of the GRU
+        (parallel_memory), so does the whole update.
 
         Every stream has the same number of segments. Prior rows hold each
         stream's span (its first segment's start to its last segment's end),
@@ -1529,16 +1645,16 @@ class SegmentMemoryLM(nn.Module):
         next_hidden = carried_hidden if carried_hidden is not None else zero_hidden
         context_norm_sum = 0.0
         if self.whole_span_gru(carry_hidden, feedback_state):
-            # Each stream's characters, in order, one row a stream: the flat
-            # (stream, segment, offset) order is row-major order here too.
-            stream_lengths = lengths.sum(axis=1)
-            span_valid = torch.from_numpy(np.arange(int(stream_lengths.max()))[None, :] < stream_lengths[:, None]).to(device)
-            span_grid = embeddings.new_zeros((streams, span_valid.shape[1], embeddings.shape[-1]))
-            span_grid[span_valid] = embeddings
-            span_out, _ = self.rnn(span_grid, next_hidden.contiguous())
-            final_states = span_out[span_valid]  # [N, H]
-            terminal = span_out[torch.arange(streams, device=device), torch.from_numpy(stream_lengths - 1).to(device)]
+            _, span_valid_t, span_out = self.span_gru(embeddings, lengths, next_hidden)
+            final_states = span_out[span_valid_t]  # [N, H]
+            stream_last = torch.from_numpy(lengths.sum(axis=1) - 1).to(device)
+            terminal = span_out[torch.arange(streams, device=device), stream_last]
             next_hidden = self.bound_carry(terminal, terminal).unsqueeze(0)
+        elif self.parallel_memory(carry_hidden):
+            final_states, records, record_positions, next_hidden, context_norm_sum = self.parallel_memory_streams(
+                embeddings, valid, lengths, positions, ends, records, record_positions, next_hidden, max_memory,
+                score_mask, collect_stats,
+            )
         else:
             final_states, records, record_positions, next_hidden, context_norm_sum = self.segment_steps_streams(
                 embeddings, valid, valid_t, lengths, positions, ends, records, record_positions, next_hidden,
@@ -1667,6 +1783,8 @@ class SegmentMemoryLM(nn.Module):
             if self.memory_state == "fused":
                 cap_input = torch.cat([hidden_seq[stream_index, last], terminal_context], dim=1)
                 cap_state = self.cap_norm(torch.tanh(self.cap_fuse(cap_input)))
+            elif self.memory_state == "gru":
+                cap_state = hidden_seq[stream_index, last]
             else:
                 cap_state = terminal
             if memory_on:
@@ -1840,7 +1958,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-rope", action="store_true")
     parser.add_argument("--input-rope", action="store_true")
     parser.add_argument("--rope-positions", choices=["segment", "char"], default="segment")
-    parser.add_argument("--memory-state", choices=["terminal", "fused"], default="terminal")
+    parser.add_argument(
+        "--memory-state",
+        choices=["terminal", "fused", "gru"],
+        default="terminal",
+        help="what a segment's record is written from: the state after the attention blocks (terminal), that fused "
+        "with the GRU's state, or the GRU's own state (gru; with --carry-bound gru the batched path runs each update "
+        "in parallel)",
+    )
     parser.add_argument("--memory-record", choices=["raw", "written"], default="raw")
     parser.add_argument("--record-aux-weight", type=float, default=0.0)
     parser.add_argument("--terminal-record-aux-weight", type=float, default=0.0)
@@ -4050,6 +4175,16 @@ def main() -> None:
     if args.train_streams > 1:
         model.check_streams_supported(args.token_feedback)
         stream_segments = split_streams(train_segments, args.train_streams)
+    # How the batched path runs an update: all at once, memory on
+    # (parallel) or off (whole-span), or one GRU call per segment index.
+    if args.train_streams < 2:
+        memory_path = "single-stream"
+    elif model.parallel_memory(args.carry_hidden):
+        memory_path = "parallel"
+    elif model.whole_span_gru(args.carry_hidden, args.feedback_state):
+        memory_path = "whole-span"
+    else:
+        memory_path = "segments"
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start_epoch = 1
     step = 0
@@ -4150,7 +4285,7 @@ def main() -> None:
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} "
-            f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} "
+            f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
             f"prior_strength={args.prior_strength} "

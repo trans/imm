@@ -1,13 +1,16 @@
 """--train-streams: B streams batched through one GRU call per segment index
 give what B separate single-stream runs of segment_loss give (losses,
 gradients, memory, carried state). With memory off (--mixing none), one GRU
-call over each stream's whole span gives the same."""
+call over each stream's whole span gives the same; so does the parallel path
+(--carry-bound gru --memory-state gru): one GRU call, then each attention
+block over every position at once, with a mask over the records."""
 
 import importlib.util
 import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 
 V = 7
@@ -241,6 +244,82 @@ class TrainStreamsTest(unittest.TestCase):
         for name in ga:
             torch.testing.assert_close(ga[name], gb[name], rtol=1e-4, atol=1e-5, msg=name)
         torch.testing.assert_close(ha, hb, rtol=1e-5, atol=1e-5)
+
+    PARALLEL = dict(carry_bound="gru", memory_state="gru")
+
+    def test_parallel_memory_is_segment_loss(self) -> None:
+        # Against separate single-stream runs; max_memory 4 against 5
+        # segments an update, so the mask's window slides and records roll
+        # over between updates; one and two blocks.
+        for name, variant in VARIANTS.items():
+            if variant.get("rope_positions") == "segment":
+                continue  # parallel needs char positions
+            variant = {**variant, **self.PARALLEL}
+            for streams, layers in ((1, 1), (3, 1), (2, 2)):
+                with self.subTest(name, streams=streams, layers=layers):
+                    self.assertTrue(make_model(layers=layers, **variant).parallel_memory(True))
+                    self.run_both(streams, layers=layers, **variant)
+
+    def test_parallel_memory_is_the_loop(self) -> None:
+        # The same updates through the per-segment loop, with dropout on in
+        # eval mode (off) and in train mode at 0.
+        ids, rows = corpus()
+        segs = runner.split_streams(ragged_segments(len(ids) - 1), 3)
+        for dropout, train in ((0.0, True), (0.3, False)):
+            model = make_model(layers=2, dropout=dropout, **self.PARALLEL)
+            model.train(train)
+            got = []
+            for parallel in (True, False):
+                model.parallel_memory = lambda carry_hidden, parallel=parallel: parallel
+                model.zero_grad()
+                memory, hidden, losses = None, None, []
+                for u in range(3):
+                    part = [s[u * 5 : (u + 1) * 5] for s in segs]
+                    loss, _, memory, hidden, _ = batched(model, ids, rows, part, memory, hidden, "gru")
+                    loss.backward()
+                    losses.append(loss.detach())
+                    memory, hidden = (memory[0].detach(), memory[1]), hidden.detach()
+                got.append((torch.stack(losses), grads(model), memory, hidden))
+            (la, ga, ma, ha), (lb, gb, mb, hb) = got
+            torch.testing.assert_close(la, lb, rtol=1e-5, atol=1e-5)
+            self.assertEqual(set(ga), set(gb))
+            for name in ga:
+                torch.testing.assert_close(ga[name], gb[name], rtol=1e-4, atol=1e-5, msg=name)
+            torch.testing.assert_close(ma[0], mb[0], rtol=1e-5, atol=1e-5)
+            self.assertTrue(torch.equal(ma[1], mb[1]))
+            torch.testing.assert_close(ha, hb, rtol=1e-5, atol=1e-5)
+
+    def test_parallel_memory_scored_segments(self) -> None:
+        # evaluate's burn-in: a score mask and the collected stats agree with the loop
+        ids, rows = corpus()
+        segs = runner.split_streams(ragged_segments(len(ids) - 1), 3)
+        part = [s[:6] for s in segs]
+        spans = [(p[0][0], p[-1][1]) for p in part]
+        given = {k: runner.prior_rows_for_spans(v, spans, torch.device("cpu")) for k, v in rows.items()}
+        score_mask = np.array([[False, False, True, True, True, True]] * 3)
+        model = make_model(**self.PARALLEL)
+        model.eval()
+        got = []
+        for parallel in (True, False):
+            model.parallel_memory = lambda carry_hidden, parallel=parallel: parallel
+            loss, scored, _, _, stats = model.segment_loss_streams(
+                ids, part, None, 4, carry_hidden=True, score_mask=score_mask, collect_stats=True, **given
+            )
+            got.append((float(loss.detach()), scored, stats))
+        (la, sa, sta), (lb, sb, stb) = got
+        self.assertAlmostEqual(la, lb, places=4)
+        self.assertEqual(sa, sb)
+        for key in ("context_norm_sum", "first_token_loss", "later_token_loss", "gate_sum", "residual_alpha_sum"):
+            self.assertAlmostEqual(sta[key], stb[key], places=3, msg=key)
+
+    def test_parallel_memory_only_when_attention_stays_out_of_the_gru(self) -> None:
+        self.assertFalse(make_model().parallel_memory(True))
+        self.assertFalse(make_model(carry_bound="gru").parallel_memory(True))
+        self.assertFalse(make_model(memory_state="gru").parallel_memory(True))
+        self.assertFalse(make_model(**self.PARALLEL).parallel_memory(False))
+        self.assertFalse(make_model(rope_positions="segment", **self.PARALLEL).parallel_memory(True))
+        with self.assertRaisesRegex(ValueError, "unknown memory_state"):
+            make_model(memory_state="nope")
 
     def test_eval_mode_has_no_l2_term(self) -> None:
         ids, rows = corpus()
