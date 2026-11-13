@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import gc
 import hashlib
@@ -63,6 +64,7 @@ PriorRows = torch.Tensor | np.memmap | CompactEvidenceRows
 class EpochProfile:
     zero_sec: float = 0.0
     rows_sec: float = 0.0  # gathering prior rows (from memmaps) and copying them to the device
+    rows_wait_sec: float = 0.0  # of rows_sec: waiting for the background reader (--prefetch-rows)
     forward_sec: float = 0.0
     wait_sec: float = 0.0  # loss.item(): waiting for the device to finish the forward pass
     backward_sec: float = 0.0
@@ -93,6 +95,7 @@ def profile_summary(profile: EpochProfile) -> str:
         f"tok_per_sec={profile.tokens / train_sec if profile.tokens else 0.0:.1f} "
         f"zero={profile.zero_sec:.2f}s/{100.0 * profile.zero_sec / train_sec:.1f}% "
         f"rows={profile.rows_sec:.2f}s/{100.0 * profile.rows_sec / train_sec:.1f}% "
+        f"rows_wait={profile.rows_wait_sec:.2f}s/{100.0 * profile.rows_wait_sec / train_sec:.1f}% "
         f"forward={profile.forward_sec:.2f}s/{100.0 * profile.forward_sec / train_sec:.1f}% "
         f"wait={profile.wait_sec:.2f}s/{100.0 * profile.wait_sec / train_sec:.1f}% "
         f"backward={profile.backward_sec:.2f}s/{100.0 * profile.backward_sec / train_sec:.1f}% "
@@ -1925,6 +1928,27 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="with --train-streams > 1, read the next update's prior rows in a background thread (same rows)",
+    )
+    parser.add_argument(
+        "--prefetch-ahead",
+        type=int,
+        default=2,
+        help="with --prefetch-rows, how many updates' rows are read ahead, that many at once (same rows; 1 was the "
+        "behaviour before 2026-11-13)",
+    )
+    parser.add_argument(
+        "--row-gather",
+        choices=("vector", "spans"),
+        default="vector",
+        help="with --prefetch-rows, read each source's spans in a few numpy calls (vector) or a slice per span "
+        "(spans, the behaviour before 2026-11-13); the same rows",
+    )
+    parser.add_argument(
+        "--pin-rows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --prefetch-rows on CUDA and --row-gather vector, read rows into pinned memory and copy them to "
+        "the GPU without blocking (same rows)",
     )
     parser.add_argument(
         "--drop-evidence-cache",
@@ -4202,7 +4226,10 @@ def main() -> None:
                 print(f"epoch={epoch} input_noise={args.input_noise} chars_changed={changed}", flush=True)
             stream_length = len(train_segments) if args.train_streams == 1 else len(stream_segments[0])
             prefetcher = None
+            pin_rows = args.pin_rows and args.row_gather == "vector" and device.type == "cuda"
             if args.train_streams > 1 and args.prefetch_rows:
+                if args.prefetch_ahead < 1:
+                    raise ValueError("--prefetch-ahead must be at least 1")
                 prefetcher = RowPrefetcher(
                     {
                         "prior_log_probs": train_prior_log_probs,
@@ -4210,13 +4237,21 @@ def main() -> None:
                         "prior_evidence": train_prior_evidence,
                     },
                     drop_cache=("prior_evidence",) if args.drop_evidence_cache else (),
+                    workers=args.prefetch_ahead,
+                    gather=args.row_gather,
+                    pin=pin_rows,
                 )
 
                 def update_spans(at: int) -> list[tuple[int, int]]:
                     last = min(at + args.segments_per_update, stream_length) - 1
                     return [(segs[at][0], segs[last][1]) for segs in stream_segments]
 
-                pending = prefetcher.submit(update_spans(0))
+                # The next --prefetch-ahead updates' reads, oldest first.
+                pending = collections.deque(
+                    prefetcher.submit(update_spans(at))
+                    for at in range(0, stream_length, args.segments_per_update)[: args.prefetch_ahead]
+                )
+                next_submit = min(stream_length, args.prefetch_ahead * args.segments_per_update)
             for offset in range(0, stream_length, args.segments_per_update):
                 step += 1
                 if args.lr_schedule == "cosine":
@@ -4231,10 +4266,15 @@ def main() -> None:
                     batch_streams = [segs[offset : offset + args.segments_per_update] for segs in stream_segments]
                     spans = [(segs[0][0], segs[-1][1]) for segs in batch_streams]
                     if prefetcher is not None:
-                        host_rows = pending.result()
-                        if offset + args.segments_per_update < stream_length:
-                            pending = prefetcher.submit(update_spans(offset + args.segments_per_update))
-                        batch_rows = {name: rows_to_device(rows, device) for name, rows in host_rows.items()}
+                        t_wait = time.perf_counter()
+                        host_rows = pending.popleft().result()
+                        step_profile.rows_wait_sec += time.perf_counter() - t_wait
+                        if next_submit < stream_length:
+                            pending.append(prefetcher.submit(update_spans(next_submit)))
+                            next_submit += args.segments_per_update
+                        batch_rows = {
+                            name: rows_to_device(rows, device, non_blocking=pin_rows) for name, rows in host_rows.items()
+                        }
                     else:
                         batch_rows = {
                             "prior_log_probs": prior_rows_for_spans(train_prior_log_probs, spans, device),

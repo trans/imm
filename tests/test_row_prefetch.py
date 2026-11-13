@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from imm.row_prefetch import PageDropper, RowPrefetcher, gather_span_rows, rows_to_device
+from imm.row_prefetch import PageDropper, RowPrefetcher, gather_span_rows, rows_to_device, take_span_rows
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_train_streams import runner  # noqa: E402
@@ -43,6 +43,42 @@ class RowPrefetchTest(unittest.TestCase):
                     want = runner.prior_rows_for_spans(rows, spans, cpu)
                     self.assertTrue(torch.equal(rows_to_device(got[name], cpu), want), name)
             prefetcher.close()
+
+    def test_vector_gather_and_several_workers_give_the_same_rows(self) -> None:
+        cpu = torch.device("cpu")
+        spans_list = self.spans + [[(10, 10), (4999, 5000), (0, 3)], [(2000, 2000)]]
+        sources = {"evidence": self.mm, "array": self.data, "features": self.tensor, "none": None}
+        for workers in (1, 3):
+            prefetcher = RowPrefetcher(sources, workers=workers, gather="vector")
+            futures = [prefetcher.submit(spans) for spans in spans_list]
+            for spans, future in zip(spans_list, futures):
+                got = future.result()
+                self.assertIsNone(got["none"])
+                for name, rows in (("evidence", self.mm), ("array", self.data), ("features", self.tensor)):
+                    want = runner.prior_rows_for_spans(rows, spans, cpu)
+                    have = rows_to_device(got[name], cpu)
+                    self.assertEqual(have.dtype, want.dtype, name)
+                    self.assertTrue(torch.equal(have, want), (workers, name, spans))
+            prefetcher.close()
+
+    def test_take_span_rows_matches_gather_span_rows(self) -> None:
+        for rows in (self.mm, self.data, self.tensor, None):
+            for spans in self.spans:
+                a, b = gather_span_rows(rows, spans), take_span_rows(rows, spans)
+                if rows is None:
+                    self.assertIsNone(b)
+                    continue
+                a = a if isinstance(a, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(a))
+                b = b if isinstance(b, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(b))
+                self.assertTrue(torch.equal(a, b))
+
+    def test_refusals(self) -> None:
+        with self.assertRaises(ValueError):
+            RowPrefetcher({}, gather="other")
+        with self.assertRaises(ValueError):
+            RowPrefetcher({}, gather="spans", pin=True)
+        with self.assertRaises(ValueError):
+            RowPrefetcher({}, workers=0)
 
     def test_dropping_pages_keeps_values(self) -> None:
         dropper = PageDropper(self.mm)

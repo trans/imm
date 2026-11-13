@@ -122,6 +122,30 @@ class CompactEvidenceTest(unittest.TestCase):
             self.assertTrue(same_bytes(rows[0:300], x))
             self.assertTrue(same_bytes(rows[3:5], x[3:5]))
 
+    def test_take_spans_is_the_slices_one_after_another(self) -> None:
+        """take_spans (the reader's few-call gather) gives the same bytes as
+        concatenating slices, at every shallow depth, with empty spans,
+        spans out of order and a reused out buffer."""
+        span_sets = [
+            [(0, 37), (37, 90), (120, 199)],
+            [(150, 151), (3, 3), (10, 60), (0, 2), (198, 199)],
+            [(5, 5)],
+            [(0, 199)],
+        ]
+        for shallow in (0, 1, 3, DEPTH):
+            out_prefix = self.convert(shallow)
+            rows = load_compact(out_prefix, json.loads(out_prefix.with_name(out_prefix.name + ".json").read_text()))["train"]
+            for spans in span_sets:
+                want = np.concatenate([rows[a:b] for a, b in spans])
+                self.assertTrue(same_bytes(rows.take_spans(spans), want), (shallow, spans))
+                buf = np.full(want.shape, np.float16(7.0))
+                self.assertIs(rows.take_spans(spans, out=buf), buf)
+                self.assertTrue(same_bytes(buf, want), (shallow, spans, "out"))
+            with self.assertRaises(IndexError):
+                rows.take_spans([(0, len(rows) + 1)])
+            with self.assertRaises(ValueError):
+                rows.take_spans([(0, 4)], out=np.zeros((3, DEPTH, rows.width), np.float16))
+
     def test_the_runner_loads_compact_evidence_as_the_dense_rows(self) -> None:
         out = self.convert(3)
         device = torch.device("cpu")

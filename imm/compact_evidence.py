@@ -156,8 +156,53 @@ class CompactEvidenceRows:
             flat[local, np.asarray(self.pos[p0:p1]).astype(np.int64) + self.shallow * self.width] = self.val[p0:p1]
         return out
 
+    def take_spans(self, spans: list[tuple[int, int]], out: np.ndarray | None = None) -> np.ndarray:
+        """Rows start..end - 1 of each span, the spans one after another: the
+        same bytes as concatenating self[start:end] over the spans, in a
+        few numpy calls whatever the number of spans. Written into out
+        (float16, (rows, depth, width)) if given."""
+        starts = np.array([a for a, _ in spans], dtype=np.int64)
+        ends = np.array([b for _, b in spans], dtype=np.int64)
+        if ((starts < 0) | (ends > self.rows) | (ends < starts)).any():
+            raise IndexError("compact evidence spans must lie within the rows")
+        idx = ragged_arange(starts, ends)
+        n = len(idx)
+        shape = (n, self.depth, self.width)
+        if out is None:
+            out = np.zeros(shape, dtype=np.float16)
+        else:
+            if out.shape != shape or out.dtype != np.float16 or not out.flags.c_contiguous:
+                raise ValueError(f"out must be C-contiguous float16 {shape}, got {out.dtype} {out.shape}")
+            out.fill(0)
+        if n == 0:
+            return out
+        if self.shallow:
+            out[:, : self.shallow] = np.take(self.table, np.take(self.index, idx), axis=0)
+        nz_starts = np.take(self.ptr, starts)
+        nz_ends = np.take(self.ptr, ends)
+        if int((nz_ends - nz_starts).sum()):
+            # A span's nonzeros are one contiguous run of pos and val: block
+            # copies, not a per-element gather.
+            pos = np.concatenate([self.pos[a:b] for a, b in zip(nz_starts.tolist(), nz_ends.tolist())])
+            val = np.concatenate([self.val[a:b] for a, b in zip(nz_starts.tolist(), nz_ends.tolist())])
+            counts = np.take(self.ptr, idx + 1) - np.take(self.ptr, idx)
+            local = np.repeat(np.arange(n, dtype=np.int64), counts)
+            out.reshape(-1)[local * (self.depth * self.width) + pos.astype(np.int64) + self.shallow * self.width] = val
+        return out
+
     def dense(self) -> np.ndarray:
         return self[0 : self.rows]
+
+
+def ragged_arange(starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """The integers starts[i]..ends[i] - 1 for each i, one run after another
+    (int64)."""
+    lengths = ends - starts
+    total = int(lengths.sum())
+    if total == 0:
+        return np.zeros(0, dtype=np.int64)
+    run_start = np.cumsum(lengths) - lengths  # where each run begins in the output
+    return np.repeat(starts - run_start, lengths) + np.arange(total, dtype=np.int64)
 
 
 def load_compact(prefix: Path, meta: dict) -> dict[str, CompactEvidenceRows]:
