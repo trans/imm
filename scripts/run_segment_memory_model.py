@@ -1505,6 +1505,12 @@ class SegmentMemoryLM(nn.Module):
         embeddings = self.apply_input_rope(embeddings, flat_positions)
         grid = embeddings.new_zeros((streams, count, longest, embeddings.shape[-1]))
         grid[valid_t] = embeddings
+        # One view per segment index. Slicing grid[:, k] inside the loop
+        # instead made the backward pass build a full-size zero gradient of
+        # grid for every k and add them up (64 x 67 MB at h256: about 100 ms
+        # of GPU time an update); unbind's backward stacks the K gradients
+        # once. The same values.
+        grid_steps = grid.unbind(1)
 
         if memory is None:
             records = embeddings.new_zeros((streams, 0, self.hidden_size))
@@ -1523,7 +1529,7 @@ class SegmentMemoryLM(nn.Module):
         for k in range(count):
             width = int(lengths[:, k].max())
             initial_hidden = next_hidden if carry_hidden else zero_hidden
-            hidden_seq, _ = self.rnn(grid[:, k, :width], initial_hidden.contiguous())
+            hidden_seq, _ = self.rnn(grid_steps[k][:, :width], initial_hidden.contiguous())
             if self.rope_positions == "char":
                 query_positions, memory_positions = positions_t[:, k, :width], record_positions
             else:
