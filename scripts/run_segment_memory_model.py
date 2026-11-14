@@ -335,6 +335,36 @@ class GatedCrossAttentionBlock(nn.Module):
         return hidden
 
 
+class WordTier(nn.Module):
+    """A second GRU that steps once a segment (--word-tier): over the
+    character GRU's state at each segment's last character, its state carried
+    from update to update. Every character of segment k gets the word GRU's
+    state after segment k - 1 (the carried state for the first), projected
+    to the hidden size, times tanh(gate). The gate starts at 0, so a model
+    starts as it would without the tier."""
+
+    def __init__(self, hidden_size: int, width: int) -> None:
+        super().__init__()
+        self.width = width
+        self.rnn = nn.GRU(hidden_size, width, batch_first=True)
+        self.proj = nn.Linear(width, hidden_size)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, word_ends: torch.Tensor, word_in: torch.Tensor, segment_of: torch.Tensor, drop) -> tuple[torch.Tensor, torch.Tensor]:
+        """word_ends [B, K, H]: the character GRU's state at each segment's end;
+        word_in [1, B, W]: the carried word state; segment_of [B, T]: each
+        position's segment. Returns what each position adds to its state
+        [B, T, H] and the word state after the last segment [1, B, W]."""
+        word_in = word_in.contiguous()
+        word_states, word_out = self.rnn(word_ends, word_in)  # [B, K, W]: after each segment
+        # Segment k's characters see the state after segment k - 1, never
+        # their own word's (read after its last character).
+        word_before = torch.cat([word_in.transpose(0, 1), word_states[:, :-1]], dim=1)  # [B, K, W]
+        streams = torch.arange(word_ends.shape[0], device=word_ends.device)
+        context = word_before[streams[:, None], segment_of]  # [B, T, W]
+        return torch.tanh(self.gate) * self.proj(drop(context)), word_out
+
+
 class SegmentMemoryLM(nn.Module):
     def __init__(
         self,
@@ -375,6 +405,7 @@ class SegmentMemoryLM(nn.Module):
         carry_bound: str = "none",
         carry_scale: float = 1.0,
         prior_dropout: float = 0.0,
+        word_tier: int = 0,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -603,6 +634,18 @@ class SegmentMemoryLM(nn.Module):
         # character. Neither is a parameter or saved.
         self.prior_ablation = "none"
         self.state_sink: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        # The word tier (WordTier, word_tier > 0: its width), its state
+        # carried beside the character GRU's; what it gives a character is
+        # added to its GRU state before the attention blocks. Built under a
+        # forked RNG, so every other parameter starts as it would without it.
+        # Parallel memory path only.
+        if word_tier < 0:
+            raise ValueError(f"word_tier must be >= 0, got {word_tier}")
+        self.word_tier_size = word_tier
+        self.word_tier = None
+        if word_tier > 0:
+            with torch.random.fork_rng(devices=[]):
+                self.word_tier = WordTier(hidden_size, word_tier)
 
     def zero_prediction_heads(self) -> None:
         for head in [
@@ -1120,6 +1163,8 @@ class SegmentMemoryLM(nn.Module):
     ) -> tuple[torch.Tensor, int, list[MemoryEntry], torch.Tensor | None, dict[str, float]]:
         """input_ids, if given, is what the model reads (a noisy copy of ids,
         say); the targets are always ids."""
+        if self.word_tier is not None:
+            raise ValueError("--word-tier runs on the batched parallel path only: give --train-streams and --eval-streams > 1")
         if token_feedback != "none":
             if input_ids is not None:
                 raise ValueError("input_ids isn't supported with token feedback")
@@ -1502,9 +1547,14 @@ class SegmentMemoryLM(nn.Module):
         GRU call; segment k's record from the GRU's state at its last
         character; each attention block over every position, a position in
         segment k seeing the records the loop would hold there: those carried
-        in and those of segments before k, the last max_memory of them."""
+        in and those of segments before k, the last max_memory of them. With
+        the word tier, next_hidden is the character GRU's carried state and
+        the word GRU's, side by side ([1, B, H + word_tier]), in and out."""
         device = embeddings.device
         streams, count, _ = valid.shape
+        word_hidden = None
+        if self.word_tier is not None:
+            next_hidden, word_hidden = next_hidden.split([self.hidden_size, self.word_tier_size], dim=-1)
         span_valid, span_valid_t, gru_states = self.span_gru(embeddings, lengths, next_hidden)
         span_length = span_valid.shape[1]
         stream_index = torch.arange(streams, device=device)
@@ -1519,12 +1569,16 @@ class SegmentMemoryLM(nn.Module):
         segment_of[span_valid] = np.broadcast_to(np.arange(count)[None, :, None], valid.shape)[valid]
         char_position = np.zeros((streams, span_length), dtype=np.int64)
         char_position[span_valid] = positions[valid]
-        seen_until = held + torch.from_numpy(segment_of).to(device)  # [B, T]: records before this one are written
+        segment_of_t = torch.from_numpy(segment_of).to(device)
+        seen_until = held + segment_of_t  # [B, T]: records before this one are written
         record_index = torch.arange(records.shape[1], device=device)
         visible = (record_index < seen_until[..., None]) & (record_index >= seen_until[..., None] - max_memory)
         mem = self.memory_interface_norm(records)
         query_positions = torch.from_numpy(char_position).to(device)
         state = gru_states
+        if self.word_tier is not None:
+            word_add, word_hidden = self.word_tier(gru_terminal, word_hidden, segment_of_t, self.drop)
+            state = gru_states + word_add
         for block in self.gated_xattn_blocks:
             state = block(
                 state, mem, query_positions=query_positions, memory_positions=record_positions,
@@ -1537,6 +1591,8 @@ class SegmentMemoryLM(nn.Module):
             context_norm_sum = float((state - gru_states).norm(dim=-1)[counted_t].sum().item())
         stream_last = gru_terminal[:, -1]
         next_hidden = self.bound_carry(stream_last, stream_last).unsqueeze(0)
+        if word_hidden is not None:
+            next_hidden = torch.cat([next_hidden, word_hidden], dim=-1)
         return (
             state[span_valid_t],
             records[:, -max_memory:],
@@ -1643,6 +1699,14 @@ class SegmentMemoryLM(nn.Module):
             records, record_positions = memory
         zero_hidden = embeddings.new_zeros((1, streams, self.hidden_size))
         next_hidden = carried_hidden if carried_hidden is not None else zero_hidden
+        if self.word_tier is not None:
+            if not self.parallel_memory(carry_hidden):
+                raise ValueError(
+                    "--word-tier needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
+                    "--carry-bound gru, --rope-positions char, a carried state"
+                )
+            if carried_hidden is None:
+                next_hidden = embeddings.new_zeros((1, streams, self.hidden_size + self.word_tier_size))
         context_norm_sum = 0.0
         if self.whole_span_gru(carry_hidden, feedback_state):
             _, span_valid_t, span_out = self.span_gru(embeddings, lengths, next_hidden)
@@ -2049,6 +2113,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--attention-layers", type=int, default=2)
     parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument(
+        "--word-tier",
+        type=int,
+        default=0,
+        metavar="WIDTH",
+        help="a second GRU of this width that steps once a segment, over the character GRU's state at each "
+        "segment's end; each character gets its state after the previous segment, gated, added before the "
+        "attention blocks (0: off; parallel memory path only)",
+    )
     parser.add_argument("--segments-per-update", type=int, default=64)
     parser.add_argument(
         "--train-streams",
@@ -4179,6 +4252,7 @@ def main() -> None:
         prior_evidence_width=prior_evidence_width,
         dropout=args.dropout,
         prior_dropout=args.prior_dropout,
+        word_tier=args.word_tier,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
@@ -4298,7 +4372,7 @@ def main() -> None:
             f"memory_state={args.memory_state} rope_positions={args.rope_positions} "
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
-            f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} "
+            f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} word_tier={args.word_tier} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
