@@ -184,6 +184,22 @@ class CompactEvidenceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             RowPrefetcher({"evidence": rows}, gather="spans", compact=True)
 
+    def test_compact_rows_advise_any_range_and_keep_their_bytes(self) -> None:
+        from imm.row_prefetch import RowPrefetcher, rows_to_device
+
+        for shallow in (0, 3):
+            out_prefix = self.convert(shallow)
+            rows = load_compact(out_prefix, json.loads(out_prefix.with_name(out_prefix.name + ".json").read_text()))["train"]
+            want = rows[0 : len(rows)]
+            for a, b in ((0, len(rows)), (len(rows) - 1, len(rows) + 100), (-5, 3), (10, 10), (50, 20)):
+                rows.advise_rows(a, b)
+            self.assertTrue(same_bytes(rows[0 : len(rows)], want))
+            spans = [(0, 37), (37, 90), (120, 199)]
+            prefetcher = RowPrefetcher({"evidence": rows}, gather="vector", compact=True, readahead_rows=16)
+            got = rows_to_device(prefetcher.submit(spans).result()["evidence"], torch.device("cpu"))
+            self.assertTrue(same_bytes(got.numpy(), rows.take_spans(spans)))
+            prefetcher.close()
+
     def test_compact_spans_keep_arbitrary_values_and_negative_zero(self) -> None:
         rng = np.random.default_rng(1)
         x = np.zeros((300, 4, 7), dtype=np.float16)

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -225,6 +226,29 @@ class CompactEvidenceRows:
             np.concatenate([self.pos[a:b] for a, b in runs], out=pos.numpy().view(np.uint16))
             np.concatenate([self.val[a:b] for a, b in runs], out=val.numpy())
         return CompactSpans(self, n, index, counts, pos, val)
+
+    def advise_rows(self, start: int, end: int) -> None:
+        """Ask the kernel to read rows start..end - 1 of every part into the
+        page cache now, in large reads (posix_fadvise WILLNEED; it returns
+        once the reads are queued). Changes no value."""
+        start, end = max(0, start), min(self.rows, end)
+        if end <= start:
+            return
+        fds = self.__dict__.get("_advise_fds")
+        if fds is None:
+            fds = {name: os.open(getattr(self, name).filename, os.O_RDONLY)
+                   for name in ("ptr", "pos", "val", "index") if isinstance(getattr(self, name), np.memmap)}
+            self.__dict__["_advise_fds"] = fds
+        ranges = {"ptr": (start * 8, (end + 1) * 8)}
+        if "index" in fds:
+            ranges["index"] = (start * 4, end * 4)
+        nz0, nz1 = int(self.ptr[start]), int(self.ptr[end])
+        if nz1 > nz0:
+            ranges["pos"] = (nz0 * 2, nz1 * 2)
+            ranges["val"] = (nz0 * 2, nz1 * 2)
+        for name, (a, b) in ranges.items():
+            if name in fds:
+                os.posix_fadvise(fds[name], a, b - a, os.POSIX_FADV_WILLNEED)
 
     def device_table(self, device: torch.device) -> torch.Tensor | None:
         """The shallow table as a tensor on device, made once per device."""

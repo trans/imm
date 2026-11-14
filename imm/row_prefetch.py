@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import mmap
 import os
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
@@ -125,6 +126,59 @@ class PageDropper:
         os.close(self.fd)
 
 
+class ReadAhead:
+    """Asks the kernel to read each stream's next rows ahead, in large reads.
+
+    A training update reads one span per stream, the streams spread through
+    each file; the kernel's own readahead sees one file read at 64 places and
+    reads a few KB per page fault (measured 2026-11-14 on the 20M split:
+    7,000 reads a second of 10 KB, 73 MB/s, the disk 58% busy, about the
+    rate the one-block model needed from it). advise(spans) asks for each
+    span's next rows_ahead to 2 * rows_ahead rows whenever fewer than
+    rows_ahead are asked for beyond it (span i is stream i), with
+    posix_fadvise WILLNEED, which queues large reads and returns; the page
+    faults then find the rows cached. The rows are the same."""
+
+    def __init__(self, sources: dict, rows_ahead: int) -> None:
+        if rows_ahead < 1:
+            raise ValueError("rows_ahead must be at least 1")
+        self.rows_ahead = rows_ahead
+        self.targets = []
+        for rows in sources.values():
+            if isinstance(rows, np.memmap) and rows.offset == 0 and rows.filename:
+                self.targets.append(("memmap", rows, os.open(rows.filename, os.O_RDONLY)))
+            elif hasattr(rows, "advise_rows"):
+                self.targets.append(("compact", rows, None))
+        self.until: dict[int, int] = {}
+        self.lock = threading.Lock()
+
+    def advise(self, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """The row ranges asked for (for tests)."""
+        asked = []
+        with self.lock:
+            for i, (start, end) in enumerate(spans):
+                until = self.until.get(i, start)
+                if until < end + self.rows_ahead:
+                    lo, hi = max(until, start), end + 2 * self.rows_ahead
+                    self.until[i] = hi
+                    asked.append((lo, hi))
+        for lo, hi in asked:
+            for kind, rows, fd in self.targets:
+                if kind == "memmap":
+                    row_bytes = int(rows.strides[0])
+                    a, b = lo * row_bytes, min(hi, rows.shape[0]) * row_bytes
+                    if b > a:
+                        os.posix_fadvise(fd, a, b - a, os.POSIX_FADV_WILLNEED)
+                else:
+                    rows.advise_rows(lo, hi)
+        return asked
+
+    def close(self) -> None:
+        for kind, _, fd in self.targets:
+            if fd is not None:
+                os.close(fd)
+
+
 class RowPrefetcher:
     """submit(spans) starts reading every source's rows for those spans in the
     background; the Future's result is {name: rows on the host}. With one
@@ -133,7 +187,8 @@ class RowPrefetcher:
     "spans" (gather_span_rows, a slice per span) or "vector"
     (take_span_rows); pin puts memmap rows in pinned memory (vector only);
     compact reads compact evidence compact, for rows_to_device to expand
-    (vector only)."""
+    (vector only); readahead_rows > 0 asks the kernel for each stream's
+    next rows ahead (ReadAhead)."""
 
     def __init__(
         self,
@@ -143,6 +198,7 @@ class RowPrefetcher:
         gather: str = "spans",
         pin: bool = False,
         compact: bool = False,
+        readahead_rows: int = 0,
     ) -> None:
         if gather not in ("spans", "vector"):
             raise ValueError(f"unknown gather: {gather}")
@@ -157,11 +213,14 @@ class RowPrefetcher:
         self.pin = pin
         self.compact = compact
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rows")
+        self.readahead = ReadAhead(sources, readahead_rows) if readahead_rows > 0 else None
         self.droppers = {
             name: PageDropper(sources[name]) for name in drop_cache if isinstance(sources.get(name), np.memmap)
         }
 
     def _read(self, spans: list[tuple[int, int]]) -> dict:
+        if self.readahead is not None:
+            self.readahead.advise(spans)
         out = {}
         for name, rows in self.sources.items():
             if self.gather == "vector":
@@ -177,5 +236,7 @@ class RowPrefetcher:
 
     def close(self) -> None:
         self.pool.shutdown(wait=True)
+        if self.readahead is not None:
+            self.readahead.close()
         for dropper in self.droppers.values():
             dropper.close()
