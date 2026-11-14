@@ -2147,6 +2147,13 @@ def parse_args() -> argparse.Namespace:
         "the GPU without blocking (same rows)",
     )
     parser.add_argument(
+        "--compact-rows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --prefetch-rows and --row-gather vector, read compact depth evidence compact and rebuild its "
+        "dense rows on the device, not on the host (same rows)",
+    )
+    parser.add_argument(
         "--drop-evidence-cache",
         action="store_true",
         help="with --prefetch-rows, drop the training depth evidence's pages from the page cache once read: for "
@@ -4285,7 +4292,7 @@ def main() -> None:
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} "
-            f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} "
+            f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
             f"prior_strength={args.prior_strength} "
@@ -4446,6 +4453,7 @@ def main() -> None:
                     workers=args.prefetch_ahead,
                     gather=args.row_gather,
                     pin=pin_rows,
+                    compact=args.compact_rows and args.row_gather == "vector",
                 )
 
                 def update_spans(at: int) -> list[tuple[int, int]]:

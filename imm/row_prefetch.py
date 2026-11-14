@@ -21,6 +21,12 @@ and writes every source straight into its output buffer; workers > 1 lets severa
 loop keeps that many submitted ahead); pin=True gathers into pinned host
 memory, so the copy to the GPU can be non-blocking and the training thread
 doesn't wait for the GPU to drain before it.
+
+Faster again, the same bytes (2026-11-14): with compact=True, compact depth
+evidence is read compact (take_spans_compact: about 7 MB an update at 64
+streams, against 72 MB of dense rows) and rows_to_device rebuilds the dense
+rows on the device. The host no longer zeroes and scatters 62 GB of dense
+rows an epoch.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import numpy as np
 import torch
 
-from imm.compact_evidence import ragged_arange
+from imm.compact_evidence import CompactSpans, ragged_arange
 
 PAGE = mmap.PAGESIZE
 
@@ -47,17 +53,20 @@ def gather_span_rows(rows, spans: list[tuple[int, int]]):
     return np.concatenate([np.asarray(rows[start:end]) for start, end in spans])
 
 
-def take_span_rows(rows, spans: list[tuple[int, int]], pin: bool = False):
+def take_span_rows(rows, spans: list[tuple[int, int]], pin: bool = False, compact: bool = False):
     """gather_span_rows's rows: a numpy array or memmap by block copies of
     its spans, compact evidence through its take_spans (a few numpy calls
     whatever the number of spans), a tensor by index_select. With pin, the
     rows land straight in a pinned torch tensor (the same bytes), so the
-    copy to the GPU can be non-blocking."""
+    copy to the GPU can be non-blocking. With compact, compact evidence
+    comes back as CompactSpans, which rows_to_device expands."""
     if rows is None:
         return None
     if isinstance(rows, torch.Tensor):
         idx = ragged_arange(*span_bounds(spans))
         return rows.index_select(0, torch.from_numpy(idx))
+    if compact and hasattr(rows, "take_spans_compact"):
+        return rows.take_spans_compact(spans, pin=pin)
     if hasattr(rows, "take_spans"):
         shape = (sum(b - a for a, b in spans),) + tuple(rows.shape[1:])
         if not pin:
@@ -85,6 +94,8 @@ TORCH_DTYPES = {np.dtype(np.float16): torch.float16, np.dtype(np.float32): torch
 def rows_to_device(rows, device: torch.device, non_blocking: bool = False) -> torch.Tensor | None:
     if rows is None:
         return None
+    if isinstance(rows, CompactSpans):
+        return rows.expand(device, non_blocking=non_blocking and rows.counts.is_pinned())
     if isinstance(rows, torch.Tensor):
         return rows.to(device, non_blocking=non_blocking and rows.is_pinned())
     return torch.from_numpy(rows).to(device)
@@ -120,20 +131,31 @@ class RowPrefetcher:
     worker, one read at a time, in submission order; with more, that many
     reads at once (each Future still holds its own spans' rows). gather is
     "spans" (gather_span_rows, a slice per span) or "vector"
-    (take_span_rows); pin puts memmap rows in pinned memory (vector only)."""
+    (take_span_rows); pin puts memmap rows in pinned memory (vector only);
+    compact reads compact evidence compact, for rows_to_device to expand
+    (vector only)."""
 
     def __init__(
-        self, sources: dict, drop_cache: tuple[str, ...] = (), workers: int = 1, gather: str = "spans", pin: bool = False
+        self,
+        sources: dict,
+        drop_cache: tuple[str, ...] = (),
+        workers: int = 1,
+        gather: str = "spans",
+        pin: bool = False,
+        compact: bool = False,
     ) -> None:
         if gather not in ("spans", "vector"):
             raise ValueError(f"unknown gather: {gather}")
         if pin and gather != "vector":
             raise ValueError("pin needs gather='vector'")
+        if compact and gather != "vector":
+            raise ValueError("compact needs gather='vector'")
         if workers < 1:
             raise ValueError("workers must be at least 1")
         self.sources = sources
         self.gather = gather
         self.pin = pin
+        self.compact = compact
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rows")
         self.droppers = {
             name: PageDropper(sources[name]) for name in drop_cache if isinstance(sources.get(name), np.memmap)
@@ -143,7 +165,7 @@ class RowPrefetcher:
         out = {}
         for name, rows in self.sources.items():
             if self.gather == "vector":
-                out[name] = take_span_rows(rows, spans, pin=self.pin)
+                out[name] = take_span_rows(rows, spans, pin=self.pin, compact=self.compact)
             else:
                 out[name] = gather_span_rows(rows, spans)
             if name in self.droppers:

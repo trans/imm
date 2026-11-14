@@ -2,6 +2,7 @@
 sparse deep rows, read back as the same dense float16 bytes."""
 
 import hashlib
+import os
 import importlib.util
 import json
 import sys
@@ -16,6 +17,9 @@ from imm.compact_evidence import convert_split, load_compact, main, part_path, v
 from imm.count_gate import PackedCountModel, expand_extra_features
 from imm.data import CharVocab
 from imm.vectorized_count_prior import depth_evidence_chunk
+
+# The GPU belongs to whoever holds the slot: GPU cases only on request.
+CUDA_TESTS = os.environ.get("IMM_CUDA_TESTS") == "1"
 
 
 def load_runner_module():
@@ -145,6 +149,60 @@ class CompactEvidenceTest(unittest.TestCase):
                 rows.take_spans([(0, len(rows) + 1)])
             with self.assertRaises(ValueError):
                 rows.take_spans([(0, 4)], out=np.zeros((3, DEPTH, rows.width), np.float16))
+
+    def test_compact_spans_expand_to_take_spans(self) -> None:
+        """take_spans_compact then expand (the reader's compact read, rebuilt
+        on the device) gives take_spans' bytes, at every shallow depth, with
+        empty spans, spans out of order and rows without deep nonzeros;
+        through the prefetcher too, which hands it to rows_to_device."""
+        from imm.row_prefetch import RowPrefetcher, rows_to_device
+
+        cpu = torch.device("cpu")
+        span_sets = [
+            [(0, 37), (37, 90), (120, 199)],
+            [(150, 151), (3, 3), (10, 60), (0, 2), (198, 199)],
+            [(5, 5)],
+            [(0, 199)],
+        ]
+        devices = [cpu] + ([torch.device("cuda")] if torch.cuda.is_available() and CUDA_TESTS else [])
+        for shallow in (0, 1, 3, DEPTH):
+            out_prefix = self.convert(shallow)
+            rows = load_compact(out_prefix, json.loads(out_prefix.with_name(out_prefix.name + ".json").read_text()))["train"]
+            for spans in span_sets:
+                want = rows.take_spans(spans)
+                for device in devices:
+                    got = rows.take_spans_compact(spans).expand(device)
+                    self.assertEqual(got.dtype, torch.float16)
+                    self.assertTrue(same_bytes(got.cpu().numpy(), want), (shallow, spans, str(device)))
+            prefetcher = RowPrefetcher({"evidence": rows}, gather="vector", compact=True)
+            for spans in span_sets:
+                got = rows_to_device(prefetcher.submit(spans).result()["evidence"], cpu)
+                self.assertTrue(same_bytes(got.numpy(), rows.take_spans(spans)), (shallow, spans, "prefetcher"))
+            prefetcher.close()
+            with self.assertRaises(IndexError):
+                rows.take_spans_compact([(0, len(rows) + 1)])
+        with self.assertRaises(ValueError):
+            RowPrefetcher({"evidence": rows}, gather="spans", compact=True)
+
+    def test_compact_spans_keep_arbitrary_values_and_negative_zero(self) -> None:
+        rng = np.random.default_rng(1)
+        x = np.zeros((300, 4, 7), dtype=np.float16)
+        mask = rng.random(x.shape) < 0.2
+        x[mask] = rng.standard_normal(int(mask.sum())).astype(np.float16)
+        x[3, 2, 1] = np.float16(-0.0)
+        x[40:60] = 0  # rows with no nonzeros at all
+        for shallow in (0, 2):
+            prefix = self.dir / f"crand{shallow}"
+            info = convert_split(x, prefix, "train", shallow, block=64)
+            section = {"schema": "depth_evidence_compact_v1", "depth": 4, "width": 7, "shallow": shallow, "train": info, "eval": info}
+            for part in ("shallow_index", "shallow_table", "ptr", "pos", "val"):
+                src = part_path(prefix, "train", part)
+                if src.exists():
+                    part_path(prefix, "eval", part).write_bytes(src.read_bytes())
+            rows = load_compact(prefix, {"compact_evidence": section})["train"]
+            for spans in ([(0, 300)], [(41, 59)], [(250, 300), (0, 45), (3, 4)]):
+                got = rows.take_spans_compact(spans).expand(torch.device("cpu"))
+                self.assertTrue(same_bytes(got.numpy(), np.concatenate([x[a:b] for a, b in spans])), (shallow, spans))
 
     def test_the_runner_loads_compact_evidence_as_the_dense_rows(self) -> None:
         out = self.convert(3)

@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 SCHEMA = "depth_evidence_compact_v1"
 PARTS = ("shallow_index", "shallow_table", "ptr", "pos", "val")
@@ -190,8 +191,91 @@ class CompactEvidenceRows:
             out.reshape(-1)[local * (self.depth * self.width) + pos.astype(np.int64) + self.shallow * self.width] = val
         return out
 
+    def take_spans_compact(self, spans: list[tuple[int, int]], pin: bool = False) -> "CompactSpans":
+        """take_spans' rows, still compact: each row's shallow-table index,
+        each row's count of deep nonzeros, and the nonzeros' positions and
+        values, spans one after another, as torch tensors (pinned with pin).
+        CompactSpans.expand rebuilds take_spans' bytes where the tensors are,
+        so the dense rows (depth x width per row, mostly zeros) are written
+        and copied on the GPU, not on the host."""
+        starts = np.array([a for a, _ in spans], dtype=np.int64)
+        ends = np.array([b for _, b in spans], dtype=np.int64)
+        if ((starts < 0) | (ends > self.rows) | (ends < starts)).any():
+            raise IndexError("compact evidence spans must lie within the rows")
+        idx = ragged_arange(starts, ends)
+        n = len(idx)
+        index = None
+        if self.shallow:
+            index = torch.empty(n, dtype=torch.int64, pin_memory=pin)
+            index.numpy()[:] = np.take(self.index, idx)
+        counts = torch.empty(n, dtype=torch.int64, pin_memory=pin)
+        if n:
+            np.subtract(np.take(self.ptr, idx + 1), np.take(self.ptr, idx), out=counts.numpy())
+        nz_starts = np.take(self.ptr, starts).tolist()
+        nz_ends = np.take(self.ptr, ends).tolist()
+        nnz = int(sum(b - a for a, b in zip(nz_starts, nz_ends)))
+        # Positions are below depth * width (at most 16 * 97 here), so int16
+        # holds them; torch has few uint16 operations.
+        if self.depth * self.width > np.iinfo(np.int16).max:
+            raise ValueError("compact positions must fit int16 for take_spans_compact")
+        pos = torch.empty(nnz, dtype=torch.int16, pin_memory=pin)
+        val = torch.empty(nnz, dtype=torch.float16, pin_memory=pin)
+        if nnz:
+            runs = [(a, b) for a, b in zip(nz_starts, nz_ends) if b > a]
+            np.concatenate([self.pos[a:b] for a, b in runs], out=pos.numpy().view(np.uint16))
+            np.concatenate([self.val[a:b] for a, b in runs], out=val.numpy())
+        return CompactSpans(self, n, index, counts, pos, val)
+
+    def device_table(self, device: torch.device) -> torch.Tensor | None:
+        """The shallow table as a tensor on device, made once per device."""
+        if self.table is None:
+            return None
+        cache = self.__dict__.setdefault("_device_tables", {})
+        key = str(device)
+        if key not in cache:
+            cache[key] = torch.from_numpy(self.table).to(device)
+        return cache[key]
+
     def dense(self) -> np.ndarray:
         return self[0 : self.rows]
+
+
+class CompactSpans:
+    """One read of compact evidence rows (take_spans_compact): n rows, their
+    shallow-table indices, their deep nonzero counts, the nonzeros' positions
+    and values."""
+
+    def __init__(self, source: CompactEvidenceRows, n: int, index, counts, pos, val) -> None:
+        self.source = source
+        self.n = n
+        self.index = index
+        self.counts = counts
+        self.pos = pos
+        self.val = val
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.n, self.source.depth, self.source.width)
+
+    def expand(self, device: torch.device, non_blocking: bool = False) -> torch.Tensor:
+        """The dense float16 rows (n, depth, width) on device: the bytes
+        take_spans gives for the same spans. Positions within a row are
+        distinct, so the scatter has one value per place."""
+        src = self.source
+        width, shallow = src.width, src.shallow
+        out = torch.zeros(self.shape, dtype=torch.float16, device=device)
+        if self.n == 0:
+            return out
+        if shallow:
+            index = self.index.to(device, non_blocking=non_blocking)
+            out[:, :shallow] = src.device_table(device).index_select(0, index)
+        nnz = int(self.pos.shape[0])
+        if nnz:
+            counts = self.counts.to(device, non_blocking=non_blocking)
+            local = torch.repeat_interleave(torch.arange(self.n, device=device), counts, output_size=nnz)
+            flat = local * (src.depth * width) + self.pos.to(device, non_blocking=non_blocking).long() + shallow * width
+            out.view(-1)[flat] = self.val.to(device, non_blocking=non_blocking)
+        return out
 
 
 def ragged_arange(starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
