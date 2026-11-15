@@ -63,6 +63,7 @@ def make_model(seed=0, layers=1, **overrides):
         word_tier=o.get("word_tier", 0),
         phrase_tier=o.get("phrase_tier", 0),
         phrase_classes=o.get("phrase_classes"),
+        tier_own_step=o.get("tier_own_step", False),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():
