@@ -11,6 +11,7 @@ import resource
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from imm.count_gate import (
     train_gate,
 )
 from imm.run_ids import prefixed_path, resolve_run_id
-from imm.segments import SEGMENT_RULES, rule_segments
+from imm.segments import PHRASE_MARK, PHRASE_SKIPPED, SEGMENT_RULES, phrase_classes, rule_segments
 from imm.typo_noise import substitute, unigram_probs
 from imm.skip_horizon_features import (
     FEATURE_NAMES as SKIP_HORIZON_FEATURE_NAMES,
@@ -350,11 +351,14 @@ class WordTier(nn.Module):
         self.proj = nn.Linear(width, hidden_size)
         self.gate = nn.Parameter(torch.zeros(1))
 
-    def forward(self, word_ends: torch.Tensor, word_in: torch.Tensor, segment_of: torch.Tensor, drop) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, word_ends: torch.Tensor, word_in: torch.Tensor, segment_of: torch.Tensor, drop
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """word_ends [B, K, H]: the character GRU's state at each segment's end;
         word_in [1, B, W]: the carried word state; segment_of [B, T]: each
         position's segment. Returns what each position adds to its state
-        [B, T, H] and the word state after the last segment [1, B, W]."""
+        [B, T, H], the word state after the last segment [1, B, W], and the
+        word state after each segment [B, K, W]."""
         word_in = word_in.contiguous()
         word_states, word_out = self.rnn(word_ends, word_in)  # [B, K, W]: after each segment
         # Segment k's characters see the state after segment k - 1, never
@@ -362,7 +366,48 @@ class WordTier(nn.Module):
         word_before = torch.cat([word_in.transpose(0, 1), word_states[:, :-1]], dim=1)  # [B, K, W]
         streams = torch.arange(word_ends.shape[0], device=word_ends.device)
         context = word_before[streams[:, None], segment_of]  # [B, T, W]
-        return torch.tanh(self.gate) * self.proj(drop(context)), word_out
+        return torch.tanh(self.gate) * self.proj(drop(context)), word_out, word_states
+
+
+class PhraseTier(nn.Module):
+    """A third GRU (--phrase-tier) that steps once a phrase, at each segment
+    that ends one (phrase_ends), over the word GRU's state after that
+    segment; its state is carried from update to update. Every character of
+    segment k gets the phrase GRU's state after the phrases that ended before
+    segment k (the carried state if none did), projected to the hidden size,
+    times tanh(gate). The gate starts at 0."""
+
+    def __init__(self, word_width: int, width: int, hidden_size: int) -> None:
+        super().__init__()
+        self.width = width
+        self.rnn = nn.GRU(word_width, width, batch_first=True)
+        self.proj = nn.Linear(width, hidden_size)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self, word_after: torch.Tensor, ends: torch.Tensor, phrase_in: torch.Tensor, segment_of: torch.Tensor, drop
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """word_after [B, K, W]: the word state after each segment; ends
+        [B, K] bool: the segments that end a phrase; phrase_in [1, B, P]: the
+        carried phrase state; segment_of [B, T]: each position's segment.
+        Returns what each position adds to its state [B, T, H] and the phrase
+        state after the last phrase [1, B, P]."""
+        streams, count = ends.shape
+        device = ends.device
+        k = torch.arange(count, device=device)
+        # Each stream's phrase-ending segments first, in order, read as one
+        # sequence; what the GRU reads past a stream's last phrase is unused.
+        order = torch.where(ends, k, k + count).argsort(dim=1)
+        packed = word_after.gather(1, order[..., None].expand(-1, -1, word_after.shape[-1]))
+        phrase_in = phrase_in.contiguous()
+        phrase_states, _ = self.rnn(packed, phrase_in)  # [B, K, P]: after each phrase
+        after = torch.cat([phrase_in.transpose(0, 1), phrase_states], dim=1)  # [B, K + 1, P]: after j phrases
+        done = ends.long().cumsum(dim=1)  # [B, K]: phrases ended by each segment's end
+        before = done - ends.long()  # phrases ended before each segment began
+        rows = torch.arange(streams, device=device)
+        context = after[rows[:, None], before[rows[:, None], segment_of]]  # [B, T, P]
+        phrase_out = after[rows, done[:, -1]].unsqueeze(0)
+        return torch.tanh(self.gate) * self.proj(drop(context)), phrase_out
 
 
 class SegmentMemoryLM(nn.Module):
@@ -406,6 +451,8 @@ class SegmentMemoryLM(nn.Module):
         carry_scale: float = 1.0,
         prior_dropout: float = 0.0,
         word_tier: int = 0,
+        phrase_tier: int = 0,
+        phrase_classes: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -634,6 +681,10 @@ class SegmentMemoryLM(nn.Module):
         # character. Neither is a parameter or saved.
         self.prior_ablation = "none"
         self.state_sink: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        # loss_sink, a list, collects (positions, losses) of the characters
+        # scored on the stats path (evaluate's): the input position in ids and
+        # the loss of predicting the character after it. Not saved.
+        self.loss_sink: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         # The word tier (WordTier, word_tier > 0: its width), its state
         # carried beside the character GRU's; what it gives a character is
         # added to its GRU state before the attention blocks. Built under a
@@ -646,6 +697,35 @@ class SegmentMemoryLM(nn.Module):
         if word_tier > 0:
             with torch.random.fork_rng(devices=[]):
                 self.word_tier = WordTier(hidden_size, word_tier)
+        # The phrase tier (PhraseTier, phrase_tier > 0: its width) over the
+        # word tier, its state carried after the word GRU's. phrase_classes
+        # gives each vocabulary id's class (phrase_classes()); a buffer, not
+        # saved, rebuilt from the vocabulary.
+        if phrase_tier < 0:
+            raise ValueError(f"phrase_tier must be >= 0, got {phrase_tier}")
+        self.phrase_tier_size = phrase_tier
+        self.phrase_tier = None
+        if phrase_tier > 0:
+            if word_tier <= 0:
+                raise ValueError("--phrase-tier steps over the word tier's states: give --word-tier too")
+            if phrase_classes is None or len(phrase_classes) != vocab_size:
+                raise ValueError(f"--phrase-tier needs a phrase class for each of the {vocab_size} vocabulary ids")
+            with torch.random.fork_rng(devices=[]):
+                self.phrase_tier = PhraseTier(word_tier, phrase_tier, hidden_size)
+            self.register_buffer("phrase_class", torch.tensor(list(phrase_classes), dtype=torch.long), persistent=False)
+
+    def phrase_ends(self, read_ids: torch.Tensor, positions: np.ndarray, valid: np.ndarray) -> torch.Tensor:
+        """[B, K] bool: the segments that end a phrase, their last character,
+        skipping whitespace and closers, a mark. From read_ids, what the
+        model reads."""
+        device = read_ids.device
+        at = torch.from_numpy(np.where(valid, positions, positions[:, :, :1])).to(device)  # padding reads the start
+        cls = self.phrase_class[read_ids[at]]  # [B, K, L]
+        offsets = torch.arange(valid.shape[-1], device=device)
+        counted = torch.from_numpy(valid).to(device) & (cls != PHRASE_SKIPPED)
+        last = torch.where(counted, offsets, -1).amax(dim=-1)  # [B, K]: the last counted character
+        marked = cls.gather(-1, last.clamp(min=0).unsqueeze(-1)).squeeze(-1) == PHRASE_MARK
+        return (last >= 0) & marked
 
     def zero_prediction_heads(self) -> None:
         for head in [
@@ -1542,6 +1622,7 @@ class SegmentMemoryLM(nn.Module):
         max_memory: int,
         score_mask: np.ndarray | None,
         collect_stats: bool,
+        phrase_ends: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
         """segment_steps_streams' result, all at once (parallel_memory): one
         GRU call; segment k's record from the GRU's state at its last
@@ -1549,11 +1630,18 @@ class SegmentMemoryLM(nn.Module):
         segment k seeing the records the loop would hold there: those carried
         in and those of segments before k, the last max_memory of them. With
         the word tier, next_hidden is the character GRU's carried state and
-        the word GRU's, side by side ([1, B, H + word_tier]), in and out."""
+        the word GRU's, side by side ([1, B, H + word_tier]), in and out; with
+        the phrase tier too, the phrase GRU's after them ([1, B, H +
+        word_tier + phrase_tier]). phrase_ends [B, K] marks the segments that
+        end a phrase (phrase_tier only)."""
         device = embeddings.device
         streams, count, _ = valid.shape
-        word_hidden = None
-        if self.word_tier is not None:
+        word_hidden = phrase_hidden = None
+        if self.phrase_tier is not None:
+            next_hidden, word_hidden, phrase_hidden = next_hidden.split(
+                [self.hidden_size, self.word_tier_size, self.phrase_tier_size], dim=-1
+            )
+        elif self.word_tier is not None:
             next_hidden, word_hidden = next_hidden.split([self.hidden_size, self.word_tier_size], dim=-1)
         span_valid, span_valid_t, gru_states = self.span_gru(embeddings, lengths, next_hidden)
         span_length = span_valid.shape[1]
@@ -1577,8 +1665,13 @@ class SegmentMemoryLM(nn.Module):
         query_positions = torch.from_numpy(char_position).to(device)
         state = gru_states
         if self.word_tier is not None:
-            word_add, word_hidden = self.word_tier(gru_terminal, word_hidden, segment_of_t, self.drop)
+            word_add, word_hidden, word_after = self.word_tier(gru_terminal, word_hidden, segment_of_t, self.drop)
             state = gru_states + word_add
+            if self.phrase_tier is not None:
+                if phrase_ends is None:
+                    raise ValueError("the phrase tier needs phrase_ends")
+                phrase_add, phrase_hidden = self.phrase_tier(word_after, phrase_ends, phrase_hidden, segment_of_t, self.drop)
+                state = state + phrase_add
         for block in self.gated_xattn_blocks:
             state = block(
                 state, mem, query_positions=query_positions, memory_positions=record_positions,
@@ -1593,6 +1686,8 @@ class SegmentMemoryLM(nn.Module):
         next_hidden = self.bound_carry(stream_last, stream_last).unsqueeze(0)
         if word_hidden is not None:
             next_hidden = torch.cat([next_hidden, word_hidden], dim=-1)
+        if phrase_hidden is not None:
+            next_hidden = torch.cat([next_hidden, phrase_hidden], dim=-1)
         return (
             state[span_valid_t],
             records[:, -max_memory:],
@@ -1706,7 +1801,9 @@ class SegmentMemoryLM(nn.Module):
                     "--carry-bound gru, --rope-positions char, a carried state"
                 )
             if carried_hidden is None:
-                next_hidden = embeddings.new_zeros((1, streams, self.hidden_size + self.word_tier_size))
+                next_hidden = embeddings.new_zeros(
+                    (1, streams, self.hidden_size + self.word_tier_size + self.phrase_tier_size)
+                )
         context_norm_sum = 0.0
         if self.whole_span_gru(carry_hidden, feedback_state):
             _, span_valid_t, span_out = self.span_gru(embeddings, lengths, next_hidden)
@@ -1715,9 +1812,12 @@ class SegmentMemoryLM(nn.Module):
             terminal = span_out[torch.arange(streams, device=device), stream_last]
             next_hidden = self.bound_carry(terminal, terminal).unsqueeze(0)
         elif self.parallel_memory(carry_hidden):
+            phrase_ends = None
+            if self.phrase_tier is not None:
+                phrase_ends = self.phrase_ends(ids if input_ids is None else input_ids, positions, valid)
             final_states, records, record_positions, next_hidden, context_norm_sum = self.parallel_memory_streams(
                 embeddings, valid, lengths, positions, ends, records, record_positions, next_hidden, max_memory,
-                score_mask, collect_stats,
+                score_mask, collect_stats, phrase_ends,
             )
         else:
             final_states, records, record_positions, next_hidden, context_norm_sum = self.segment_steps_streams(
@@ -1761,6 +1861,8 @@ class SegmentMemoryLM(nn.Module):
         first = torch.from_numpy(np.broadcast_to(offsets[None, None, :] == 0, valid.shape)[valid]).to(device)[keep]
         token_losses = F.cross_entropy(logits[keep], targets[keep], reduction="none")
         loss = token_losses.sum()
+        if self.loss_sink is not None:
+            self.loss_sink.append((flat_positions[keep].cpu(), token_losses.detach().float().cpu()))
         if self.training and residual_logits is not None and self.prior_residual_l2 > 0.0:
             loss = loss + self.prior_residual_l2 * residual_logits[keep].square().mean(dim=1).sum()
         scored = int(keep.sum().item())
@@ -2122,6 +2224,21 @@ def parse_args() -> argparse.Namespace:
         "segment's end; each character gets its state after the previous segment, gated, added before the "
         "attention blocks (0: off; parallel memory path only)",
     )
+    parser.add_argument(
+        "--phrase-tier",
+        type=int,
+        default=0,
+        metavar="WIDTH",
+        help="a third GRU of this width, over the word tier, that steps once a phrase: at each segment whose last "
+        "character, skipping whitespace and closing quotes and brackets, is one of --phrase-marks, over the word "
+        "GRU's state after it; each character gets its state after the phrases before its segment, gated, added "
+        "with the word tier's (0: off; needs --word-tier)",
+    )
+    parser.add_argument(
+        "--phrase-marks",
+        default=",;:.!?",
+        help="the characters that end a phrase for --phrase-tier ('.!?' makes it a sentence tier)",
+    )
     parser.add_argument("--segments-per-update", type=int, default=64)
     parser.add_argument(
         "--train-streams",
@@ -2172,6 +2289,14 @@ def parse_args() -> argparse.Namespace:
         "segments first (1: one stream, with every diagnostic)",
     )
     parser.add_argument("--eval-burn-in", type=int, default=256, help="unscored segments before each stream's own")
+    parser.add_argument(
+        "--char-loss-output",
+        type=Path,
+        default=None,
+        help="with --eval-only: score the held-out text and write each character's loss to this .npz "
+        "(positions: the input position; losses: of predicting the next character, in nats; text: the held-out "
+        "ids; vocab: the characters), for scripts/tier_position_losses.py",
+    )
     parser.add_argument(
         "--prior-ablation-output",
         type=Path,
@@ -3576,6 +3701,48 @@ def train_probe(
     }
 
 
+def write_char_losses(
+    model: SegmentMemoryLM,
+    args: argparse.Namespace,
+    eval_ids: torch.Tensor,
+    eval_segments: list[tuple[int, int]],
+    eval_input_ids: torch.Tensor | None,
+    vocab: CharVocab,
+    eval_rows: dict[str, PriorRows | None],
+) -> None:
+    """--char-loss-output: score the held-out text as evaluate does and keep
+    each scored character's loss, in position order."""
+    sink: list[tuple[torch.Tensor, torch.Tensor]] = []
+    model.loss_sink = sink
+    try:
+        nll, ppl, _, _ = evaluate(
+            model, eval_ids, eval_segments, max_memory=args.max_memory, carry_hidden=args.carry_hidden,
+            feedback_state=args.feedback_state, token_feedback=args.token_feedback, input_ids=eval_input_ids,
+            streams=args.eval_streams, burn_in=args.eval_burn_in, **eval_rows,
+        )
+    finally:
+        model.loss_sink = None
+    if not sink:
+        raise ValueError("--char-loss-output needs --eval-streams > 1 (the batched path keeps the losses)")
+    positions = torch.cat([p for p, _ in sink]).numpy()
+    losses = torch.cat([x for _, x in sink]).numpy()
+    order = np.argsort(positions, kind="stable")
+    positions, losses = positions[order], losses[order]
+    if len(np.unique(positions)) != len(positions):
+        raise RuntimeError("--char-loss-output scored a character twice")
+    if abs(float(losses.astype(np.float64).mean()) - nll) > 1e-4:
+        raise RuntimeError(f"--char-loss-output: the kept losses average {losses.mean():.6f}, the score {nll:.6f}")
+    args.char_loss_output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        args.char_loss_output,
+        positions=positions.astype(np.int64),
+        losses=losses.astype(np.float32),
+        text=eval_ids.cpu().numpy().astype(np.int16),
+        vocab=np.array(list(vocab.chars)),
+    )
+    print(f"char_losses heldout_ppl={ppl:.4f} chars={len(positions)} -> {args.char_loss_output}", flush=True)
+
+
 def run_prior_ablation(
     model: SegmentMemoryLM,
     args: argparse.Namespace,
@@ -3759,6 +3926,8 @@ def main() -> None:
         args.eval_initial = True
     if args.prior_ablation_output is not None and not args.eval_only:
         raise ValueError("--prior-ablation-output scores a trained model: give --eval-only and --resume-checkpoint")
+    if args.char_loss_output is not None and not args.eval_only:
+        raise ValueError("--char-loss-output scores a trained model: give --eval-only and --resume-checkpoint")
     args.run_id = resolve_run_id(args.run_id, resume=args.resume_checkpoint is not None)
     args.output = prefixed_path(args.output, args.run_id)
     if args.checkpoint_output is None:
@@ -4253,6 +4422,8 @@ def main() -> None:
         dropout=args.dropout,
         prior_dropout=args.prior_dropout,
         word_tier=args.word_tier,
+        phrase_tier=args.phrase_tier,
+        phrase_classes=phrase_classes(vocab.chars, args.phrase_marks) if args.phrase_tier > 0 else None,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
@@ -4298,6 +4469,18 @@ def main() -> None:
             f"start_epoch={start_epoch} step={step}",
             flush=True,
         )
+
+    if args.char_loss_output is not None:
+        write_char_losses(
+            model, args, eval_score_ids, eval_segments, eval_input_ids, vocab,
+            {
+                "prior_log_probs": eval_prior_log_probs,
+                "prior_gate_features": eval_prior_gate_features,
+                "prior_evidence": eval_prior_evidence,
+            },
+        )
+        if args.prior_ablation_output is None:
+            return
 
     if args.prior_ablation_output is not None:
         t0 = time.perf_counter()
@@ -4373,6 +4556,7 @@ def main() -> None:
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} word_tier={args.word_tier} "
+            f"phrase_tier={args.phrase_tier} phrase_marks={args.phrase_marks!r} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "

@@ -61,6 +61,8 @@ def make_model(seed=0, layers=1, **overrides):
         carry_scale=o.get("carry_scale", 1.0),
         prior_dropout=o.get("prior_dropout", 0.0),
         word_tier=o.get("word_tier", 0),
+        phrase_tier=o.get("phrase_tier", 0),
+        phrase_classes=o.get("phrase_classes"),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():

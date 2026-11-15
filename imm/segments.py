@@ -1,6 +1,7 @@
 """Cut text into variable-length segments: by how often each stretch occurs
 in the training text (the unique rule), at word boundaries (the word rule),
-or by the unique rule extended to the next word boundary (hybrid).
+or by the unique rule extended to the next word boundary (hybrid). Also
+which segments end a phrase, for the phrase tier.
 
 A segment starting at position p runs to the first length L at which
 text[p:p+L] occurs at most `unique_threshold` times in the training text
@@ -152,3 +153,34 @@ def walk(lengths: np.ndarray) -> list[tuple[int, int]]:
         segments.append((pos, end))
         pos = end
     return segments
+
+
+# What a character is to the phrase tier: a phrase ends at a segment whose
+# last character, skipping whitespace and these closers, is a mark.
+PHRASE_CLOSERS = "\"')]}"
+PHRASE_ORDINARY, PHRASE_SKIPPED, PHRASE_MARK = 0, 1, 2
+
+
+def phrase_classes(chars: Sequence[str], marks: str) -> list[int]:
+    """Each vocabulary character's class for the phrase tier: skipped
+    (whitespace, a closing quote or bracket), a mark, or ordinary."""
+    if not marks:
+        raise ValueError("--phrase-marks is empty")
+    if any(m.isspace() or m in PHRASE_CLOSERS for m in marks):
+        raise ValueError(f"--phrase-marks {marks!r}: whitespace and closers {PHRASE_CLOSERS!r} are skipped, not marks")
+    return [
+        PHRASE_SKIPPED if ch.isspace() or ch in PHRASE_CLOSERS else PHRASE_MARK if ch in marks else PHRASE_ORDINARY
+        for ch in chars
+    ]
+
+
+def phrase_end_segments(text: np.ndarray, segments: Sequence[tuple[int, int]], classes: Sequence[int]) -> np.ndarray:
+    """For each segment, whether it ends a phrase: its last character that
+    isn't skipped is a mark. What the model's phrase_ends gives, on the
+    whole text at once."""
+    cls = np.asarray(classes, dtype=np.int64)[np.asarray(text, dtype=np.int64)]
+    counted = np.flatnonzero(cls != PHRASE_SKIPPED)
+    bounds = np.asarray(segments, dtype=np.int64).reshape(-1, 2)
+    i = np.searchsorted(counted, bounds[:, 1], side="left") - 1  # the last counted position before each end
+    last = np.where(i >= 0, counted[np.maximum(i, 0)] if len(counted) else 0, -1)
+    return (last >= bounds[:, 0]) & (cls[np.maximum(last, 0)] == PHRASE_MARK)
