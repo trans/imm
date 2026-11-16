@@ -11,9 +11,14 @@ copies and page faults run without the GIL), so the read overlaps the GPU
 work and the Python of the current update. The rows are the same bytes as a
 direct read: results don't change.
 
-With drop_cache, pages of a memmap are dropped from the page cache once their
-rows are read, so a file read straight through each epoch doesn't crowd out
-other processes' memory. It only makes sense for files too big to stay cached.
+With drop_cache, pages of a memmap, or of compact evidence's parts, are
+dropped from the page cache once their rows are read, so a file read
+straight through each epoch doesn't crowd out other processes' memory. It
+only makes sense for files too big to stay cached. A source named there that
+has no file behind it (rows in memory) is refused, not passed over. Until
+2026-11-16 compact evidence was passed over, and a drop covered only its
+span's own pages, which in folios larger than a span mostly stayed
+(drop_pages).
 
 Faster, the same bytes (2026-11-13): gather="vector" decodes compact
 evidence for all spans in a few numpy calls instead of a decode per span,
@@ -31,7 +36,6 @@ rows an epoch.
 
 from __future__ import annotations
 
-import mmap
 import os
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -39,9 +43,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import numpy as np
 import torch
 
-from imm.compact_evidence import CompactSpans, ragged_arange
+from imm.compact_evidence import CompactSpans, drop_pages, ragged_arange
 
-PAGE = mmap.PAGESIZE
 
 
 def gather_span_rows(rows, spans: list[tuple[int, int]]):
@@ -103,8 +106,9 @@ def rows_to_device(rows, device: torch.device, non_blocking: bool = False) -> to
 
 
 class PageDropper:
-    """Drops the whole pages under rows start..end - 1 of a memmap from the page
-    cache: unmapped from this process (madvise), then evicted (fadvise)."""
+    """Drops the pages under rows start..end - 1 of a memmap from the page
+    cache, reaching back of start too (drop_pages): unmapped from this
+    process (madvise), then evicted (fadvise)."""
 
     def __init__(self, rows: np.memmap) -> None:
         if not isinstance(rows, np.memmap) or rows.offset != 0 or getattr(rows, "_mmap", None) is None:
@@ -116,14 +120,34 @@ class PageDropper:
 
     def drop(self, spans: list[tuple[int, int]]) -> None:
         for start, end in spans:
-            a = (start * self.row_bytes) // PAGE * PAGE
-            b = min(self.size, (end * self.row_bytes) // PAGE * PAGE)  # the partial last page stays
-            if b > a:
-                self.mm.madvise(mmap.MADV_DONTNEED, a, b - a)
-                os.posix_fadvise(self.fd, a, b - a, os.POSIX_FADV_DONTNEED)
+            drop_pages(self.mm, self.fd, start * self.row_bytes, end * self.row_bytes)
 
     def close(self) -> None:
         os.close(self.fd)
+
+
+class CompactPageDropper:
+    """PageDropper for compact evidence: drops the pages of each of its
+    parts (ptr, shallow index, pos, val) under the rows read."""
+
+    def __init__(self, rows) -> None:
+        self.rows = rows
+
+    def drop(self, spans: list[tuple[int, int]]) -> None:
+        for start, end in spans:
+            self.rows.drop_rows(start, end)
+
+    def close(self) -> None:
+        pass
+
+
+def page_dropper(name: str, rows):
+    """The dropper for a source: refused if it has no file to drop."""
+    if isinstance(rows, np.memmap):
+        return PageDropper(rows)
+    if hasattr(rows, "drop_rows"):
+        return CompactPageDropper(rows)
+    raise ValueError(f"drop_cache: {name} has no file behind it ({type(rows).__name__}), so no pages to drop")
 
 
 class ReadAhead:
@@ -214,9 +238,7 @@ class RowPrefetcher:
         self.compact = compact
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rows")
         self.readahead = ReadAhead(sources, readahead_rows) if readahead_rows > 0 else None
-        self.droppers = {
-            name: PageDropper(sources[name]) for name in drop_cache if isinstance(sources.get(name), np.memmap)
-        }
+        self.droppers = {name: page_dropper(name, sources[name]) for name in drop_cache if sources.get(name) is not None}
 
     def _read(self, spans: list[tuple[int, int]]) -> dict:
         if self.readahead is not None:

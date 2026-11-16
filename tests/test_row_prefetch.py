@@ -2,6 +2,7 @@
 in submission order; dropping a memmap's pages from the cache changes no
 values."""
 
+import mmap
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ import torch
 from imm.row_prefetch import PageDropper, ReadAhead, RowPrefetcher, gather_span_rows, rows_to_device, take_span_rows
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from page_cache import evicts, resident, settle  # noqa: E402
 from test_train_streams import runner  # noqa: E402
 
 
@@ -121,6 +123,49 @@ class RowPrefetchTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             PageDropper(self.data)
 
+    def test_drop_cache_refuses_rows_with_no_file(self) -> None:
+        # Rows in memory have no pages to drop: refused, not passed over (as
+        # compact evidence was, before 2026-11-16). Absent rows are fine.
+        for name, rows in (("features", self.tensor), ("array", self.data)):
+            with self.assertRaisesRegex(ValueError, f"drop_cache: {name} has no file"):
+                RowPrefetcher({name: rows}, drop_cache=(name,))
+        prefetcher = RowPrefetcher({"evidence": self.mm, "none": None}, drop_cache=("evidence", "none", "missing"))
+        self.assertEqual(sorted(prefetcher.droppers), ["evidence"])
+        prefetcher.close()
+
+    def test_dropped_pages_leave_the_cache(self) -> None:
+        # One stream's spans, read one after another as training reads them
+        # (about 70 KB each, smaller than the folios a mapped read makes):
+        # every page 2 MB or more behind the last span read leaves the cache,
+        # none past it does, and no value changes. Dropping only each span's
+        # own pages, as before 2026-11-16, left most of them on this laptop.
+        if not evicts(Path(self.tmp.name)):
+            self.skipTest("this file system keeps pages: nothing to see")
+        rows_bytes = 192  # a row of 96 float16 log-probs
+        data = np.random.default_rng(1).standard_normal((44000, rows_bytes // 2)).astype(np.float16)
+        path = Path(self.tmp.name) / "log_probs.dat"
+        data.tofile(path)
+        mm = np.memmap(path, dtype=np.float16, mode="r", shape=data.shape)
+        settle(path)
+        self.assertTrue(resident(path).all())
+        prefetcher = RowPrefetcher({"rows": mm}, gather="vector", drop_cache=("rows",))
+        last = 30000
+        for a in range(0, last, 360):
+            spans = [(a, min(a + 360, last))]
+            got = prefetcher.submit(spans).result()["rows"]
+            np.testing.assert_array_equal(np.asarray(got), data[spans[0][0] : spans[0][1]])
+        prefetcher.close()
+        cached = resident(path)
+        b = last * rows_bytes
+        behind = (b - (2 << 20)) // mmap.PAGESIZE
+        self.assertFalse(cached[:behind].any(), f"{int(cached[:behind].sum())} of {behind} pages behind stayed")
+        self.assertTrue(cached[-(-b // mmap.PAGESIZE) :].all())
+        np.testing.assert_array_equal(np.asarray(mm), data)
+        dropper = PageDropper(mm)
+        dropper.drop([(0, len(data))])  # to the file's end: every page goes
+        self.assertFalse(resident(path).any())
+        dropper.close()
+        del mm
 
 if __name__ == "__main__":
     unittest.main()

@@ -200,6 +200,47 @@ class CompactEvidenceTest(unittest.TestCase):
             self.assertTrue(same_bytes(got.numpy(), rows.take_spans(spans)))
             prefetcher.close()
 
+    def test_compact_rows_drop_their_pages_and_keep_their_bytes(self) -> None:
+        # What --drop-evidence-cache does to compact evidence: the pages of
+        # each part under the rows read leave the page cache (where the file
+        # system lets them), the partial last page stays, and no byte
+        # changes. Until 2026-11-16 the prefetcher passed compact evidence
+        # over, and the flag did nothing.
+        from imm.row_prefetch import RowPrefetcher, rows_to_device
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from page_cache import evicts, resident, settle
+
+        can_see = evicts(self.dir)
+        for shallow in (0, 3):
+            with self.subTest(shallow=shallow):
+                out_prefix = self.convert(shallow)
+                rows = load_compact(out_prefix, json.loads(out_prefix.with_name(out_prefix.name + ".json").read_text()))["train"]
+                want = rows[0 : len(rows)]
+                for a, b in ((0, 37), (len(rows) - 1, len(rows) + 100), (-5, 3), (10, 10), (50, 20)):
+                    rows.drop_rows(a, b)
+                self.assertTrue(same_bytes(rows[0 : len(rows)], want))
+                spans = [(0, 37), (37, 90), (120, 199)]
+                prefetcher = RowPrefetcher({"evidence": rows}, gather="vector", compact=True, readahead_rows=16,
+                                           drop_cache=("evidence",))
+                self.assertEqual(list(prefetcher.droppers), ["evidence"])
+                got = rows_to_device(prefetcher.submit(spans).result()["evidence"], torch.device("cpu"))
+                self.assertTrue(same_bytes(got.numpy(), rows.take_spans(spans)))
+                prefetcher.close()
+                if not can_see:
+                    continue
+                parts = {name: Path(getattr(rows, name).filename)
+                         for name in ("ptr", "pos", "val", "index") if isinstance(getattr(rows, name), np.memmap)}
+                self.assertTrue({"ptr", "pos", "val"} <= set(parts))
+                for path in parts.values():
+                    settle(path)
+                    self.assertTrue(resident(path).all())
+                self.assertEqual(set(rows.part_ranges(0, len(rows))), set(parts))
+                rows.drop_rows(0, len(rows))  # every part to its end: every page goes
+                for name, path in parts.items():
+                    self.assertFalse(resident(path).any(), name)
+                self.assertTrue(same_bytes(rows[0 : len(rows)], want))
+
     def test_compact_spans_keep_arbitrary_values_and_negative_zero(self) -> None:
         rng = np.random.default_rng(1)
         x = np.zeros((300, 4, 7), dtype=np.float16)

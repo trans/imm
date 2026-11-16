@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mmap
 import os
 import sys
 import time
@@ -102,6 +103,34 @@ def convert_split(dense: np.ndarray, prefix: Path, split: str, shallow: int, blo
         for f in files.values():
             f.close()
     return {"rows": rows, "entries": len(seen), "nnz": nnz}
+
+
+# How far back of a span drop_pages reaches: the largest folio the page cache
+# makes (PMD size on x86-64).
+DROP_BEHIND = 2 << 20
+
+
+def drop_pages(mm: mmap.mmap, fd: int, a: int, b: int) -> None:
+    """Drops from the page cache the pages of a file mapped whole as mm (fd
+    open on it) under bytes a..b - 1, and under the DROP_BEHIND bytes before
+    a: unmapped from this process (madvise), then evicted (fadvise).
+
+    The cache holds a file in folios of several pages (on this laptop's XFS,
+    128-256 KB for pages faulted through a mapping, measured 2026-11-16), and
+    the kernel evicts only folios wholly inside the range. A span of rows is
+    often smaller than that (about 60 KB a stream an update), so a folio
+    across the boundary of two spans read one after another would never go.
+    Reaching DROP_BEHIND back takes it with the next span. The bytes before a
+    are the rows the same stream read before it. The partial page at b stays,
+    for the bytes after it, unless b is the file's end. The pages are clean:
+    nothing is lost, and a page wanted again is read back from the file."""
+    if b <= a:
+        return
+    a = max(0, a - DROP_BEHIND) // mmap.PAGESIZE * mmap.PAGESIZE
+    b = len(mm) if b >= len(mm) else b // mmap.PAGESIZE * mmap.PAGESIZE
+    if b > a:
+        mm.madvise(mmap.MADV_DONTNEED, a, b - a)
+        os.posix_fadvise(fd, a, b - a, os.POSIX_FADV_DONTNEED)
 
 
 class CompactEvidenceRows:
@@ -227,18 +256,22 @@ class CompactEvidenceRows:
             np.concatenate([self.val[a:b] for a, b in runs], out=val.numpy())
         return CompactSpans(self, n, index, counts, pos, val)
 
-    def advise_rows(self, start: int, end: int) -> None:
-        """Ask the kernel to read rows start..end - 1 of every part into the
-        page cache now, in large reads (posix_fadvise WILLNEED; it returns
-        once the reads are queued). Changes no value."""
-        start, end = max(0, start), min(self.rows, end)
-        if end <= start:
-            return
-        fds = self.__dict__.get("_advise_fds")
+    def _part_fds(self) -> dict[str, int]:
+        """A file descriptor on each mapped part, opened once."""
+        fds = self.__dict__.get("_part_fds_open")
         if fds is None:
             fds = {name: os.open(getattr(self, name).filename, os.O_RDONLY)
                    for name in ("ptr", "pos", "val", "index") if isinstance(getattr(self, name), np.memmap)}
-            self.__dict__["_advise_fds"] = fds
+            self.__dict__["_part_fds_open"] = fds
+        return fds
+
+    def part_ranges(self, start: int, end: int) -> dict[str, tuple[int, int]]:
+        """The bytes of each mapped part that rows start..end - 1 read, by
+        part name (ptr, index, pos, val): {} for no rows."""
+        start, end = max(0, start), min(self.rows, end)
+        if end <= start:
+            return {}
+        fds = self._part_fds()
         ranges = {"ptr": (start * 8, (end + 1) * 8)}
         if "index" in fds:
             ranges["index"] = (start * 4, end * 4)
@@ -246,9 +279,24 @@ class CompactEvidenceRows:
         if nz1 > nz0:
             ranges["pos"] = (nz0 * 2, nz1 * 2)
             ranges["val"] = (nz0 * 2, nz1 * 2)
-        for name, (a, b) in ranges.items():
-            if name in fds:
-                os.posix_fadvise(fds[name], a, b - a, os.POSIX_FADV_WILLNEED)
+        return {name: r for name, r in ranges.items() if name in fds}
+
+    def advise_rows(self, start: int, end: int) -> None:
+        """Ask the kernel to read rows start..end - 1 of every part into the
+        page cache now, in large reads (posix_fadvise WILLNEED; it returns
+        once the reads are queued). Changes no value."""
+        fds = self._part_fds()
+        for name, (a, b) in self.part_ranges(start, end).items():
+            os.posix_fadvise(fds[name], a, b - a, os.POSIX_FADV_WILLNEED)
+
+    def drop_rows(self, start: int, end: int) -> None:
+        """Drop the whole pages under rows start..end - 1 of every mapped part
+        from the page cache, once they are read (drop_pages): so a file read
+        straight through each epoch doesn't crowd out other memory. Changes
+        no value: a page wanted again is read back from the file."""
+        fds = self._part_fds()
+        for name, (a, b) in self.part_ranges(start, end).items():
+            drop_pages(getattr(self, name)._mmap, fds[name], a, b)
 
     def device_table(self, device: torch.device) -> torch.Tensor | None:
         """The shallow table as a tensor on device, made once per device."""

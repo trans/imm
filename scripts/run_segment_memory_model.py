@@ -2457,7 +2457,14 @@ def parse_args() -> argparse.Namespace:
         "--drop-evidence-cache",
         action="store_true",
         help="with --prefetch-rows, drop the training depth evidence's pages from the page cache once read: for "
-        "an evidence file too big to stay cached, so reading it each epoch doesn't push other memory into swap",
+        "an evidence file too big to stay cached, so reading it each epoch doesn't push other memory into swap "
+        "(dense or compact; before 2026-11-16 compact evidence was passed over)",
+    )
+    parser.add_argument(
+        "--drop-row-cache",
+        action="store_true",
+        help="with --prefetch-rows, drop every training row file's pages (log-probs, gate features, depth "
+        "evidence) from the page cache once read, not only the evidence's (same rows)",
     )
     parser.add_argument("--checkpoint-output", type=Path, default=None)
     parser.add_argument("--best-checkpoint-output", type=Path, default=None)
@@ -4528,6 +4535,15 @@ def main() -> None:
         raise ValueError("--train-streams must be at least 1")
     if args.prior_dropout > 0.0 and args.train_streams < 2:
         raise ValueError("--prior-dropout is built for the batched path: give --train-streams > 1")
+    # The training rows whose pages are dropped once read (RowPrefetcher).
+    drop_cache: tuple[str, ...] = ()
+    if args.drop_row_cache:
+        drop_cache = ("prior_log_probs", "prior_gate_features", "prior_evidence")
+    elif args.drop_evidence_cache:
+        drop_cache = ("prior_evidence",)
+    if drop_cache and not (args.train_streams > 1 and args.prefetch_rows):
+        raise ValueError("--drop-evidence-cache and --drop-row-cache drop pages as the row prefetcher reads them: "
+                         "give --train-streams > 1 and keep --prefetch-rows")
     if args.train_streams > 1:
         model.check_streams_supported(args.token_feedback)
         stream_segments = split_streams(train_segments, args.train_streams)
@@ -4654,7 +4670,7 @@ def main() -> None:
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} word_tier={args.word_tier} "
             f"phrase_tier={args.phrase_tier} phrase_marks={args.phrase_marks!r} tier_own_step={args.tier_own_step} prior_strength_gate={args.prior_strength_gate} "
-            f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} "
+            f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} drop_cache={','.join(drop_cache) or 'none'} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
             f"prior_strength={args.prior_strength} "
@@ -4811,7 +4827,7 @@ def main() -> None:
                         "prior_gate_features": train_prior_gate_features,
                         "prior_evidence": train_prior_evidence,
                     },
-                    drop_cache=("prior_evidence",) if args.drop_evidence_cache else (),
+                    drop_cache=drop_cache,
                     workers=args.prefetch_ahead,
                     gather=args.row_gather,
                     pin=pin_rows,
