@@ -136,6 +136,8 @@ def empty_stats() -> dict[str, float]:
         "utility_target_entropy_sum": 0.0,
         "residual_alpha_sum": 0.0,
         "residual_alpha_count": 0.0,
+        "prior_strength_sum": 0.0,
+        "prior_strength_count": 0.0,
         "skip_prior_alpha_sum": 0.0,
         "skip_prior_alpha_count": 0.0,
     }
@@ -486,6 +488,7 @@ class SegmentMemoryLM(nn.Module):
         phrase_tier: int = 0,
         phrase_classes: Sequence[int] | None = None,
         tier_own_step: bool = False,
+        prior_strength_gate: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -637,6 +640,20 @@ class SegmentMemoryLM(nn.Module):
             self.residual_trust_gate = None
         else:
             raise ValueError(f"unknown prior_residual_gate: {prior_residual_gate}")
+        # --prior-strength-gate: the prior's strength learned per position,
+        # g = softplus(w . [state, features] + b), as air's prior transformer
+        # has, so a confidently wrong prior can be turned down. w = 0 and
+        # softplus(b) = 1 at the start, so the model starts as it would
+        # without it. Built under a forked RNG; batched path only
+        # (segment_loss_streams, parallel memory or not).
+        self.prior_strength_gate = None
+        if prior_strength_gate:
+            if prior_residual_gate_features <= 0:
+                raise ValueError("--prior-strength-gate needs the prior's feature rows")
+            with torch.random.fork_rng(devices=[]):
+                self.prior_strength_gate = nn.Linear(hidden_size + prior_residual_gate_features, 1)
+            nn.init.zeros_(self.prior_strength_gate.weight)
+            nn.init.constant_(self.prior_strength_gate.bias, math.log(math.e - 1.0))
         if skip_prior_gate == "context":
             if prior_residual_gate_features <= 0:
                 raise ValueError("context skip prior gate requires feature rows")
@@ -799,7 +816,13 @@ class SegmentMemoryLM(nn.Module):
         prior_gate_features: torch.Tensor | None,
         skip_prior_log_probs: torch.Tensor | None = None,
         skip_prior_strength: torch.Tensor | None = None,
+        state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """The prior's log-probabilities times its strength, plus the
+        residual (own logits, scaled or gated). state [N, H] is what the head
+        read, needed by --prior-strength-gate; self.last_prior_strength keeps
+        that gate's g [N, 1] (else None)."""
+        self.last_prior_strength = None
         if prior_log_probs is None:
             return logits, None, None, None
         skip_alpha = None
@@ -848,7 +871,14 @@ class SegmentMemoryLM(nn.Module):
         else:
             alpha = None
             residual_logits = self.prior_residual_scale * logits
-        return self.prior_strength * prior_log_probs + residual_logits, residual_logits, alpha, skip_alpha
+        strength = self.prior_strength
+        if self.prior_strength_gate is not None:
+            if state is None or prior_gate_features is None:
+                raise ValueError("--prior-strength-gate runs on the batched path only")
+            g = F.softplus(self.prior_strength_gate(torch.cat([state, prior_gate_features.to(state.dtype)], dim=-1)))
+            self.last_prior_strength = g
+            strength = self.prior_strength * g
+        return strength * prior_log_probs + residual_logits, residual_logits, alpha, skip_alpha
 
     def write_memory(self, state: torch.Tensor) -> torch.Tensor:
         if self.memory_record == "raw":
@@ -1280,6 +1310,8 @@ class SegmentMemoryLM(nn.Module):
         say); the targets are always ids."""
         if self.word_tier is not None:
             raise ValueError("--word-tier runs on the batched parallel path only: give --train-streams and --eval-streams > 1")
+        if self.prior_strength_gate is not None:
+            raise ValueError("--prior-strength-gate runs on the batched path only: give --train-streams and --eval-streams > 1")
         if token_feedback != "none":
             if input_ids is not None:
                 raise ValueError("input_ids isn't supported with token feedback")
@@ -1868,12 +1900,15 @@ class SegmentMemoryLM(nn.Module):
                 embeddings, valid, valid_t, lengths, positions, ends, records, record_positions, next_hidden,
                 zero_hidden, carry_hidden, feedback_state, max_memory, score_mask, collect_stats,
             )
-        own_logits = self.gru_head(self.drop(final_states))  # [N, V]
+        head_in = self.drop(final_states)
+        own_logits = self.gru_head(head_in)  # [N, V]
         logits, residual_logits, residual_alpha, _ = self.apply_prior_residual(
             own_logits,
             prior_log_probs[flat_rows] if prior_log_probs is not None else None,
             prior_gate_features[flat_rows] if prior_gate_features is not None else None,
+            state=head_in,
         )
+        prior_g = self.last_prior_strength
         if prior_kept is not None:
             # Streams without the prior score their own head; the residual's
             # L2 leash is for streams with it.
@@ -1920,6 +1955,9 @@ class SegmentMemoryLM(nn.Module):
             if residual_alpha is not None:
                 stats["residual_alpha_sum"] = float(residual_alpha[keep].sum().item())
                 stats["residual_alpha_count"] = float(residual_alpha[keep].numel())
+            if prior_g is not None:
+                stats["prior_strength_sum"] = float(prior_g[keep].sum().item())
+                stats["prior_strength_count"] = float(prior_g[keep].numel())
             for block in self.gated_xattn_blocks if self.mixing != "none" else ():
                 stats["gate_sum"] += float(torch.tanh(block.gate_attn).abs().item() + torch.tanh(block.gate_mlp).abs().item())
                 stats["gate_count"] += 2.0
@@ -2206,6 +2244,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prior-residual-scale", type=float, default=1.0)
     parser.add_argument("--prior-residual-l2", type=float, default=0.0)
     parser.add_argument("--prior-residual-gate", choices=["none", "context"], default="none")
+    parser.add_argument(
+        "--prior-strength-gate",
+        action="store_true",
+        help="learn the prior's strength per position, softplus of a linear map of the head's input state and the "
+        "prior's features, starting at 1, so a confidently wrong prior can be turned down (batched path only)",
+    )
     parser.add_argument(
         "--prior-residual-state-features",
         default="",
@@ -4476,6 +4520,7 @@ def main() -> None:
         phrase_tier=args.phrase_tier,
         phrase_classes=phrase_classes(vocab.chars, args.phrase_marks) if args.phrase_tier > 0 else None,
         tier_own_step=args.tier_own_step,
+        prior_strength_gate=args.prior_strength_gate,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
@@ -4608,7 +4653,7 @@ def main() -> None:
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} word_tier={args.word_tier} "
-            f"phrase_tier={args.phrase_tier} phrase_marks={args.phrase_marks!r} tier_own_step={args.tier_own_step} "
+            f"phrase_tier={args.phrase_tier} phrase_marks={args.phrase_marks!r} tier_own_step={args.tier_own_step} prior_strength_gate={args.prior_strength_gate} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
@@ -5065,6 +5110,7 @@ def main() -> None:
                 f"mean_context_norm={mean_context_norm if mean_context_norm is not None else float('nan'):.4f} "
                 f"mean_delta_norm={mean_delta_norm if mean_delta_norm is not None else float('nan'):.4f} "
                 f"mean_residual_alpha={mean_residual_alpha if mean_residual_alpha is not None else float('nan'):.4f} "
+                f"mean_prior_strength={mean_or_none(val_stats['prior_strength_sum'], val_stats['prior_strength_count']) or float('nan'):.4f} "
                 f"mean_skip_prior_alpha={mean_skip_prior_alpha if mean_skip_prior_alpha is not None else float('nan'):.4f} "
                 f"no_memory_ppl={no_memory_ppl if no_memory_ppl is not None else float('nan'):.3f} "
                 f"context_only_ppl={context_only_ppl if context_only_ppl is not None else float('nan'):.3f} "
