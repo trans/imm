@@ -65,6 +65,7 @@ def make_model(seed=0, layers=1, **overrides):
         phrase_classes=o.get("phrase_classes"),
         tier_own_step=o.get("tier_own_step", False),
         prior_strength_gate=o.get("prior_strength_gate", False),
+        memory_attention=o.get("memory_attention", True),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():
