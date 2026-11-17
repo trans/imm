@@ -66,6 +66,13 @@ def make_model(seed=0, layers=1, **overrides):
         tier_own_step=o.get("tier_own_step", False),
         prior_strength_gate=o.get("prior_strength_gate", False),
         documents=o.get("documents", False),
+        sentence_tier=o.get("sentence_tier", 0),
+        paragraph_tier=o.get("paragraph_tier", 0),
+        tier_bptt=o.get("tier_bptt", 0),
+        tier_centroid=o.get("tier_centroid", False),
+        sentence_classes=o.get("sentence_classes"),
+        newline_id=o.get("newline_id"),
+        top_down=o.get("top_down", False),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():

@@ -445,6 +445,160 @@ class PhraseTier(nn.Module):
         return torch.tanh(self.gate) * self.proj(drop(context)), phrase_out
 
 
+class BoundaryTier(nn.Module):
+    """A GRU that steps at the segments a boundary marks (--sentence-tier,
+    --paragraph-tier): at a sentence's last segment, say, over the state of
+    the level below after it. Its state is carried; every character gets
+    this tier's state as PhraseTier gives its own: projected to the hidden
+    size, times tanh(gate), the gate starting at 0, with own_step at a
+    unit's last character.
+
+    centroid (--tier-input end+centroid): each step also reads the mean of
+    the level below's states over the unit (after each of its segments),
+    the running sum carried across updates.
+
+    bptt (--tier-bptt N): the last N inputs are carried too, detached, with
+    the state before them; each update reruns the GRU over them and then the
+    new ones, so the gradient reaches back N of this tier's own steps, but
+    not into the levels below in earlier updates.
+
+    The carried vector ([1, B, carry_width()]): the state (with bptt, the
+    state before the buffered inputs), then with bptt the buffer [N, step
+    width] and its fill, then with centroid the running sum and count."""
+
+    def __init__(
+        self, in_width: int, width: int, hidden_size: int, own_step: bool = False, centroid: bool = False, bptt: int = 0
+    ) -> None:
+        super().__init__()
+        if bptt < 0:
+            raise ValueError(f"--tier-bptt must be >= 0, got {bptt}")
+        self.in_width = in_width
+        self.width = width
+        self.own_step = own_step
+        self.centroid = centroid
+        self.bptt = bptt
+        self.step_width = in_width * (2 if centroid else 1)
+        self.rnn = nn.GRU(self.step_width, width, batch_first=True)
+        self.proj = nn.Linear(width, hidden_size)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def carry_width(self) -> int:
+        return self.width + (self.bptt * self.step_width + 1 if self.bptt else 0) + (self.in_width + 1 if self.centroid else 0)
+
+    def unpack(self, carry: torch.Tensor):
+        c = carry[0]
+        streams = c.shape[0]
+        state, at = c[:, : self.width], self.width
+        buffer = fill = csum = ccount = None
+        if self.bptt:
+            buffer = c[:, at : at + self.bptt * self.step_width].reshape(streams, self.bptt, self.step_width)
+            at += self.bptt * self.step_width
+            fill = c[:, at].round().long()
+            at += 1
+        if self.centroid:
+            csum, ccount = c[:, at : at + self.in_width], c[:, at + self.in_width]
+        return state, buffer, fill, csum, ccount
+
+    def begin(self, carry: torch.Tensor) -> dict:
+        """The tier's state at the update's start, [B, width] under "start":
+        with bptt, the GRU rerun over the buffered inputs from the state
+        before them (so it has a gradient into this tier's weights); without,
+        the carried state. The rest is what forward needs."""
+        state, buffer, fill, csum, ccount = self.unpack(carry)
+        begun = dict(state=state, buffer=buffer, fill=fill, csum=csum, ccount=ccount)
+        if self.bptt:
+            h0 = state.unsqueeze(0).contiguous()
+            states, _ = self.rnn(buffer, h0)
+            after = torch.cat([state[:, None], states], dim=1)  # [B, N + 1, width]: after j buffered inputs
+            begun["after_buffer"] = after
+            begun["start"] = after[torch.arange(len(fill), device=fill.device), fill]
+        else:
+            begun["start"] = state
+        return begun
+
+    def forward(
+        self,
+        lower_after: torch.Tensor,
+        ends: torch.Tensor,
+        carry: torch.Tensor,
+        segment_of: torch.Tensor,
+        drop,
+        at_last: torch.Tensor | None = None,
+        begun: dict | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """lower_after [B, K, W]: the level below's state after each segment;
+        ends [B, K] bool: the segments that end a unit; carry [1, B,
+        carry_width()]; segment_of [B, T]; at_last [B, T] (own_step only);
+        begun, begin(carry) if already taken. Returns what each position adds
+        to its state [B, T, H], the carried vector out, and this tier's state
+        after each segment [B, K, width]."""
+        streams, count = ends.shape
+        device = ends.device
+        rows = torch.arange(streams, device=device)
+        k = torch.arange(count, device=device)
+        if begun is None:
+            begun = self.begin(carry)
+        buffer, fill, csum, ccount = begun["buffer"], begun["fill"], begun["csum"], begun["ccount"]
+        inputs = lower_after
+        out_aux = []
+        if self.centroid:
+            # The mean over each unit of the level below's states, its sum
+            # and count since the last end carried in: cs, cc through segment
+            # k, less what they were at the last end before k.
+            cs = lower_after.cumsum(dim=1) + csum[:, None, :]
+            cc = (k + 1)[None, :].to(cs.dtype) + ccount[:, None]
+            through = torch.where(ends, k, -1).cummax(dim=1).values  # [B, K]: the last end at or before k
+            prev = torch.cat([torch.full_like(through[:, :1], -1), through[:, :-1]], dim=1)
+            has = (prev >= 0)[..., None]
+            sub_s = torch.where(has, cs.gather(1, prev.clamp(min=0)[..., None].expand_as(cs)), torch.zeros_like(cs))
+            sub_c = torch.where(prev >= 0, cc.gather(1, prev.clamp(min=0)), torch.zeros_like(cc))
+            inputs = torch.cat([lower_after, (cs - sub_s) / (cc - sub_c)[..., None]], dim=-1)
+            last = through[:, -1]
+            took = (last >= 0)[:, None]
+            out_aux = [
+                cs[:, -1] - torch.where(took, cs[rows, last.clamp(min=0)], torch.zeros_like(csum)),
+                (cc[:, -1] - torch.where(last >= 0, cc[rows, last.clamp(min=0)], torch.zeros_like(ccount)))[:, None],
+            ]
+        # Each stream's unit-ending segments first, in order, one sequence,
+        # from the state at the update's start. What the GRU reads past a
+        # stream's last input is unused.
+        order = torch.where(ends, k, k + count).argsort(dim=1)
+        packed = inputs.gather(1, order[..., None].expand(-1, -1, inputs.shape[-1]))
+        new = ends.long().sum(dim=1)  # [B]
+        start = begun["start"]
+        states, _ = self.rnn(packed, start.unsqueeze(0).contiguous())
+        after = torch.cat([start[:, None], states], dim=1)  # [B, K + 1, width]: after j new inputs
+        done = ends.long().cumsum(dim=1)  # [B, K]: units ended by each segment's end
+        before = done - ends.long()
+        index = before[rows[:, None], segment_of]  # [B, T]
+        if self.own_step:
+            if at_last is None:
+                raise ValueError("own_step needs at_last")
+            index = index + (at_last & ends[rows[:, None], segment_of]).long()
+        context = after[rows[:, None], index]  # [B, T, width]
+        seg_after = after[rows[:, None], done]  # [B, K, width]
+        if self.bptt:
+            # The buffered inputs and the new ones, as one sequence of
+            # fill + new steps (j < fill from the buffer), and the states
+            # after j of them; keep the last N and the state before them.
+            n = self.bptt
+            total = fill + new
+            keep = total.clamp(max=n)
+            first = total - keep
+            j = first[:, None] + torch.arange(n, device=device)[None, :]  # [B, N]: steps kept
+            src = torch.where(j < fill[:, None], j, n + j - fill[:, None]).clamp(max=n + count - 1)
+            seq = torch.cat([buffer.to(packed.dtype), packed], dim=1)
+            kept = seq.gather(1, src[..., None].expand(-1, -1, self.step_width))
+            kept = kept * (torch.arange(n, device=device)[None, :] < keep[:, None])[..., None].to(kept.dtype)
+            states_all = torch.cat([begun["after_buffer"], after[:, 1:]], dim=1)  # after j: j <= fill buffer, else n + j - fill
+            back = torch.where(first <= fill, first, n + first - fill)
+            parts = [states_all[rows, back].detach(), kept.detach().flatten(1), keep[:, None].to(after.dtype)]
+        else:
+            parts = [after[rows, new]]
+        carry_out = torch.cat(parts + [a.to(after.dtype) for a in out_aux], dim=-1).unsqueeze(0)
+        return torch.tanh(self.gate) * self.proj(drop(context)), carry_out, seg_after
+
+
 class SegmentMemoryLM(nn.Module):
     def __init__(
         self,
@@ -491,6 +645,13 @@ class SegmentMemoryLM(nn.Module):
         tier_own_step: bool = False,
         prior_strength_gate: bool = False,
         documents: bool = False,
+        sentence_tier: int = 0,
+        paragraph_tier: int = 0,
+        tier_bptt: int = 0,
+        tier_centroid: bool = False,
+        sentence_classes: Sequence[int] | None = None,
+        newline_id: int | None = None,
+        top_down: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -767,21 +928,75 @@ class SegmentMemoryLM(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.phrase_tier = PhraseTier(word_tier, phrase_tier, hidden_size, own_step=tier_own_step)
             self.register_buffer("phrase_class", torch.tensor(list(phrase_classes), dtype=torch.long), persistent=False)
+        # The sentence and paragraph tiers (BoundaryTier, --sentence-tier and
+        # --paragraph-tier: their widths): a stack over the word tier, the
+        # sentence tier stepping at each segment that ends a sentence (its
+        # last counted character one of sentence_classes' marks) or a
+        # paragraph, over the word state after it; the paragraph tier at each
+        # segment with a blank line in it (two newlines), over the sentence
+        # state after it. Built under a forked RNG. Parallel memory path only.
+        for name, width in (("sentence_tier", sentence_tier), ("paragraph_tier", paragraph_tier), ("tier_bptt", tier_bptt)):
+            if width < 0:
+                raise ValueError(f"{name} must be >= 0, got {width}")
+        if sentence_tier > 0 and word_tier <= 0:
+            raise ValueError("--sentence-tier steps over the word tier's states: give --word-tier too")
+        if sentence_tier > 0 and phrase_tier > 0:
+            raise ValueError("--sentence-tier replaces --phrase-tier: give one")
+        if paragraph_tier > 0 and sentence_tier <= 0:
+            raise ValueError("--paragraph-tier steps over the sentence tier's states: give --sentence-tier too")
+        if (tier_bptt > 0 or tier_centroid) and sentence_tier <= 0:
+            raise ValueError("--tier-bptt and --tier-input end+centroid are for the sentence and paragraph tiers")
+        self.sentence_tier = self.paragraph_tier = None
+        if sentence_tier > 0:
+            if sentence_classes is None or len(sentence_classes) != vocab_size:
+                raise ValueError(f"--sentence-tier needs a sentence class for each of the {vocab_size} vocabulary ids")
+            with torch.random.fork_rng(devices=[]):
+                self.sentence_tier = BoundaryTier(
+                    word_tier, sentence_tier, hidden_size, own_step=tier_own_step, centroid=tier_centroid, bptt=tier_bptt
+                )
+            self.register_buffer("sentence_class", torch.tensor(list(sentence_classes), dtype=torch.long), persistent=False)
+        if paragraph_tier > 0:
+            if newline_id is None:
+                raise ValueError("--paragraph-tier needs the newline's vocabulary id")
+            with torch.random.fork_rng(devices=[]):
+                self.paragraph_tier = BoundaryTier(
+                    sentence_tier, paragraph_tier, hidden_size, own_step=tier_own_step, centroid=tier_centroid,
+                    bptt=tier_bptt,
+                )
+        self.newline_id = newline_id
+        # --top-down: the character GRU and the word tier also read the
+        # paragraph tier's state as of the update's start (BoundaryTier.begin),
+        # each through a linear map that starts at zero, so the model starts
+        # as it would without it. With --tier-bptt that state is the buffer's
+        # rerun, so the paragraph tier learns from this use too.
+        self.top_down_char = self.top_down_word = None
+        if top_down:
+            if self.paragraph_tier is None:
+                raise ValueError("--top-down reads the paragraph tier's state: give --paragraph-tier too")
+            with torch.random.fork_rng(devices=[]):
+                self.top_down_char = nn.Linear(paragraph_tier, embedding_size)
+                self.top_down_word = nn.Linear(paragraph_tier, hidden_size)
+            for layer in (self.top_down_char, self.top_down_word):
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
         # --documents: the carried state a piece starts from, learned, through
         # tanh to stay in the GRUs' range: the character GRU's, then each
-        # tier's, as the carried state lays them out. Zero at the start, the
+        # tier's, as the carried state lays them out (a boundary tier's
+        # buffer and running sum start empty instead). Zero at the start, the
         # state a stream starts from without it. Parallel memory path only.
         self.start_state = None
         if documents:
-            self.start_state = nn.Parameter(torch.zeros(self.carried_width()))
+            self.start_state = nn.Parameter(torch.zeros(sum(learned for _, learned in self.carried_blocks())))
 
-    def phrase_ends(self, read_ids: torch.Tensor, positions: np.ndarray, valid: np.ndarray) -> torch.Tensor:
+    def phrase_ends(
+        self, read_ids: torch.Tensor, positions: np.ndarray, valid: np.ndarray, classes: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """[B, K] bool: the segments that end a phrase, their last character,
         skipping whitespace and closers, a mark. From read_ids, what the
         model reads."""
         device = read_ids.device
         at = torch.from_numpy(np.where(valid, positions, positions[:, :, :1])).to(device)  # padding reads the start
-        cls = self.phrase_class[read_ids[at]]  # [B, K, L]
+        cls = (self.phrase_class if classes is None else classes)[read_ids[at]]  # [B, K, L]
         offsets = torch.arange(valid.shape[-1], device=device)
         counted = torch.from_numpy(valid).to(device) & (cls != PHRASE_SKIPPED)
         last = torch.where(counted, offsets, -1).amax(dim=-1)  # [B, K]: the last counted character
@@ -803,16 +1018,49 @@ class SegmentMemoryLM(nn.Module):
     def zero_state(self, device: torch.device) -> torch.Tensor:
         return torch.zeros(1, 1, self.hidden_size, device=device)
 
+    def carried_blocks(self) -> list[tuple[int, int]]:
+        """The batched path's carried state, block by block: (width, how much
+        of it at its start is a state a piece starts from). The character
+        GRU's, the word tier's, the phrase tier's, then each boundary tier's
+        carried vector."""
+        blocks = [(self.hidden_size, self.hidden_size)]
+        for size in (self.word_tier_size, self.phrase_tier_size):
+            if size:
+                blocks.append((size, size))
+        for tier in (self.sentence_tier, self.paragraph_tier):
+            if tier is not None:
+                blocks.append((tier.carry_width(), tier.width))
+        return blocks
+
     def carried_width(self) -> int:
-        """The batched path's carried state: the character GRU's, then the tiers'."""
-        return self.hidden_size + self.word_tier_size + self.phrase_tier_size
+        return sum(width for width, _ in self.carried_blocks())
 
     def start_hidden(self, streams: int, device: torch.device) -> torch.Tensor:
         """[1, streams, carried_width]: the state a piece starts from
         (--documents), or zeros without a learned one."""
         if self.start_state is None:
             return torch.zeros(1, streams, self.carried_width(), device=device)
-        return torch.tanh(self.start_state).to(device).expand(1, streams, -1)
+        learned = torch.tanh(self.start_state).to(device)
+        parts, at = [], 0
+        for width, n in self.carried_blocks():
+            parts += [learned[at : at + n], learned.new_zeros(width - n)]
+            at += n
+        return torch.cat(parts).expand(1, streams, -1)
+
+    def boundary_ends(self, read_ids: torch.Tensor, positions: np.ndarray, valid: np.ndarray):
+        """[B, K] bool each, the segments that end a sentence and those that
+        end a paragraph (a blank line: two newlines in the segment); a
+        paragraph's end ends its sentence too. None for a tier not built."""
+        if self.sentence_tier is None:
+            return None, None
+        sentence = self.phrase_ends(read_ids, positions, valid, self.sentence_class)
+        paragraph = None
+        if self.paragraph_tier is not None:
+            at = torch.from_numpy(np.where(valid, positions, positions[:, :, :1])).to(read_ids.device)
+            newlines = ((read_ids[at] == self.newline_id) & torch.from_numpy(valid).to(read_ids.device)).sum(dim=-1)
+            paragraph = newlines >= 2
+            sentence = sentence | paragraph
+        return sentence, paragraph
 
     def reset_streams(
         self, carried_hidden: torch.Tensor | None, memory: StreamMemory | None, reset: np.ndarray
@@ -1728,6 +1976,8 @@ class SegmentMemoryLM(nn.Module):
         score_mask: np.ndarray | None,
         collect_stats: bool,
         phrase_ends: torch.Tensor | None = None,
+        sentence_ends: torch.Tensor | None = None,
+        paragraph_ends: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
         """segment_steps_streams' result, all at once (parallel_memory): one
         GRU call; segment k's record from the GRU's state at its last
@@ -1738,16 +1988,26 @@ class SegmentMemoryLM(nn.Module):
         the word GRU's, side by side ([1, B, H + word_tier]), in and out; with
         the phrase tier too, the phrase GRU's after them ([1, B, H +
         word_tier + phrase_tier]). phrase_ends [B, K] marks the segments that
-        end a phrase (phrase_tier only)."""
+        end a phrase (phrase_tier only). With the sentence and paragraph
+        tiers, their carried vectors follow (carried_blocks), and
+        sentence_ends and paragraph_ends [B, K] mark their boundaries
+        (boundary_ends)."""
         device = embeddings.device
         streams, count, _ = valid.shape
-        word_hidden = phrase_hidden = None
-        if self.phrase_tier is not None:
-            next_hidden, word_hidden, phrase_hidden = next_hidden.split(
-                [self.hidden_size, self.word_tier_size, self.phrase_tier_size], dim=-1
-            )
-        elif self.word_tier is not None:
-            next_hidden, word_hidden = next_hidden.split([self.hidden_size, self.word_tier_size], dim=-1)
+        parts = list(next_hidden.split([width for width, _ in self.carried_blocks()], dim=-1))
+        next_hidden = parts.pop(0)
+        word_hidden = parts.pop(0) if self.word_tier is not None else None
+        phrase_hidden = parts.pop(0) if self.phrase_tier is not None else None
+        sentence_carry = parts.pop(0) if self.sentence_tier is not None else None
+        paragraph_carry = parts.pop(0) if self.paragraph_tier is not None else None
+        paragraph_begun = top_down = None
+        if self.top_down_char is not None:
+            # --top-down: every character of stream b reads the paragraph state
+            # its stream had at the update's start.
+            paragraph_begun = self.paragraph_tier.begin(paragraph_carry)
+            top_down = paragraph_begun["start"]  # [B, P]
+            flat_streams = torch.from_numpy(np.broadcast_to(np.arange(streams)[:, None, None], valid.shape)[valid]).to(device)
+            embeddings = embeddings + self.top_down_char(top_down)[flat_streams]
         span_valid, span_valid_t, gru_states = self.span_gru(embeddings, lengths, next_hidden)
         span_length = span_valid.shape[1]
         stream_index = torch.arange(streams, device=device)
@@ -1778,7 +2038,8 @@ class SegmentMemoryLM(nn.Module):
                 at_last = torch.zeros(streams, span_length, dtype=torch.bool, device=device)
                 nonempty = torch.from_numpy(lengths > 0).to(device)
                 at_last[stream_index[:, None].expand_as(last)[nonempty], last[nonempty]] = True
-            word_add, word_hidden, word_after = self.word_tier(gru_terminal, word_hidden, segment_of_t, self.drop, at_last)
+            word_in = gru_terminal if top_down is None else gru_terminal + self.top_down_word(top_down)[:, None, :]
+            word_add, word_hidden, word_after = self.word_tier(word_in, word_hidden, segment_of_t, self.drop, at_last)
             state = gru_states + word_add
             if self.phrase_tier is not None:
                 if phrase_ends is None:
@@ -1787,6 +2048,19 @@ class SegmentMemoryLM(nn.Module):
                     word_after, phrase_ends, phrase_hidden, segment_of_t, self.drop, at_last
                 )
                 state = state + phrase_add
+            if self.sentence_tier is not None:
+                if sentence_ends is None or (self.paragraph_tier is not None and paragraph_ends is None):
+                    raise ValueError("the sentence and paragraph tiers need their boundaries")
+                sentence_add, sentence_carry, sentence_after = self.sentence_tier(
+                    word_after, sentence_ends, sentence_carry, segment_of_t, self.drop, at_last
+                )
+                state = state + sentence_add
+                if self.paragraph_tier is not None:
+                    paragraph_add, paragraph_carry, _ = self.paragraph_tier(
+                        sentence_after, paragraph_ends, paragraph_carry, segment_of_t, self.drop, at_last,
+                        begun=paragraph_begun,
+                    )
+                    state = state + paragraph_add
         for block in self.gated_xattn_blocks:
             state = block(
                 state, mem, query_positions=query_positions, memory_positions=record_positions,
@@ -1801,8 +2075,9 @@ class SegmentMemoryLM(nn.Module):
         next_hidden = self.bound_carry(stream_last, stream_last).unsqueeze(0)
         if word_hidden is not None:
             next_hidden = torch.cat([next_hidden, word_hidden], dim=-1)
-        if phrase_hidden is not None:
-            next_hidden = torch.cat([next_hidden, phrase_hidden], dim=-1)
+        for carried in (phrase_hidden, sentence_carry, paragraph_carry):
+            if carried is not None:
+                next_hidden = torch.cat([next_hidden, carried], dim=-1)
         return (
             state[span_valid_t],
             records[:, -max_memory:],
@@ -1916,9 +2191,7 @@ class SegmentMemoryLM(nn.Module):
                     "--carry-bound gru, --rope-positions char, a carried state"
                 )
             if carried_hidden is None:
-                next_hidden = embeddings.new_zeros(
-                    (1, streams, self.hidden_size + self.word_tier_size + self.phrase_tier_size)
-                )
+                next_hidden = embeddings.new_zeros((1, streams, self.carried_width()))
         context_norm_sum = 0.0
         if self.whole_span_gru(carry_hidden, feedback_state):
             _, span_valid_t, span_out = self.span_gru(embeddings, lengths, next_hidden)
@@ -1928,11 +2201,13 @@ class SegmentMemoryLM(nn.Module):
             next_hidden = self.bound_carry(terminal, terminal).unsqueeze(0)
         elif self.parallel_memory(carry_hidden):
             phrase_ends = None
+            read_ids = ids if input_ids is None else input_ids
             if self.phrase_tier is not None:
-                phrase_ends = self.phrase_ends(ids if input_ids is None else input_ids, positions, valid)
+                phrase_ends = self.phrase_ends(read_ids, positions, valid)
+            sentence_ends, paragraph_ends = self.boundary_ends(read_ids, positions, valid)
             final_states, records, record_positions, next_hidden, context_norm_sum = self.parallel_memory_streams(
                 embeddings, valid, lengths, positions, ends, records, record_positions, next_hidden, max_memory,
-                score_mask, collect_stats, phrase_ends,
+                score_mask, collect_stats, phrase_ends, sentence_ends, paragraph_ends,
             )
         else:
             final_states, records, record_positions, next_hidden, context_norm_sum = self.segment_steps_streams(
@@ -2372,6 +2647,41 @@ def parse_args() -> argparse.Namespace:
         "--phrase-marks",
         default=",;:.!?",
         help="the characters that end a phrase for --phrase-tier ('.!?' makes it a sentence tier)",
+    )
+    parser.add_argument(
+        "--sentence-tier",
+        type=int,
+        default=0,
+        help="a GRU of this width over the word tier that steps at each segment ending a sentence ('.!?', closers "
+        "skipped) or a paragraph, its state carried and added to each character's like the word tier's (needs "
+        "--word-tier; instead of --phrase-tier)",
+    )
+    parser.add_argument(
+        "--paragraph-tier",
+        type=int,
+        default=0,
+        help="a GRU of this width over the sentence tier that steps at each segment with a blank line in it "
+        "(needs --sentence-tier)",
+    )
+    parser.add_argument(
+        "--tier-bptt",
+        type=int,
+        default=0,
+        help="the sentence and paragraph tiers carry their last N inputs, detached, and rerun them each update, so "
+        "the gradient reaches back N of a tier's own steps instead of only those inside the update",
+    )
+    parser.add_argument(
+        "--top-down",
+        action="store_true",
+        help="the character GRU and the word tier also read the paragraph tier's state as of the update's start, "
+        "through linear maps that start at zero (needs --paragraph-tier)",
+    )
+    parser.add_argument(
+        "--tier-input",
+        choices=("end", "end+centroid"),
+        default="end",
+        help="what a sentence or paragraph tier's step reads: the state below at the unit's end, or that and the "
+        "mean of the states below over the unit",
     )
     parser.add_argument("--segments-per-update", type=int, default=64)
     parser.add_argument(
@@ -4681,6 +4991,13 @@ def main() -> None:
         tier_own_step=args.tier_own_step,
         prior_strength_gate=args.prior_strength_gate,
         documents=args.documents is not None,
+        sentence_tier=args.sentence_tier,
+        paragraph_tier=args.paragraph_tier,
+        tier_bptt=args.tier_bptt,
+        tier_centroid=args.tier_input == "end+centroid",
+        sentence_classes=phrase_classes(vocab.chars, ".!?") if args.sentence_tier > 0 else None,
+        newline_id=vocab.chars.index("\n") if "\n" in vocab.chars else None,
+        top_down=args.top_down,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
