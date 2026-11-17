@@ -75,6 +75,7 @@ def make_model(seed=0, layers=1, **overrides):
         top_down=o.get("top_down", False),
         tier_position_gate=o.get("tier_position_gate", False),
         char_memory=o.get("char_memory", 0),
+        memory_attention=o.get("memory_attention", True),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():

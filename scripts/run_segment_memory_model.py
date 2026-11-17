@@ -718,6 +718,7 @@ class SegmentMemoryLM(nn.Module):
         top_down: bool = False,
         tier_position_gate: bool = False,
         char_memory: int = 0,
+        memory_attention: bool = True,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -875,6 +876,13 @@ class SegmentMemoryLM(nn.Module):
         # softplus(b) = 1 at the start, so the model starts as it would
         # without it. Built under a forked RNG; batched path only
         # (segment_loss_streams, parallel memory or not).
+        # --no-memory-attention: the gated blocks see no records, so the
+        # attention over them adds nothing and their MLPs stay. Parallel
+        # memory path only. The record writer and the attention's projections
+        # are still built (and get no gradient), so the parameter names match.
+        if not memory_attention and mixing != "gated-xattn":
+            raise ValueError("--no-memory-attention keeps the gated blocks' MLPs: it needs --mixing gated-xattn")
+        self.memory_attention = memory_attention
         self.prior_strength_gate = None
         if prior_strength_gate:
             if prior_residual_gate_features <= 0:
@@ -1688,6 +1696,10 @@ class SegmentMemoryLM(nn.Module):
         say); the targets are always ids."""
         if self.word_tier is not None:
             raise ValueError("--word-tier runs on the batched parallel path only: give --train-streams and --eval-streams > 1")
+        if not self.memory_attention:
+            raise ValueError(
+                "--no-memory-attention runs on the batched parallel path only: give --train-streams and --eval-streams > 1"
+            )
         if self.prior_strength_gate is not None:
             raise ValueError("--prior-strength-gate runs on the batched path only: give --train-streams and --eval-streams > 1")
         if token_feedback != "none":
@@ -2191,10 +2203,14 @@ class SegmentMemoryLM(nn.Module):
                         begun=paragraph_begun, reader=state,
                     )
                     state = state + paragraph_add
+        block_mem, block_positions, block_visible = mem, memory_positions, visible
+        if not self.memory_attention:
+            # No records, word or character: each block's attention adds zero, its MLP still runs.
+            block_mem, block_positions, block_visible = mem[:, :0], memory_positions[:, :0], visible[..., :0]
         for block in self.gated_xattn_blocks:
             state = block(
-                state, mem, query_positions=query_positions, memory_positions=memory_positions,
-                use_rope=self.use_rope, memory_mask=visible,
+                state, block_mem, query_positions=query_positions, memory_positions=block_positions,
+                use_rope=self.use_rope, memory_mask=block_visible,
             )
         context_norm_sum = 0.0
         if collect_stats:
@@ -2345,6 +2361,11 @@ class SegmentMemoryLM(nn.Module):
         char_out = None
         zero_hidden = embeddings.new_zeros((1, streams, self.hidden_size))
         next_hidden = carried_hidden if carried_hidden is not None else zero_hidden
+        if not self.memory_attention and not self.parallel_memory(carry_hidden):
+            raise ValueError(
+                "--no-memory-attention needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
+                "--carry-bound gru, --rope-positions char, a carried state"
+            )
         if self.word_tier is not None:
             if not self.parallel_memory(carry_hidden):
                 raise ValueError(
@@ -2794,6 +2815,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="learn the prior's strength per position, softplus of a linear map of the head's input state and the "
         "prior's features, starting at 1, so a confidently wrong prior can be turned down (batched path only)",
+    )
+    parser.add_argument(
+        "--no-memory-attention",
+        action="store_true",
+        help="the gated blocks attend to no records, so the memory adds nothing; their MLPs stay (parallel "
+        "memory path only): a model trained without the history attention, the rest unchanged",
     )
     parser.add_argument(
         "--prior-residual-state-features",
@@ -5307,6 +5334,7 @@ def main() -> None:
         top_down=args.top_down,
         tier_position_gate=args.tier_position_gate,
         char_memory=args.char_memory,
+        memory_attention=not args.no_memory_attention,
     ).to(device)
     if args.bf16:
         if args.train_streams < 2 or args.eval_streams < 2:
