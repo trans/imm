@@ -23,6 +23,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from imm.data import CharVocab, read_text
+from imm.documents import aligned_streams, cut_segments, piece_starts, piece_windows
 from imm.row_prefetch import RowPrefetcher, rows_to_device
 from imm.eval import split_text
 from imm.count_gate import (
@@ -489,6 +490,7 @@ class SegmentMemoryLM(nn.Module):
         phrase_classes: Sequence[int] | None = None,
         tier_own_step: bool = False,
         prior_strength_gate: bool = False,
+        documents: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -765,6 +767,13 @@ class SegmentMemoryLM(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.phrase_tier = PhraseTier(word_tier, phrase_tier, hidden_size, own_step=tier_own_step)
             self.register_buffer("phrase_class", torch.tensor(list(phrase_classes), dtype=torch.long), persistent=False)
+        # --documents: the carried state a piece starts from, learned, through
+        # tanh to stay in the GRUs' range: the character GRU's, then each
+        # tier's, as the carried state lays them out. Zero at the start, the
+        # state a stream starts from without it. Parallel memory path only.
+        self.start_state = None
+        if documents:
+            self.start_state = nn.Parameter(torch.zeros(self.carried_width()))
 
     def phrase_ends(self, read_ids: torch.Tensor, positions: np.ndarray, valid: np.ndarray) -> torch.Tensor:
         """[B, K] bool: the segments that end a phrase, their last character,
@@ -793,6 +802,35 @@ class SegmentMemoryLM(nn.Module):
 
     def zero_state(self, device: torch.device) -> torch.Tensor:
         return torch.zeros(1, 1, self.hidden_size, device=device)
+
+    def carried_width(self) -> int:
+        """The batched path's carried state: the character GRU's, then the tiers'."""
+        return self.hidden_size + self.word_tier_size + self.phrase_tier_size
+
+    def start_hidden(self, streams: int, device: torch.device) -> torch.Tensor:
+        """[1, streams, carried_width]: the state a piece starts from
+        (--documents), or zeros without a learned one."""
+        if self.start_state is None:
+            return torch.zeros(1, streams, self.carried_width(), device=device)
+        return torch.tanh(self.start_state).to(device).expand(1, streams, -1)
+
+    def reset_streams(
+        self, carried_hidden: torch.Tensor | None, memory: StreamMemory | None, reset: np.ndarray
+    ) -> tuple[torch.Tensor, StreamMemory | None]:
+        """--documents: the streams marked in reset ([B] bool) begin a piece.
+        Their carried state becomes the start state, and their records so far
+        are marked gone (position -1), so no later query sees them."""
+        streams = len(reset)
+        device = self.start_state.device if self.start_state is not None else self.embed.weight.device
+        at = torch.from_numpy(np.asarray(reset, dtype=bool)).to(device)
+        start = self.start_hidden(streams, device)
+        if carried_hidden is None:
+            carried_hidden = torch.zeros(1, streams, self.carried_width(), device=device)
+        carried_hidden = torch.where(at[None, :, None], start, carried_hidden)
+        if memory is not None:
+            records, positions = memory
+            memory = (records, torch.where(at[:, None], torch.full_like(positions, -1), positions))
+        return carried_hidden, memory
 
     def drop(self, x: torch.Tensor) -> torch.Tensor:
         # Skipped at 0, so a run without dropout draws no random numbers for it.
@@ -1728,6 +1766,7 @@ class SegmentMemoryLM(nn.Module):
         seen_until = held + segment_of_t  # [B, T]: records before this one are written
         record_index = torch.arange(records.shape[1], device=device)
         visible = (record_index < seen_until[..., None]) & (record_index >= seen_until[..., None] - max_memory)
+        visible = visible & (record_positions >= 0)[:, None, :]  # --documents: a piece forgets the one before
         mem = self.memory_interface_norm(records)
         query_positions = torch.from_numpy(char_position).to(device)
         state = gru_states
@@ -2384,6 +2423,16 @@ def parse_args() -> argparse.Namespace:
         "segments first (1: one stream, with every diagnostic)",
     )
     parser.add_argument("--eval-burn-in", type=int, default=256, help="unscored segments before each stream's own")
+    parser.add_argument(
+        "--documents",
+        type=Path,
+        default=None,
+        help="a pieces manifest (mobius scripts/pg19-split.cr): read each piece from its start. In training every "
+        "carried state resets at a piece's start to a learned start state and the memory forgets the piece "
+        "before; each piece's last segments are dropped to make whole updates, so resets fall between updates. "
+        "The held-out text is scored one stream per piece, from its start (--eval-streams and --eval-burn-in "
+        "unused). Parallel memory path only",
+    )
     parser.add_argument(
         "--char-loss-output",
         type=Path,
@@ -3572,13 +3621,23 @@ def evaluate(
     streams: int = 1,
     burn_in: int = 0,
     chunk: int = 64,
+    pieces: list[tuple[int, int]] | None = None,
 ) -> tuple[float, float, float, dict[str, float]]:
     """Score the held-out segments. streams > 1 runs them as that many
     batched streams (eval_stream_windows), each warmed up on burn_in unscored
     segments before its own; with burn_in at least the segment count every
     stream reads the whole text and the score is the one-stream score. The
-    batched rows leave the attention and no-memory diagnostics empty."""
+    batched rows leave the attention and no-memory diagnostics empty.
+    pieces (--documents), the segment windows of the held-out pieces, runs
+    one stream per piece instead, each from its start (evaluate_documents);
+    streams and burn_in are then unused."""
     model.eval()
+    if pieces is not None:
+        return evaluate_documents(
+            model, ids, segments, pieces, max_memory, carry_hidden, feedback_state, token_feedback, chunk,
+            prior_log_probs=prior_log_probs, prior_gate_features=prior_gate_features, prior_evidence=prior_evidence,
+            input_ids=input_ids, skip_prior=skip_prior_log_probs is not None or skip_prior_strength is not None,
+        )
     if streams > 1:
         return evaluate_streams(
             model, ids, segments, max_memory, carry_hidden, feedback_state, token_feedback, streams, burn_in, chunk,
@@ -3691,6 +3750,81 @@ def evaluate_streams(
     want = sum(end - start for start, end in segments)
     if tokens != want:
         raise RuntimeError(f"evaluate_streams scored {tokens} characters, expected {want}")
+    nll = total_loss / tokens
+    return nll, math.exp(nll) if nll <= 700.0 else float("inf"), nll / math.log(2.0), stats
+
+
+@torch.no_grad()
+def evaluate_documents(
+    model: SegmentMemoryLM,
+    ids: torch.Tensor,
+    segments: list[tuple[int, int]],
+    pieces: list[tuple[int, int]],
+    max_memory: int,
+    carry_hidden: bool,
+    feedback_state: str,
+    token_feedback: str,
+    chunk: int,
+    prior_log_probs: PriorRows | None = None,
+    prior_gate_features: PriorRows | None = None,
+    prior_evidence: PriorRows | None = None,
+    input_ids: torch.Tensor | None = None,
+    skip_prior: bool = False,
+) -> tuple[float, float, float, dict[str, float]]:
+    """--documents: one stream per held-out piece (pieces: its segments
+    lo..hi - 1), each read from its start, from the start state and an empty
+    memory, every character scored. The streams step together, at most chunk
+    segments at a time and never past the shortest one left; a stream that
+    has ended leaves the batch."""
+    if skip_prior:
+        raise ValueError("--documents doesn't support the skip prior")
+    if chunk < 1:
+        raise ValueError("evaluate_documents needs chunk >= 1")
+    model.check_streams_supported(token_feedback)
+    device = ids.device
+    active = list(range(len(pieces)))
+    at = [lo for lo, _ in pieces]
+    memory: StreamMemory | None = None
+    hidden: torch.Tensor | None = model.start_hidden(len(active), device) if model.start_state is not None else None
+    total_loss = 0.0
+    stats = empty_stats()
+    gates = (0.0, 0.0)
+    while active:
+        step = min(chunk, min(pieces[i][1] - at[i] for i in active))
+        stream_segments = [segments[at[i] : at[i] + step] for i in active]
+        spans = [(segs[0][0], segs[-1][1]) for segs in stream_segments]
+        loss, _, memory, hidden, chunk_stats = model.segment_loss_streams(
+            ids,
+            stream_segments,
+            memory,
+            max_memory,
+            carried_hidden=hidden,
+            carry_hidden=carry_hidden,
+            feedback_state=feedback_state,
+            token_feedback=token_feedback,
+            prior_log_probs=prior_rows_for_spans(prior_log_probs, spans, device),
+            prior_gate_features=prior_rows_for_spans(prior_gate_features, spans, device),
+            prior_evidence=prior_rows_for_spans(prior_evidence, spans, device),
+            input_ids=input_ids,
+            collect_stats=True,
+        )
+        total_loss += float(loss.item())
+        gates = (chunk_stats.pop("gate_sum"), chunk_stats.pop("gate_count"))
+        merge_stats(stats, chunk_stats)
+        for i in active:
+            at[i] += step
+        keep = [j for j, i in enumerate(active) if at[i] < pieces[i][1]]
+        if len(keep) < len(active):
+            index = torch.tensor(keep, dtype=torch.long, device=device)
+            if keep:
+                memory = (memory[0][index], memory[1][index])
+                hidden = hidden[:, index]
+            active = [active[j] for j in keep]
+    stats["gate_sum"], stats["gate_count"] = gates
+    tokens = stats["token_count"]
+    want = sum(end - start for lo, hi in pieces for start, end in segments[lo:hi])
+    if tokens != want:
+        raise RuntimeError(f"evaluate_documents scored {tokens} characters, expected {want}")
     nll = total_loss / tokens
     return nll, math.exp(nll) if nll <= 700.0 else float("inf"), nll / math.log(2.0), stats
 
@@ -3811,6 +3945,7 @@ def write_char_losses(
     eval_input_ids: torch.Tensor | None,
     vocab: CharVocab,
     eval_rows: dict[str, PriorRows | None],
+    pieces: list[tuple[int, int]] | None = None,
 ) -> None:
     """--char-loss-output: score the held-out text as evaluate does and keep
     each scored character's loss, in position order."""
@@ -3820,7 +3955,7 @@ def write_char_losses(
         nll, ppl, _, _ = evaluate(
             model, eval_ids, eval_segments, max_memory=args.max_memory, carry_hidden=args.carry_hidden,
             feedback_state=args.feedback_state, token_feedback=args.token_feedback, input_ids=eval_input_ids,
-            streams=args.eval_streams, burn_in=args.eval_burn_in, **eval_rows,
+            streams=args.eval_streams, burn_in=args.eval_burn_in, pieces=pieces, **eval_rows,
         )
     finally:
         model.loss_sink = None
@@ -4428,6 +4563,23 @@ def main() -> None:
     train_segments, eval_segments = rule_segments(
         args.segment_rule, train_ids_list, eval_ids_list, args.max_depth, args.unique_threshold, space_ids
     )
+    # --documents: each piece read from its start. The segments are cut so
+    # none spans two pieces; the held-out pieces are scored one stream each.
+    train_piece_starts = None
+    eval_pieces: list[tuple[int, int]] | None = None
+    if args.documents is not None:
+        if args.train_streams < 2 or args.eval_streams < 2:
+            raise ValueError("--documents runs on the batched path: give --train-streams and --eval-streams > 1")
+        if args.prior_ablation_output is not None:
+            raise ValueError("--prior-ablation-output doesn't read --documents yet")
+        train_piece_starts, eval_piece_starts = piece_starts(args.documents, len(train_ids_list), len(eval_ids_list))
+        train_segments = cut_segments(train_segments, train_piece_starts)
+        eval_segments = cut_segments(eval_segments, eval_piece_starts)
+        eval_pieces = piece_windows(eval_segments, eval_piece_starts)
+        print(
+            f"documents={args.documents} train_pieces={len(train_piece_starts)} eval_pieces={len(eval_pieces)}",
+            flush=True,
+        )
     mean_segment_len, max_segment_len = segment_stats(train_segments)
 
     prior_residual_gate_max = (
@@ -4528,6 +4680,7 @@ def main() -> None:
         phrase_classes=phrase_classes(vocab.chars, args.phrase_marks) if args.phrase_tier > 0 else None,
         tier_own_step=args.tier_own_step,
         prior_strength_gate=args.prior_strength_gate,
+        documents=args.documents is not None,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
@@ -4544,9 +4697,26 @@ def main() -> None:
     if drop_cache and not (args.train_streams > 1 and args.prefetch_rows):
         raise ValueError("--drop-evidence-cache and --drop-row-cache drop pages as the row prefetcher reads them: "
                          "give --train-streams > 1 and keep --prefetch-rows")
+    stream_resets = None  # --documents: [streams, updates], the updates that begin a piece
     if args.train_streams > 1:
         model.check_streams_supported(args.token_feedback)
-        stream_segments = split_streams(train_segments, args.train_streams)
+        if args.documents is not None:
+            if not model.parallel_memory(args.carry_hidden):
+                raise ValueError(
+                    "--documents needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
+                    "--carry-bound gru, --rope-positions char, a carried state"
+                )
+            stream_segments, stream_resets, dropped = aligned_streams(
+                train_segments, train_piece_starts, args.train_streams, args.segments_per_update
+            )
+            kept = sum(e - s for segs in stream_segments for s, e in segs)
+            print(
+                f"documents: {int(stream_resets.sum())} piece starts in the streams, {kept} training characters "
+                f"a epoch, {dropped} dropped ({100 * dropped / (kept + dropped):.2f}%: pieces cut to whole updates)",
+                flush=True,
+            )
+        else:
+            stream_segments = split_streams(train_segments, args.train_streams)
     # How the batched path runs an update: all at once, memory on
     # (parallel) or off (whole-span), or one GRU call per segment index.
     if args.train_streams < 2:
@@ -4567,8 +4737,18 @@ def main() -> None:
     if checkpoint is not None:
         if tuple(checkpoint["vocab_chars"]) != vocab.chars:
             raise ValueError("checkpoint vocab does not match input text vocab")
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        state = checkpoint["model_state_dict"]
+        no_start = model.start_state is not None and "start_state" not in state
+        if no_start:
+            # A model trained without --documents, scored by piece (R0): it
+            # starts each piece from zeros, as it started each stream.
+            if not args.eval_only:
+                raise ValueError("--documents can't resume training a checkpoint without a start state: give --eval-only")
+            state = {**state, "start_state": torch.zeros_like(model.start_state)}
+            print("resume: the checkpoint has no start_state; pieces start from zeros", flush=True)
+        model.load_state_dict(state)
+        if not no_start:  # without the start state the optimizer's groups don't match; scoring doesn't need them
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "rng_state" in checkpoint:
             torch.set_rng_state(checkpoint["rng_state"])
         completed_epoch = int(checkpoint["epoch"])
@@ -4591,6 +4771,7 @@ def main() -> None:
                 "prior_gate_features": eval_prior_gate_features,
                 "prior_evidence": eval_prior_evidence,
             },
+            pieces=eval_pieces,
         )
         if args.prior_ablation_output is None:
             return
@@ -4717,6 +4898,7 @@ def main() -> None:
                 input_ids=eval_input_ids,
                 streams=args.eval_streams,
                 burn_in=args.eval_burn_in,
+                pieces=eval_pieces,
             )
             mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
             mean_residual_alpha = mean_or_none(val_stats["residual_alpha_sum"], val_stats["residual_alpha_count"])
@@ -4858,6 +5040,10 @@ def main() -> None:
                 if args.train_streams > 1:
                     batch_streams = [segs[offset : offset + args.segments_per_update] for segs in stream_segments]
                     spans = [(segs[0][0], segs[-1][1]) for segs in batch_streams]
+                    if stream_resets is not None:
+                        reset = stream_resets[:, offset // args.segments_per_update]
+                        if reset.any():
+                            carried_hidden, memory = model.reset_streams(carried_hidden, memory, reset)
                     if prefetcher is not None:
                         t_wait = time.perf_counter()
                         host_rows = pending.popleft().result()
@@ -4989,6 +5175,7 @@ def main() -> None:
                         input_ids=eval_input_ids,
                         streams=args.eval_streams,
                         burn_in=args.eval_burn_in,
+                        pieces=eval_pieces,
                     )
                     epoch_profile.eval_sec += time.perf_counter() - t0
                     mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
@@ -5070,6 +5257,7 @@ def main() -> None:
                 input_ids=eval_input_ids,
                 streams=args.eval_streams,
                 burn_in=args.eval_burn_in,
+                pieces=eval_pieces,
             )
             epoch_profile.eval_sec += time.perf_counter() - t0
             mean_gate, mean_context_norm, mean_delta_norm = row_stats(val_stats)
