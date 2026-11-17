@@ -2671,6 +2671,13 @@ def parse_args() -> argparse.Namespace:
         "the gradient reaches back N of a tier's own steps instead of only those inside the update",
     )
     parser.add_argument(
+        "--swap-tier",
+        choices=("sentence", "paragraph"),
+        default=None,
+        help="the swap test, with --documents and --char-loss-output (eval only): before each chunk of the "
+        "held-out pieces, that tier's carried state passes to the next piece's stream",
+    )
+    parser.add_argument(
         "--top-down",
         action="store_true",
         help="the character GRU and the word tier also read the paragraph tier's state as of the update's start, "
@@ -3932,6 +3939,7 @@ def evaluate(
     burn_in: int = 0,
     chunk: int = 64,
     pieces: list[tuple[int, int]] | None = None,
+    swap_block: int | None = None,
 ) -> tuple[float, float, float, dict[str, float]]:
     """Score the held-out segments. streams > 1 runs them as that many
     batched streams (eval_stream_windows), each warmed up on burn_in unscored
@@ -3947,6 +3955,7 @@ def evaluate(
             model, ids, segments, pieces, max_memory, carry_hidden, feedback_state, token_feedback, chunk,
             prior_log_probs=prior_log_probs, prior_gate_features=prior_gate_features, prior_evidence=prior_evidence,
             input_ids=input_ids, skip_prior=skip_prior_log_probs is not None or skip_prior_strength is not None,
+            swap_block=swap_block,
         )
     if streams > 1:
         return evaluate_streams(
@@ -4080,12 +4089,19 @@ def evaluate_documents(
     prior_evidence: PriorRows | None = None,
     input_ids: torch.Tensor | None = None,
     skip_prior: bool = False,
+    swap_block: int | None = None,
 ) -> tuple[float, float, float, dict[str, float]]:
     """--documents: one stream per held-out piece (pieces: its segments
     lo..hi - 1), each read from its start, from the start state and an empty
     memory, every character scored. The streams step together, at most chunk
     segments at a time and never past the shortest one left; a stream that
-    has ended leaves the batch."""
+    has ended leaves the batch.
+
+    swap_block (--swap-tier): before every chunk but the first, that block of
+    the carried state (carried_blocks' index) passes from each stream to the
+    next, so each piece reads on with another piece's tier state from the
+    same place: the swap test. If the loss doesn't rise, the state carries
+    nothing of its piece."""
     if skip_prior:
         raise ValueError("--documents doesn't support the skip prior")
     if chunk < 1:
@@ -4099,7 +4115,13 @@ def evaluate_documents(
     total_loss = 0.0
     stats = empty_stats()
     gates = (0.0, 0.0)
+    blocks = np.cumsum([0] + [width for width, _ in model.carried_blocks()])
+    first = True
     while active:
+        if swap_block is not None and not first and len(active) > 1:
+            lo, hi = int(blocks[swap_block]), int(blocks[swap_block + 1])
+            hidden = torch.cat([hidden[..., :lo], hidden[..., lo:hi].roll(1, dims=1), hidden[..., hi:]], dim=-1)
+        first = False
         step = min(chunk, min(pieces[i][1] - at[i] for i in active))
         stream_segments = [segments[at[i] : at[i] + step] for i in active]
         spans = [(segs[0][0], segs[-1][1]) for segs in stream_segments]
@@ -4247,6 +4269,16 @@ def train_probe(
     }
 
 
+def swap_block(model: SegmentMemoryLM, tier: str | None) -> int | None:
+    """--swap-tier: the index in carried_blocks of that tier's carried vector."""
+    if tier is None:
+        return None
+    module = {"sentence": model.sentence_tier, "paragraph": model.paragraph_tier}[tier]
+    if module is None:
+        raise ValueError(f"--swap-tier {tier}: the model has no {tier} tier")
+    return 1 + (model.word_tier is not None) + (model.phrase_tier is not None) + (tier == "paragraph")
+
+
 def write_char_losses(
     model: SegmentMemoryLM,
     args: argparse.Namespace,
@@ -4265,7 +4297,8 @@ def write_char_losses(
         nll, ppl, _, _ = evaluate(
             model, eval_ids, eval_segments, max_memory=args.max_memory, carry_hidden=args.carry_hidden,
             feedback_state=args.feedback_state, token_feedback=args.token_feedback, input_ids=eval_input_ids,
-            streams=args.eval_streams, burn_in=args.eval_burn_in, pieces=pieces, **eval_rows,
+            streams=args.eval_streams, burn_in=args.eval_burn_in, pieces=pieces,
+            swap_block=swap_block(model, args.swap_tier), **eval_rows,
         )
     finally:
         model.loss_sink = None
@@ -4475,6 +4508,8 @@ def main() -> None:
         raise ValueError("--prior-ablation-output scores a trained model: give --eval-only and --resume-checkpoint")
     if args.char_loss_output is not None and not args.eval_only:
         raise ValueError("--char-loss-output scores a trained model: give --eval-only and --resume-checkpoint")
+    if args.swap_tier is not None and (args.char_loss_output is None or args.documents is None):
+        raise ValueError("--swap-tier is a test of a trained model: give --documents and --char-loss-output")
     args.run_id = resolve_run_id(args.run_id, resume=args.resume_checkpoint is not None)
     args.output = prefixed_path(args.output, args.run_id)
     if args.checkpoint_output is None:

@@ -239,6 +239,43 @@ class StackTest(unittest.TestCase):
             make_model(word_tier=W, tier_bptt=2, **PARALLEL)
 
 
+class SwapTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from imm.documents import cut_segments, piece_windows
+        from test_documents import STARTS
+        self.ids, self.rows = corpus(n=400)
+        self.segments = cut_segments(ragged_segments(399), STARTS)
+        self.pieces = piece_windows(self.segments, STARTS)
+
+    def score(self, model, swap):
+        nll, _, _, _ = runner.evaluate(
+            model, self.ids, self.segments, 4, carry_hidden=True, feedback_state="gru", token_feedback="none",
+            chunk=5, pieces=self.pieces, swap_block=swap, **self.rows,
+        )
+        return nll
+
+    def test_the_swap_moves_only_its_tier(self) -> None:
+        model = make_model(layers=2, documents=True, tier_bptt=2, **STACK)
+        model.eval()
+        base = self.score(model, None)
+        for tier, block in (("sentence", 2), ("paragraph", 3)):
+            self.assertEqual(runner.swap_block(model, tier), block)
+            self.assertNotAlmostEqual(self.score(model, block), base, places=4, msg=tier)
+            # with the tier's read-out off, its state reaches nothing (no top-down): no change
+            module = getattr(model, f"{tier}_tier")
+            saved = module.gate.detach().clone()
+            with torch.no_grad():
+                module.gate.zero_()
+                if tier == "sentence":
+                    model.paragraph_tier.gate.zero_()  # the paragraph tier reads the sentence states
+            off = self.score(model, None)
+            self.assertAlmostEqual(self.score(model, block), off, places=6, msg=tier)
+            with torch.no_grad():
+                module.gate.copy_(saved)
+            model = make_model(layers=2, documents=True, tier_bptt=2, **STACK)
+            model.eval()
+
+
 class StackDocumentsTest(unittest.TestCase):
     def test_a_reset_stream_reads_its_piece_as_a_fresh_stream(self) -> None:
         from test_documents import STARTS, call, losses_by_position
