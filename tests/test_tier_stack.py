@@ -103,6 +103,26 @@ class StackTest(unittest.TestCase):
         for b, segs in enumerate(part):
             for k, (a, e) in enumerate(segs):
                 self.assertEqual(bool(paragraph[b, k]), int((self.ids[a:e] == NEWLINE).sum()) >= 2)
+        # a sentence tier alone ends its sentences at the same segments
+        alone = make_model(layers=2, **{k: v for k, v in STACK.items() if k != "paragraph_tier"})
+        sentence_alone, none = alone.boundary_ends(self.ids, positions, valid)
+        self.assertIsNone(none)
+        self.assertTrue(torch.equal(sentence_alone, sentence))
+
+    def test_a_sentence_tier_alone(self) -> None:
+        sentence_only = {k: v for k, v in STACK.items() if k != "paragraph_tier"}
+        self.check_causal(make_model(layers=2, tier_bptt=2, tier_centroid=True, **sentence_only))
+        model = make_model(layers=2, tier_bptt=3, tier_centroid=True, **sentence_only)
+        self.assertIsNone(model.paragraph_tier)
+        model.train()
+        memory, hidden = None, None
+        for u in range(3):
+            model.zero_grad()
+            part = [s[4 * u : 4 * u + 4] for s in self.segs]
+            loss, _, memory, hidden, _ = run(model, self.ids, self.rows, part, memory, hidden, max_memory=32)
+            loss.backward()
+            memory, hidden = (memory[0].detach(), memory[1]), hidden.detach()
+        self.assertGreater(float(grads(model)["sentence_tier.rnn.weight_ih_l0"].abs().sum()), 0.0)
 
     def test_bptt_changes_no_forward_value(self) -> None:
         for centroid in (False, True):

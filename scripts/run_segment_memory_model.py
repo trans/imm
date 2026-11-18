@@ -1050,17 +1050,18 @@ class SegmentMemoryLM(nn.Module):
     def boundary_ends(self, read_ids: torch.Tensor, positions: np.ndarray, valid: np.ndarray):
         """[B, K] bool each, the segments that end a sentence and those that
         end a paragraph (a blank line: two newlines in the segment); a
-        paragraph's end ends its sentence too. None for a tier not built."""
+        paragraph's end ends its sentence too, with or without a paragraph
+        tier (given newline_id). None for a tier not built."""
         if self.sentence_tier is None:
             return None, None
         sentence = self.phrase_ends(read_ids, positions, valid, self.sentence_class)
         paragraph = None
-        if self.paragraph_tier is not None:
+        if self.newline_id is not None:
             at = torch.from_numpy(np.where(valid, positions, positions[:, :, :1])).to(read_ids.device)
             newlines = ((read_ids[at] == self.newline_id) & torch.from_numpy(valid).to(read_ids.device)).sum(dim=-1)
             paragraph = newlines >= 2
             sentence = sentence | paragraph
-        return sentence, paragraph
+        return sentence, (paragraph if self.paragraph_tier is not None else None)
 
     def reset_streams(
         self, carried_hidden: torch.Tensor | None, memory: StreamMemory | None, reset: np.ndarray
