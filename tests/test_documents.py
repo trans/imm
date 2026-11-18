@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_phrase_tier import PARALLEL, W  # noqa: E402
 from test_train_streams import corpus, make_model, ragged_segments, runner  # noqa: E402
 
-from imm.documents import aligned_streams, cut_segments, first_positions, piece_starts, piece_windows  # noqa: E402
+from imm.documents import aligned_streams, cut_segments, first_positions, piece_starts, piece_windows, text_prefix  # noqa: E402
 
 CPU = torch.device("cpu")
 STARTS = np.array([0, 97, 230, 301])  # four pieces of a 400-character text
@@ -106,6 +106,25 @@ class HelpersTest(unittest.TestCase):
         self.assertTrue(resets[0, 0])
         used = sum(e - s for segs in streams for s, e in segs)
         self.assertEqual(used + dropped, 399)
+
+    def test_text_prefix(self) -> None:
+        segs, starts = text_prefix(self.segments, STARTS, 250)
+        self.assertEqual(segs, self.segments[: len(segs)])  # a prefix of the segments
+        self.assertLessEqual(segs[-1][1], 250)
+        self.assertGreater(self.segments[len(segs)][1], 250)  # the next segment ends past it
+        self.assertEqual(starts.tolist(), [0, 97, 230])  # 301 begins past it
+        streams, resets, dropped = aligned_streams(segs, starts, 2, 4)
+        used = sum(e - s for ss in streams for s, e in ss)
+        self.assertEqual(used + dropped, segs[-1][1])
+        self.assertTrue(all(e <= 250 for ss in streams for _, e in ss))
+        whole, all_starts = text_prefix(self.segments, STARTS, 10**6)
+        self.assertEqual(whole, self.segments)
+        self.assertEqual(all_starts.tolist(), STARTS.tolist())
+        with self.assertRaisesRegex(ValueError, "chars >= 1"):
+            text_prefix(self.segments, STARTS, 0)
+        if self.segments[0][1] > 1:
+            with self.assertRaisesRegex(ValueError, "no segment"):
+                text_prefix(self.segments, STARTS, self.segments[0][1] - 1)
 
     def test_piece_starts(self) -> None:
         m = {

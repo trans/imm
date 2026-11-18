@@ -76,6 +76,21 @@ def piece_windows(segments: list[Segment], starts: np.ndarray) -> list[tuple[int
     return [(int(a), int(b)) for a, b in zip(lo, hi) if b > a]
 
 
+def text_prefix(segments: list[Segment], starts: np.ndarray, chars: int) -> tuple[list[Segment], np.ndarray]:
+    """The training text's first `chars` characters, for a data-size test
+    that keeps the whole text (and the prior rows made for it) loaded: the
+    segments that end by then, and the pieces that begin before the last of
+    them ends. The last piece kept is cut short at a segment boundary. The
+    segments must be cut (cut_segments) and in order."""
+    if chars < 1:
+        raise ValueError("text_prefix needs chars >= 1")
+    kept = [s for s in segments if s[1] <= chars]
+    if not kept:
+        raise ValueError(f"no segment ends within the first {chars} characters")
+    starts = np.asarray(starts, dtype=np.int64)
+    return kept, starts[first_positions(starts) < kept[-1][1]]
+
+
 def aligned_streams(
     segments: list[Segment], starts: np.ndarray, streams: int, multiple: int
 ) -> tuple[list[list[Segment]], np.ndarray, int]:

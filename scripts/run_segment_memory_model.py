@@ -23,7 +23,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from imm.data import CharVocab, read_text
-from imm.documents import aligned_streams, cut_segments, piece_starts, piece_windows
+from imm.documents import aligned_streams, cut_segments, piece_starts, piece_windows, text_prefix
 from imm.row_prefetch import RowPrefetcher, rows_to_device
 from imm.eval import split_text
 from imm.count_gate import (
@@ -2799,6 +2799,14 @@ def parse_args() -> argparse.Namespace:
         "unused). Parallel memory path only",
     )
     parser.add_argument(
+        "--train-prefix-chars",
+        type=int,
+        default=None,
+        help="with --documents: train on the pieces in the training text's first N characters only, the last cut "
+        "short. The whole text and its prior rows stay loaded (--max-train-chars shortens the text, so it refuses "
+        "rows made for the whole of it). For data-size tests",
+    )
+    parser.add_argument(
         "--char-loss-output",
         type=Path,
         default=None,
@@ -4960,6 +4968,8 @@ def main() -> None:
     # none spans two pieces; the held-out pieces are scored one stream each.
     train_piece_starts = None
     eval_pieces: list[tuple[int, int]] | None = None
+    if args.train_prefix_chars is not None and args.documents is None:
+        raise ValueError("--train-prefix-chars is for --documents runs")
     if args.documents is not None:
         if args.train_streams < 2 or args.eval_streams < 2:
             raise ValueError("--documents runs on the batched path: give --train-streams and --eval-streams > 1")
@@ -5107,8 +5117,16 @@ def main() -> None:
                     "--documents needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
                     "--carry-bound gru, --rope-positions char, a carried state"
                 )
+            stream_source, stream_starts = train_segments, train_piece_starts
+            if args.train_prefix_chars is not None:
+                stream_source, stream_starts = text_prefix(train_segments, train_piece_starts, args.train_prefix_chars)
+                print(
+                    f"train_prefix_chars={args.train_prefix_chars}: training on {stream_source[-1][1]} of "
+                    f"{len(train_ids_list)} characters, {len(stream_starts)} of {len(train_piece_starts)} pieces",
+                    flush=True,
+                )
             stream_segments, stream_resets, dropped = aligned_streams(
-                train_segments, train_piece_starts, args.train_streams, args.segments_per_update
+                stream_source, stream_starts, args.train_streams, args.segments_per_update
             )
             kept = sum(e - s for segs in stream_segments for s, e in segs)
             print(
