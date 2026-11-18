@@ -296,6 +296,91 @@ class SwapTest(unittest.TestCase):
             model.eval()
 
 
+SENTENCE = {k: v for k, v in STACK.items() if k != "paragraph_tier"}
+
+
+class PositionGateTest(unittest.TestCase):
+    """--tier-position-gate: each position scales the tier's add by 2
+    sigmoid(a), a read from its state and the tier state; 1 at the start."""
+
+    def setUp(self) -> None:
+        self.ids, self.rows = corpus(n=240)
+        self.segs = runner.split_streams(ragged_segments(len(self.ids) - 1), 3)
+        self.pieces = [slice(4 * u, 4 * u + 4) for u in range(4)]
+
+    def losses(self, model):
+        return StackTest.losses(self, model, self.pieces)[0]
+
+    def pair(self, **kw):
+        torch.manual_seed(3)
+        a = make_model(layers=2, tier_bptt=2, tier_centroid=True, **SENTENCE, **kw)
+        b = make_model(layers=2, tier_bptt=2, tier_centroid=True, tier_position_gate=True, **SENTENCE, **kw)
+        missing, unexpected = b.load_state_dict(a.state_dict(), strict=False)
+        self.assertEqual(sorted(missing), ["sentence_tier.position.bias", "sentence_tier.position.weight"])
+        self.assertEqual(unexpected, [])
+        with torch.no_grad():
+            # make_model randomizes every weight; the flag's own start is zero
+            b.sentence_tier.position.weight.zero_()
+            b.sentence_tier.position.bias.zero_()
+        for m in (a, b):
+            with torch.no_grad():
+                m.sentence_tier.gate.fill_(0.8)  # open, so the tier's add matters
+            m.eval()
+        return a, b
+
+    def test_at_the_start_it_is_the_model_without(self) -> None:
+        a, b = self.pair()
+        for x, y in zip(self.losses(a), self.losses(b)):
+            self.assertAlmostEqual(x, y, places=6)
+
+    def test_it_varies_by_position_and_changes_the_model(self) -> None:
+        a, b = self.pair()
+        with torch.no_grad():
+            b.sentence_tier.position.weight.normal_(0.0, 1.0)
+        without, gated = self.losses(a), self.losses(b)
+        self.assertGreater(max(abs(x - y) for x, y in zip(without, gated)), 1e-4)
+        factor = b.sentence_tier.last_position_gate
+        self.assertGreater(float(factor.std()), 1e-3)
+        self.assertTrue(bool(((factor > 0) & (factor < 2)).all()))
+
+    def test_it_learns(self) -> None:
+        _, model = self.pair()
+        model.train()
+        memory, hidden = None, None
+        for piece in self.pieces[:2]:
+            model.zero_grad()
+            part = [s[piece] for s in self.segs]
+            loss, _, memory, hidden, _ = run(model, self.ids, self.rows, part, memory, hidden, max_memory=32)
+            loss.backward()
+            memory, hidden = (memory[0].detach(), memory[1]), hidden.detach()
+        g = grads(model)
+        self.assertGreater(float(g["sentence_tier.position.weight"].abs().sum()), 0.0)
+        self.assertGreater(float(g["sentence_tier.position.bias"].abs().sum()), 0.0)
+
+    def test_still_causal(self) -> None:
+        _, model = self.pair()
+        with torch.no_grad():
+            model.sentence_tier.position.weight.normal_(0.0, 1.0)
+        StackTest.check_causal(self, model)
+
+    def test_the_sink_has_a_factor_for_each_character_read(self) -> None:
+        _, model = self.pair()
+        sink = []
+        model.position_gate_sink = sink
+        self.losses(model)
+        model.position_gate_sink = None
+        positions = torch.cat([p for p, _ in sink])
+        factors = torch.cat([f for _, f in sink])
+        self.assertEqual(len(positions), len(factors))
+        read = sorted(q for piece in self.pieces for s in self.segs for a, e in s[piece] for q in range(a, e))
+        self.assertEqual(sorted(positions.tolist()), read)
+        torch.testing.assert_close(factors, torch.ones_like(factors))
+
+    def test_refusals(self) -> None:
+        with self.assertRaisesRegex(ValueError, "tier-position-gate"):
+            make_model(word_tier=W, tier_position_gate=True, **PARALLEL)
+
+
 class StackDocumentsTest(unittest.TestCase):
     def test_a_reset_stream_reads_its_piece_as_a_fresh_stream(self) -> None:
         from test_documents import STARTS, call, losses_by_position

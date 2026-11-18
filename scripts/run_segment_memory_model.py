@@ -462,12 +462,26 @@ class BoundaryTier(nn.Module):
     new ones, so the gradient reaches back N of this tier's own steps, but
     not into the levels below in earlier updates.
 
+    position_gate (--tier-position-gate): each position also scales what it
+    adds by 2 sigmoid(a), a read from that position's state (the reader,
+    [B, T, hidden_size]) and the tier state it sees, through a linear map
+    that starts at zero: a factor of 1, the tier as without it. The single
+    tanh(gate) still starts at 0. last_position_gate keeps the factors
+    [B, T] of the last call, detached.
+
     The carried vector ([1, B, carry_width()]): the state (with bptt, the
     state before the buffered inputs), then with bptt the buffer [N, step
     width] and its fill, then with centroid the running sum and count."""
 
     def __init__(
-        self, in_width: int, width: int, hidden_size: int, own_step: bool = False, centroid: bool = False, bptt: int = 0
+        self,
+        in_width: int,
+        width: int,
+        hidden_size: int,
+        own_step: bool = False,
+        centroid: bool = False,
+        bptt: int = 0,
+        position_gate: bool = False,
     ) -> None:
         super().__init__()
         if bptt < 0:
@@ -481,6 +495,12 @@ class BoundaryTier(nn.Module):
         self.rnn = nn.GRU(self.step_width, width, batch_first=True)
         self.proj = nn.Linear(width, hidden_size)
         self.gate = nn.Parameter(torch.zeros(1))
+        self.position = None
+        if position_gate:
+            self.position = nn.Linear(hidden_size + width, 1)
+            nn.init.zeros_(self.position.weight)
+            nn.init.zeros_(self.position.bias)
+        self.last_position_gate: torch.Tensor | None = None
 
     def carry_width(self) -> int:
         return self.width + (self.bptt * self.step_width + 1 if self.bptt else 0) + (self.in_width + 1 if self.centroid else 0)
@@ -525,11 +545,13 @@ class BoundaryTier(nn.Module):
         drop,
         at_last: torch.Tensor | None = None,
         begun: dict | None = None,
+        reader: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """lower_after [B, K, W]: the level below's state after each segment;
         ends [B, K] bool: the segments that end a unit; carry [1, B,
         carry_width()]; segment_of [B, T]; at_last [B, T] (own_step only);
-        begun, begin(carry) if already taken. Returns what each position adds
+        begun, begin(carry) if already taken; reader [B, T, H], each
+        position's state (position_gate only). Returns what each position adds
         to its state [B, T, H], the carried vector out, and this tier's state
         after each segment [B, K, width]."""
         streams, count = ends.shape
@@ -596,7 +618,14 @@ class BoundaryTier(nn.Module):
         else:
             parts = [after[rows, new]]
         carry_out = torch.cat(parts + [a.to(after.dtype) for a in out_aux], dim=-1).unsqueeze(0)
-        return torch.tanh(self.gate) * self.proj(drop(context)), carry_out, seg_after
+        add = self.proj(drop(context))
+        if self.position is not None:
+            if reader is None:
+                raise ValueError("position_gate needs each position's state (reader)")
+            factor = 2.0 * torch.sigmoid(self.position(torch.cat([reader, context.to(reader.dtype)], dim=-1)))
+            self.last_position_gate = factor[..., 0].detach()
+            add = add * factor
+        return torch.tanh(self.gate) * add, carry_out, seg_after
 
 
 class SegmentMemoryLM(nn.Module):
@@ -652,6 +681,7 @@ class SegmentMemoryLM(nn.Module):
         sentence_classes: Sequence[int] | None = None,
         newline_id: int | None = None,
         top_down: bool = False,
+        tier_position_gate: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -898,6 +928,10 @@ class SegmentMemoryLM(nn.Module):
         # scored on the stats path (evaluate's): the input position in ids and
         # the loss of predicting the character after it. Not saved.
         self.loss_sink: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        # position_gate_sink, a list, collects (positions, factors) of the
+        # sentence tier's per-position gate (--tier-position-gate) on the
+        # parallel path, at the positions of the characters read.
+        self.position_gate_sink: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         # The word tier (WordTier, word_tier > 0: its width), its state
         # carried beside the character GRU's; what it gives a character is
         # added to its GRU state before the attention blocks. Built under a
@@ -944,15 +978,18 @@ class SegmentMemoryLM(nn.Module):
             raise ValueError("--sentence-tier replaces --phrase-tier: give one")
         if paragraph_tier > 0 and sentence_tier <= 0:
             raise ValueError("--paragraph-tier steps over the sentence tier's states: give --sentence-tier too")
-        if (tier_bptt > 0 or tier_centroid) and sentence_tier <= 0:
-            raise ValueError("--tier-bptt and --tier-input end+centroid are for the sentence and paragraph tiers")
+        if (tier_bptt > 0 or tier_centroid or tier_position_gate) and sentence_tier <= 0:
+            raise ValueError(
+                "--tier-bptt, --tier-input end+centroid and --tier-position-gate are for the sentence and paragraph tiers"
+            )
         self.sentence_tier = self.paragraph_tier = None
         if sentence_tier > 0:
             if sentence_classes is None or len(sentence_classes) != vocab_size:
                 raise ValueError(f"--sentence-tier needs a sentence class for each of the {vocab_size} vocabulary ids")
             with torch.random.fork_rng(devices=[]):
                 self.sentence_tier = BoundaryTier(
-                    word_tier, sentence_tier, hidden_size, own_step=tier_own_step, centroid=tier_centroid, bptt=tier_bptt
+                    word_tier, sentence_tier, hidden_size, own_step=tier_own_step, centroid=tier_centroid, bptt=tier_bptt,
+                    position_gate=tier_position_gate,
                 )
             self.register_buffer("sentence_class", torch.tensor(list(sentence_classes), dtype=torch.long), persistent=False)
         if paragraph_tier > 0:
@@ -961,7 +998,7 @@ class SegmentMemoryLM(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.paragraph_tier = BoundaryTier(
                     sentence_tier, paragraph_tier, hidden_size, own_step=tier_own_step, centroid=tier_centroid,
-                    bptt=tier_bptt,
+                    bptt=tier_bptt, position_gate=tier_position_gate,
                 )
         self.newline_id = newline_id
         # --top-down: the character GRU and the word tier also read the
@@ -2053,13 +2090,17 @@ class SegmentMemoryLM(nn.Module):
                 if sentence_ends is None or (self.paragraph_tier is not None and paragraph_ends is None):
                     raise ValueError("the sentence and paragraph tiers need their boundaries")
                 sentence_add, sentence_carry, sentence_after = self.sentence_tier(
-                    word_after, sentence_ends, sentence_carry, segment_of_t, self.drop, at_last
+                    word_after, sentence_ends, sentence_carry, segment_of_t, self.drop, at_last, reader=state
                 )
+                if self.position_gate_sink is not None and self.sentence_tier.position is not None:
+                    self.position_gate_sink.append(
+                        (torch.from_numpy(char_position[span_valid]), self.sentence_tier.last_position_gate[span_valid_t].cpu())
+                    )
                 state = state + sentence_add
                 if self.paragraph_tier is not None:
                     paragraph_add, paragraph_carry, _ = self.paragraph_tier(
                         sentence_after, paragraph_ends, paragraph_carry, segment_of_t, self.drop, at_last,
-                        begun=paragraph_begun,
+                        begun=paragraph_begun, reader=state,
                     )
                     state = state + paragraph_add
         for block in self.gated_xattn_blocks:
@@ -2677,6 +2718,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="the swap test, with --documents and --char-loss-output (eval only): before each chunk of the "
         "held-out pieces, that tier's carried state passes to the next piece's stream",
+    )
+    parser.add_argument(
+        "--tier-position-gate",
+        action="store_true",
+        help="each position scales what the sentence and paragraph tiers add by a gate read from its own state and "
+        "the tier's, 1 at the start (needs --sentence-tier)",
     )
     parser.add_argument(
         "--top-down",
@@ -5034,6 +5081,7 @@ def main() -> None:
         sentence_classes=phrase_classes(vocab.chars, ".!?") if args.sentence_tier > 0 else None,
         newline_id=vocab.chars.index("\n") if "\n" in vocab.chars else None,
         top_down=args.top_down,
+        tier_position_gate=args.tier_position_gate,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
