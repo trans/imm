@@ -103,6 +103,9 @@ def rule_segments(
     return walk(lengths[0]), walk(lengths[1])
 
 
+WORD_LENGTHS_BLOCK = 1 << 22
+
+
 def word_starts(text: np.ndarray, space_ids: Sequence[int]) -> np.ndarray:
     """Positions where a word begins: a non-space whose predecessor is a
     space (or that starts the text)."""
@@ -125,33 +128,43 @@ def word_lengths(
     n = len(text)
     if n == 0:
         return np.zeros(0, dtype=np.int64)
-    pos = np.arange(n)
     starts = word_starts(text, space_ids)
     last = len(starts) - 1
-    reach = pos + np.maximum(at_least, 1)  # the segment ends at or after here
-    i = np.searchsorted(starts, reach, side="left")
-    end = np.where(i <= last, starts[np.minimum(i, max(last, 0))], n) if len(starts) else np.full(n, n)
-    if len(starts):
-        j = np.searchsorted(starts, pos + max_depth, side="right") - 1  # the last word start within reach of the cap
-        back = starts[np.maximum(j, 0)]
-        backed = np.where((j >= 0) & (back > pos), back, pos + max_depth)
-    else:
-        backed = pos + max_depth
-    end = np.where(end - pos > max_depth, backed, end)
-    cap = n - 1 - pos  # a segment may not cover the last character
-    return np.maximum(np.minimum(end - pos, cap), 1)
+    out = np.empty(n, dtype=np.int64)
+    # In blocks of positions, so the intermediates stay small on a long text
+    # (a whole-text pass held about ten arrays of n int64s at once).
+    for a in range(0, n, WORD_LENGTHS_BLOCK):
+        pos = np.arange(a, min(n, a + WORD_LENGTHS_BLOCK))
+        reach = pos + np.maximum(at_least[a : a + len(pos)], 1)  # the segment ends at or after here
+        if len(starts):
+            i = np.searchsorted(starts, reach, side="left")
+            end = np.where(i <= last, starts[np.minimum(i, max(last, 0))], n)
+            j = np.searchsorted(starts, pos + max_depth, side="right") - 1  # the last word start within reach of the cap
+            back = starts[np.maximum(j, 0)]
+            backed = np.where((j >= 0) & (back > pos), back, pos + max_depth)
+        else:
+            end = np.full(len(pos), n)
+            backed = pos + max_depth
+        end = np.where(end - pos > max_depth, backed, end)
+        cap = n - 1 - pos  # a segment may not cover the last character
+        out[a : a + len(pos)] = np.maximum(np.minimum(end - pos, cap), 1)
+    return out
 
 
 def walk(lengths: np.ndarray) -> list[tuple[int, int]]:
     """Segments from position 0, each starting where the last one ended."""
-    steps = lengths.tolist()
-    limit = len(steps) - 1
+    limit = len(lengths) - 1
     segments = []
     pos = 0
-    while pos < limit:
-        end = pos + steps[pos]
-        segments.append((pos, end))
-        pos = end
+    # A block of lengths at a time as Python ints (fast to index), not the
+    # whole text's: a list of n ints is 8n bytes.
+    for a in range(0, max(limit, 0), WORD_LENGTHS_BLOCK):
+        b = min(limit, a + WORD_LENGTHS_BLOCK)
+        steps = lengths[a:b].tolist()
+        while pos < b:
+            end = pos + steps[pos - a]
+            segments.append((pos, end))
+            pos = end
     return segments
 
 
