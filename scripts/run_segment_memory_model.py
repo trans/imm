@@ -781,7 +781,7 @@ class SegmentMemoryLM(nn.Module):
         top_down: bool = False,
         tier_position_gate: bool = False,
         char_memory: int = 0,
-        char_chunk: int = 128,
+        char_chunk: int = 0,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -1131,7 +1131,9 @@ class SegmentMemoryLM(nn.Module):
         # --char-chunk C: the queries read the character records in runs of
         # C, each run over just the records its queries' windows reach
         # (N + C - 1 of them) instead of all of the update's, masked. The
-        # same attention, less of it; 0 reads them all, masked.
+        # same attention, less of it; 0 reads them all, masked. 0 is the
+        # default: on the laptop's GPU (slot 115) the runs' copies of the
+        # keys and values cost more than the masked records they skip.
         if char_chunk < 0:
             raise ValueError(f"char_chunk must be >= 0, got {char_chunk}")
         self.char_chunk = char_chunk
@@ -2885,11 +2887,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--char-chunk",
         type=int,
-        default=128,
+        default=0,
         metavar="C",
         help="with --char-memory N: the queries read the character records in runs of C characters, each run over "
-        "the N + C - 1 records its queries' windows reach, not all of the update's (0: all, masked). The same "
-        "attention, less of it",
+        "the N + C - 1 records its queries' windows reach, not all of the update's (0, the default: all, masked). "
+        "The same attention, less of it, but slower on the laptop's GPU: at N 1,024, 281 ms an update in runs of "
+        "128 against 219 masked",
     )
     parser.add_argument(
         "--word-tier",
