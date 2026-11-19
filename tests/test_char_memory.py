@@ -4,8 +4,7 @@ state before u and u's embedding; character t sees those of u <= t within
 its last N characters, in its piece; the last N are carried from update to
 update. A character never sees its future; each sees exactly its window;
 an update split in two gives what the whole update gives; a piece forgets
-the one before; the other paths refuse it. Read in runs (--char-chunk),
-the attention is the one over the whole update, masked."""
+the one before; the other paths refuse it."""
 
 import sys
 import unittest
@@ -93,36 +92,18 @@ class CharMemoryTest(unittest.TestCase):
                     self.assertFalse(torch.equal(before[n], after[n]))
 
     def test_each_character_sees_exactly_its_window(self) -> None:
-        # For each real query, the character records it sees are those at
-        # positions p - N + 1 .. p of its own stream, in the second update
-        # too (carried ones included): with every record masked (chunk 0)
-        # and read in runs of 1, 4 and more than an update.
-        for chunk in (0, 1, 4, 500):
-            with self.subTest(chunk=chunk):
-                self.check_windows(chunk)
-
-    def check_windows(self, chunk: int) -> None:
-        model = make_model(layers=1, char_memory=N, char_chunk=chunk, **PARALLEL)
+        # The blocks get every record with a mask: for each real query, the
+        # character records it sees are those at positions p - N + 1 .. p of
+        # its own stream, in the second update too (carried ones included).
+        model = make_model(layers=1, char_memory=N, **PARALLEL)
         model.eval()
         block = model.gated_xattn_blocks[0]
         seen = []
         original = block.forward
 
         def capture(hidden, memory, **kw):
-            seen.append({k: v for k, v in kw.items()})
+            seen.append((kw["query_positions"].clone(), kw["memory_positions"].clone(), kw["memory_mask"].clone()))
             return original(hidden, memory, **kw)
-
-        def char_seen(kw, words, b, t):
-            w = kw.get("windows")
-            self.assertEqual(w is None, chunk == 0)
-            if w is None:
-                char_pos, char_mask = kw["memory_positions"][:, words:], kw["memory_mask"][:, :, words:]
-                return char_pos[b][char_mask[b, t]]
-            self.assertEqual(w.mask.shape[-1], words + w.width)
-            queries = kw["query_positions"].shape[1]
-            run_pos = runner.window_runs(w.positions, 1, w.first, N, w.chunk, queries, -1)
-            run, j = divmod(t, w.chunk)
-            return run_pos[b, run][w.mask[b, run, j, words:]]
 
         block.forward = capture
         memory = hidden = None
@@ -131,13 +112,13 @@ class CharMemoryTest(unittest.TestCase):
             word_held = 0 if memory is None else memory[0].shape[1]
             with torch.no_grad():
                 _, _, memory, hidden, _ = run(model, self.ids, self.rows, part, memory, hidden)
-            kw = seen[-1]
-            q = kw["query_positions"]
+            q, mp, mask = seen[-1]
             words = word_held + len(part[0])  # word records come first: held, then this update's
+            char_pos, char_mask = mp[:, words:], mask[:, :, words:]
             for b, segs in enumerate(part):
                 for t, p in enumerate(range(segs[0][0], segs[-1][1])):
                     self.assertEqual(int(q[b, t]), p)
-                    got = sorted(int(x) for x in char_seen(kw, words, b, t))
+                    got = sorted(int(x) for x in char_pos[b][char_mask[b, t]])
                     first = max(p - N + 1, self.segs[b][0][0])
                     self.assertEqual(got, list(range(first, p + 1)), (u, b, p))
             # the carried records are each stream's last N positions, in order
@@ -146,44 +127,6 @@ class CharMemoryTest(unittest.TestCase):
                 want = [p if p >= self.segs[b][0][0] else -1 for p in range(end - N, end)]
                 self.assertEqual(memory[3][b].tolist(), want)
         block.forward = original
-
-    def test_runs_are_the_whole_update_masked(self) -> None:
-        # Read in runs of 1, 3, 8 or more than an update, two updates with
-        # records carried and two of three streams starting a new piece in
-        # between: the loss, every gradient and the carried state and records
-        # are the ones reading every record, masked, gives.
-        got = {}
-        for chunk in (0, 1, 3, 8, 500):
-            model = make_model(layers=2, word_tier=5, char_memory=N, char_chunk=chunk, documents=True, **PARALLEL)
-            model.train()
-            model.zero_grad()
-            memory = hidden = None
-            losses = []
-            for u in range(2):
-                if u == 1:
-                    hidden, memory = model.reset_streams(hidden, memory, np.array([True, False, True]))
-                part = [s[u * 5 : (u + 1) * 5] for s in self.segs]
-                loss, _, memory, hidden, _ = run(model, self.ids, self.rows, part, memory, hidden, max_memory=4)
-                loss.backward()
-                losses.append(float(loss.detach()))
-                memory, hidden = tuple(m.detach() for m in memory), hidden.detach()
-            got[chunk] = (losses, grads(model), memory, hidden)
-        la, ga, ma, ha = got[0]
-        for chunk in (1, 3, 8, 500):
-            with self.subTest(chunk=chunk):
-                lb, gb, mb, hb = got[chunk]
-                for x, y in zip(la, lb):
-                    self.assertAlmostEqual(x, y, places=5)
-                self.assertEqual(set(ga), set(gb))
-                for name in ga:
-                    torch.testing.assert_close(gb[name], ga[name], rtol=1e-4, atol=1e-6, msg=name)
-                for x, y in zip(ma, mb):
-                    if x.dtype.is_floating_point:
-                        torch.testing.assert_close(y, x, rtol=1e-5, atol=1e-6)
-                    else:
-                        self.assertTrue(torch.equal(x, y))
-                torch.testing.assert_close(hb, ha, rtol=1e-5, atol=1e-6)
-        self.assertGreater(float(ga["char_writer.0.weight"].abs().sum()), 0.0)
 
     def test_a_record_is_the_state_before_and_the_character(self) -> None:
         # Character u's record is char_writer([GRU state before u, u's
@@ -300,8 +243,6 @@ class CharMemoryTest(unittest.TestCase):
             run(model, self.ids, self.rows, part, None, None)
         with self.assertRaises(ValueError):
             make_model(layers=1, char_memory=-1, **PARALLEL)
-        with self.assertRaises(ValueError):
-            make_model(layers=1, char_memory=N, char_chunk=-1, **PARALLEL)
 
 
 if __name__ == "__main__":
