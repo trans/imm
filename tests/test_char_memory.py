@@ -193,6 +193,49 @@ class CharMemoryTest(unittest.TestCase):
         n0 = nxt[0][-1][1] - nxt[0][0][0]
         torch.testing.assert_close(s_carried[:n0], s_fresh[:n0], rtol=1e-5, atol=1e-6)
 
+    def test_the_fused_attention_is_the_masked_softmax(self) -> None:
+        # With a mask the block attends fused (the weights aren't kept);
+        # it gives what masked softmax attention gives, gradients included,
+        # and a query that sees nothing gets no attention output.
+        torch.manual_seed(0)
+        block = runner.GatedCrossAttentionBlock(H, 2)
+        with torch.no_grad():
+            block.gate_attn.fill_(0.7)
+            block.gate_mlp.fill_(-0.4)
+        B, T, M = 3, 7, 9
+        hidden = torch.randn(B, T, H, requires_grad=True)
+        memory = torch.randn(B, M, H, requires_grad=True)
+        qpos = torch.arange(T).repeat(B, 1) + 20
+        mpos = torch.randint(0, 30, (B, M))
+        mask = torch.rand(B, T, M) < 0.5
+        mask[0, 3] = False  # sees nothing
+        mask[1, :, 4] = False  # a record nobody sees
+
+        def reference():
+            q = block.apply_rope(block.q_proj(block.ln_q(hidden)).view(B, T, 2, -1).transpose(1, 2), qpos, True)
+            mn = block.ln_kv(memory)
+            k = block.apply_rope(block.k_proj(mn).view(B, M, 2, -1).transpose(1, 2), mpos, True)
+            v = block.v_proj(mn).view(B, M, 2, -1).transpose(1, 2)
+            scores = (q @ k.transpose(-2, -1) / (H // 2) ** 0.5).masked_fill(~mask[:, None], torch.finfo(torch.float32).min)
+            out = (torch.softmax(scores, dim=-1) @ v).transpose(1, 2).reshape(B, T, H)
+            out = block.out_proj(out) * mask.any(dim=-1, keepdim=True)
+            h = hidden + torch.tanh(block.gate_attn) * out
+            return h + torch.tanh(block.gate_mlp) * block.mlp(block.ln_mlp(h))
+
+        got = block(hidden, memory, query_positions=qpos, memory_positions=mpos, memory_mask=mask)
+        want = reference()
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+        weight = torch.randn_like(got)
+        g_got = torch.autograd.grad((got * weight).sum(), [hidden, memory, block.k_proj.weight])
+        g_want = torch.autograd.grad((want * weight).sum(), [hidden, memory, block.k_proj.weight])
+        for a, b in zip(g_got, g_want):
+            torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+        no_attn = got[0, 3] - hidden[0, 3]
+        h = hidden[0, 3]
+        torch.testing.assert_close(
+            no_attn, torch.tanh(block.gate_mlp) * block.mlp(block.ln_mlp(h)), rtol=1e-5, atol=1e-6
+        )
+
     def test_other_paths_refuse_it(self) -> None:
         model = make_model(layers=1, char_memory=N)  # carry_bound none: not the parallel path
         part = [s[:3] for s in self.segs]

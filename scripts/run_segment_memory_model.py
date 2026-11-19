@@ -305,28 +305,35 @@ class GatedCrossAttentionBlock(nn.Module):
                 memory_positions = torch.arange(-memory_count, 0, device=hidden.device)
             query = self.apply_rope(query, query_positions, use_rope)
             key = self.apply_rope(key, memory_positions, use_rope)
-            scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_dim)
             if memory_mask is not None:
-                # The lowest finite value, not -inf: a query that sees nothing
-                # gets even weights instead of NaN, and its output is zeroed
-                # below. Elsewhere exp(lowest - max) is exactly 0.
-                scores = scores.masked_fill(~memory_mask[:, None], torch.finfo(scores.dtype).min)
-            weights = torch.softmax(scores, dim=-1)
-            if return_diagnostics:
-                mean_weights = weights.mean(dim=1).squeeze(0)
-                eps = torch.finfo(mean_weights.dtype).eps
-                entropy = -(mean_weights * mean_weights.clamp_min(eps).log()).sum(dim=1)
-                top_weight = mean_weights.max(dim=1).values
-                top_indices = mean_weights.argmax(dim=1)
-                distances = (query_positions[:, None] - memory_positions[None, :]).abs().to(dtype=mean_weights.dtype)
-                mean_distance = (mean_weights * distances).sum(dim=1)
-                stats["attn_entropy_sum"] = float(entropy.detach().sum().item())
-                stats["attn_top_weight_sum"] = float(top_weight.detach().sum().item())
-                stats["attn_char_distance_sum"] = float(mean_distance.detach().sum().item())
-                stats["attn_token_count"] = float(query_count)
-                stats["attn_prev_weight_sum"] = float(mean_weights.detach().sum().item())
-                stats["attn_top_is_prev_sum"] = float(torch.ones_like(top_indices, dtype=mean_weights.dtype).sum().item())
-            attn_out = self.drop(weights) @ value
+                # Fused, so the [B, heads, T, M] weights are never kept for
+                # the backward pass: with character records (--char-memory)
+                # they no longer fit on the GPU. A query that sees nothing is
+                # let see everything, so no row is empty (NaN in some kernels;
+                # the CPU gives 0 anyway); its output is zeroed below, as
+                # before.
+                sees = memory_mask | ~memory_mask.any(dim=-1, keepdim=True)
+                attn_out = F.scaled_dot_product_attention(
+                    query, key, value, attn_mask=sees[:, None], dropout_p=self.dropout if self.training else 0.0
+                )
+            else:
+                scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_dim)
+                weights = torch.softmax(scores, dim=-1)
+                if return_diagnostics:
+                    mean_weights = weights.mean(dim=1).squeeze(0)
+                    eps = torch.finfo(mean_weights.dtype).eps
+                    entropy = -(mean_weights * mean_weights.clamp_min(eps).log()).sum(dim=1)
+                    top_weight = mean_weights.max(dim=1).values
+                    top_indices = mean_weights.argmax(dim=1)
+                    distances = (query_positions[:, None] - memory_positions[None, :]).abs().to(dtype=mean_weights.dtype)
+                    mean_distance = (mean_weights * distances).sum(dim=1)
+                    stats["attn_entropy_sum"] = float(entropy.detach().sum().item())
+                    stats["attn_top_weight_sum"] = float(top_weight.detach().sum().item())
+                    stats["attn_char_distance_sum"] = float(mean_distance.detach().sum().item())
+                    stats["attn_token_count"] = float(query_count)
+                    stats["attn_prev_weight_sum"] = float(mean_weights.detach().sum().item())
+                    stats["attn_top_is_prev_sum"] = float(torch.ones_like(top_indices, dtype=mean_weights.dtype).sum().item())
+                attn_out = self.drop(weights) @ value
             attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, query_count, self.hidden_size)
             attn_out = self.drop(self.out_proj(attn_out))
             if memory_mask is not None:
