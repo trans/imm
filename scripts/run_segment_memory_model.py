@@ -216,6 +216,39 @@ class LMATokenBlock(nn.Module):
         return self.norm_mlp(tokens + self.mlp(tokens))
 
 
+def window_runs(x: torch.Tensor, dim: int, first: int, window: int, chunk: int, queries: int, fill: float) -> torch.Tensor:
+    """--char-chunk: x's entries along dim, `first` carried ones and then
+    one per query, cut for the queries in runs of `chunk`. Run c, for
+    queries c * chunk .. c * chunk + chunk - 1, gets the entries
+    first + c * chunk - window + 1 .. first + c * chunk + chunk - 1: every
+    window of `window` entries ending at one of its queries' own. Entries
+    before the first or past the last are `fill`. Returns x with dim
+    replaced by [runs, window + chunk - 1]."""
+    runs = -(-queries // chunk)
+    width = window + chunk - 1
+    pad = [0, 0] * (x.dim() - 1 - dim) + [window, first + runs * chunk - x.shape[dim]]
+    padded = F.pad(x, pad, value=fill)
+    return padded.narrow(dim, first + 1, window + runs * chunk - 1).unfold(dim, width, chunk).movedim(-1, dim + 1)
+
+
+@dataclass
+class CharWindows:
+    """--char-chunk: the character records, for queries read in runs of
+    chunk. records [B, L, H] and positions [B, L]: the `first` carried ones,
+    then one per query of this update, in order. mask [B, runs, chunk,
+    M + width] bool: what each query of each run sees, of the M word records
+    (the block's memory) and then the run's width = N + chunk - 1 character
+    records (window_runs). Only right if a stream's real positions increase
+    along it, so a window of N positions is one of N records."""
+
+    records: torch.Tensor
+    positions: torch.Tensor
+    first: int
+    chunk: int
+    width: int
+    mask: torch.Tensor
+
+
 class GatedCrossAttentionBlock(nn.Module):
     def __init__(
         self, hidden_size: int, heads: int, memory_size: int | None = None, mlp_mult: int = 4, dropout: float = 0.0
@@ -284,14 +317,19 @@ class GatedCrossAttentionBlock(nn.Module):
         use_rope: bool = True,
         return_diagnostics: bool = False,
         memory_mask: torch.Tensor | None = None,
+        windows: CharWindows | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """memory_mask ([B, T, M] bool), if given, says which records each
         query may see; a query that sees none gets no attention output, as
-        with an empty memory."""
+        with an empty memory. With windows (--char-chunk), each run of
+        queries sees the memory and its own window of character records,
+        as windows.mask says (memory_mask is then not used)."""
         stats = empty_stats()
-        if memory_mask is not None and return_diagnostics:
+        if (memory_mask is not None or windows is not None) and return_diagnostics:
             raise ValueError("memory_mask has no diagnostics")
-        if memory.shape[1] > 0:
+        if windows is not None:
+            attn_out = self.windowed_attention(hidden, memory, query_positions, memory_positions, use_rope, windows)
+        elif memory.shape[1] > 0:
             batch_size, query_count, _ = hidden.shape
             memory_count = memory.shape[1]
             query_norm = self.ln_q(hidden)
@@ -346,6 +384,57 @@ class GatedCrossAttentionBlock(nn.Module):
         if return_diagnostics:
             return hidden, stats
         return hidden
+
+    def project(self, x: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
+        """[B, M, memory size] records to [B, heads, M, head dim] keys or values."""
+        return proj(x).view(x.shape[0], x.shape[1], self.heads, self.head_dim).transpose(1, 2)
+
+    def windowed_attention(
+        self,
+        hidden: torch.Tensor,
+        memory: torch.Tensor,
+        query_positions: torch.Tensor,
+        memory_positions: torch.Tensor,
+        use_rope: bool,
+        windows: CharWindows,
+    ) -> torch.Tensor:
+        """--char-chunk: the attention output [B, T, H] (out_proj and the
+        zeroing of queries that see nothing included), each run of
+        windows.chunk queries over the word records and its own window of
+        character records. The keys and values are made once per record and
+        then cut into the runs' windows."""
+        batch_size, query_count, _ = hidden.shape
+        chunk, width = windows.chunk, windows.width
+        runs = windows.mask.shape[1]
+        padded = runs * chunk
+        query = self.project(self.ln_q(hidden), self.q_proj)
+        query = self.apply_rope(query, query_positions, use_rope)
+        query = F.pad(query, (0, 0, 0, padded - query_count)).view(batch_size, self.heads, runs, chunk, self.head_dim)
+        word_norm = self.ln_kv(memory)
+        char_norm = self.ln_kv(windows.records)
+        word_key = self.apply_rope(self.project(word_norm, self.k_proj), memory_positions, use_rope)
+        char_key = self.apply_rope(self.project(char_norm, self.k_proj), windows.positions, use_rope)
+        cut = dict(dim=2, first=windows.first, window=width - chunk + 1, chunk=chunk, queries=query_count, fill=0.0)
+        expand = (batch_size, self.heads, runs, memory.shape[1], self.head_dim)
+        key = torch.cat([word_key[:, :, None].expand(expand), window_runs(char_key, **cut)], dim=3)
+        value = torch.cat(
+            [self.project(word_norm, self.v_proj)[:, :, None].expand(expand), window_runs(self.project(char_norm, self.v_proj), **cut)],
+            dim=3,
+        )
+
+        def flat(x: torch.Tensor) -> torch.Tensor:  # [B, heads, runs, n, d] -> [B * runs, heads, n, d]
+            return x.transpose(1, 2).reshape(batch_size * runs, self.heads, x.shape[3], self.head_dim)
+
+        mask = windows.mask.reshape(batch_size * runs, 1, chunk, -1)
+        sees = mask | ~mask.any(dim=-1, keepdim=True)  # as in forward: no empty row
+        attn_out = F.scaled_dot_product_attention(
+            flat(query), flat(key), flat(value), attn_mask=sees, dropout_p=self.dropout if self.training else 0.0
+        )  # [B * runs, heads, chunk, d]
+        attn_out = attn_out.view(batch_size, runs, self.heads, chunk, self.head_dim).permute(0, 1, 3, 2, 4)
+        attn_out = attn_out.reshape(batch_size, padded, self.hidden_size)[:, :query_count]
+        attn_out = self.drop(self.out_proj(attn_out))
+        sees_any = windows.mask.any(dim=-1).reshape(batch_size, padded)[:, :query_count, None]
+        return attn_out * sees_any.to(attn_out.dtype)
 
 
 class WordTier(nn.Module):
@@ -692,6 +781,7 @@ class SegmentMemoryLM(nn.Module):
         top_down: bool = False,
         tier_position_gate: bool = False,
         char_memory: int = 0,
+        char_chunk: int = 128,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -1038,6 +1128,13 @@ class SegmentMemoryLM(nn.Module):
         if char_memory < 0:
             raise ValueError(f"char_memory must be >= 0, got {char_memory}")
         self.char_memory = char_memory
+        # --char-chunk C: the queries read the character records in runs of
+        # C, each run over just the records its queries' windows reach
+        # (N + C - 1 of them) instead of all of the update's, masked. The
+        # same attention, less of it; 0 reads them all, masked.
+        if char_chunk < 0:
+            raise ValueError(f"char_chunk must be >= 0, got {char_chunk}")
+        self.char_chunk = char_chunk
         self.char_writer = None
         if char_memory > 0:
             with torch.random.fork_rng(devices=[]):
@@ -2016,6 +2113,34 @@ class SegmentMemoryLM(nn.Module):
             and self.rope_positions == "char"
         )
 
+    def char_windows(
+        self,
+        records: torch.Tensor,
+        positions: torch.Tensor,
+        first: int,
+        query_positions: torch.Tensor,
+        word_visible: torch.Tensor,
+    ) -> CharWindows:
+        """--char-chunk: the character records ([B, first + T, H], the
+        carried ones first, padding at position -1) for the queries
+        ([B, T] positions) in runs of char_chunk, and what each sees: the
+        word records word_visible ([B, T, M]) says, then of its run's
+        window the ones at most char_memory - 1 positions back, as the
+        whole-update mask has it. Padding queries see nothing."""
+        chunk, window = self.char_chunk, self.char_memory
+        batch_size, queries = query_positions.shape
+        runs = -(-queries // chunk)
+        padded = runs * chunk - queries
+        run_positions = window_runs(positions, 1, first, window, chunk, queries, -1)  # [B, runs, width]
+        query_runs = F.pad(query_positions, (0, padded), value=-1).view(batch_size, runs, chunk)
+        gap = query_runs[..., None] - run_positions[:, :, None, :]  # [B, runs, chunk, width]
+        char_visible = (gap >= 0) & (gap < window) & (run_positions >= 0)[:, :, None, :]
+        word_runs = F.pad(word_visible, (0, 0, 0, padded), value=False).view(batch_size, runs, chunk, -1)
+        return CharWindows(
+            records=records, positions=positions, first=first, chunk=chunk, width=window + chunk - 1,
+            mask=torch.cat([word_runs, char_visible], dim=-1),
+        )
+
     def span_gru(
         self, embeddings: torch.Tensor, lengths: np.ndarray, initial_hidden: torch.Tensor
     ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
@@ -2106,6 +2231,7 @@ class SegmentMemoryLM(nn.Module):
         query_positions = torch.from_numpy(char_position).to(device)
         memory_positions = record_positions
         char_out = None
+        windows = None
         if char_held is not None:
             # Character u's record: the GRU's state before u (the carried
             # state for the update's first) and u's embedding. Padding gets
@@ -2118,11 +2244,14 @@ class SegmentMemoryLM(nn.Module):
             char_positions = torch.cat(
                 [held_char_positions, torch.where(span_valid_t, query_positions, torch.full_like(query_positions, -1))], dim=1
             )
-            gap = query_positions[:, :, None] - char_positions[:, None, :]  # [B, T, M + T]
-            char_visible = (gap >= 0) & (gap < self.char_memory) & (char_positions >= 0)[:, None, :]
-            mem = torch.cat([mem, char_records], dim=1)
-            memory_positions = torch.cat([record_positions, char_positions], dim=1)
-            visible = torch.cat([visible, char_visible], dim=-1)
+            if self.char_chunk > 0:
+                windows = self.char_windows(char_records, char_positions, held_char.shape[1], query_positions, visible)
+            else:
+                gap = query_positions[:, :, None] - char_positions[:, None, :]  # [B, T, M + T]
+                char_visible = (gap >= 0) & (gap < self.char_memory) & (char_positions >= 0)[:, None, :]
+                mem = torch.cat([mem, char_records], dim=1)
+                memory_positions = torch.cat([record_positions, char_positions], dim=1)
+                visible = torch.cat([visible, char_visible], dim=-1)
             # The last char_memory records of each stream are carried: its
             # real ones are the held ones, then its first L of this update's.
             taken = held_char.shape[1] + span_valid_t.sum(dim=1, keepdim=True)  # [B, 1]
@@ -2172,7 +2301,7 @@ class SegmentMemoryLM(nn.Module):
         for block in self.gated_xattn_blocks:
             state = block(
                 state, mem, query_positions=query_positions, memory_positions=memory_positions,
-                use_rope=self.use_rope, memory_mask=visible,
+                use_rope=self.use_rope, memory_mask=None if windows is not None else visible, windows=windows,
             )
         context_norm_sum = 0.0
         if collect_stats:
@@ -2752,6 +2881,15 @@ def parse_args() -> argparse.Namespace:
         help="records at character resolution beside the word records, in the same attention blocks: character u "
         "writes one from the GRU's state before it and its own embedding, and each character sees those of its last "
         "N characters (itself included) in its piece (0: off; parallel memory path only)",
+    )
+    parser.add_argument(
+        "--char-chunk",
+        type=int,
+        default=128,
+        metavar="C",
+        help="with --char-memory N: the queries read the character records in runs of C characters, each run over "
+        "the N + C - 1 records its queries' windows reach, not all of the update's (0: all, masked). The same "
+        "attention, less of it",
     )
     parser.add_argument(
         "--word-tier",
@@ -5187,6 +5325,7 @@ def main() -> None:
         top_down=args.top_down,
         tier_position_gate=args.tier_position_gate,
         char_memory=args.char_memory,
+        char_chunk=args.char_chunk,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
@@ -5363,7 +5502,7 @@ def main() -> None:
             f"memory_state={args.memory_state} rope_positions={args.rope_positions} "
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
-            f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} char_memory={args.char_memory} word_tier={args.word_tier} "
+            f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} char_memory={args.char_memory} char_chunk={args.char_chunk} word_tier={args.word_tier} "
             f"phrase_tier={args.phrase_tier} phrase_marks={args.phrase_marks!r} tier_own_step={args.tier_own_step} prior_strength_gate={args.prior_strength_gate} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} drop_cache={','.join(drop_cache) or 'none'} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
