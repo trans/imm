@@ -58,7 +58,9 @@ from imm.vectorized_count_prior import (
 
 
 MemoryEntry = tuple[torch.Tensor, int]
-StreamMemory = tuple[torch.Tensor, torch.Tensor]  # records [B, M, H], their positions [B, M]
+# records [B, M, H], their positions [B, M]; with --char-memory N, the
+# character records [B, N, H] and their positions [B, N] after them.
+StreamMemory = tuple[torch.Tensor, ...]
 PriorRows = torch.Tensor | np.memmap | CompactEvidenceRows
 
 
@@ -682,6 +684,7 @@ class SegmentMemoryLM(nn.Module):
         newline_id: int | None = None,
         top_down: bool = False,
         tier_position_gate: bool = False,
+        char_memory: int = 0,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -1016,6 +1019,24 @@ class SegmentMemoryLM(nn.Module):
             for layer in (self.top_down_char, self.top_down_word):
                 nn.init.zeros_(layer.weight)
                 nn.init.zeros_(layer.bias)
+        # --char-memory N: records at character resolution beside the word
+        # records, read by the same attention blocks. Character u writes one
+        # from the GRU's state before it (what the text so far ends in) and
+        # its own embedding (what came next), so a single lookup copies: a
+        # query whose state matches the state before u reads u. Character t
+        # sees those of u <= t within its last N characters, in its piece.
+        # The last N are carried from update to update, detached in training
+        # as the word records are. Built under a forked RNG, so every other
+        # parameter starts as it would without it. Parallel memory path only.
+        if char_memory < 0:
+            raise ValueError(f"char_memory must be >= 0, got {char_memory}")
+        self.char_memory = char_memory
+        self.char_writer = None
+        if char_memory > 0:
+            with torch.random.fork_rng(devices=[]):
+                self.char_writer = nn.Sequential(
+                    nn.Linear(hidden_size + embedding_size, hidden_size), nn.LayerNorm(hidden_size)
+                )
         # --documents: the carried state a piece starts from, learned, through
         # tanh to stay in the GRUs' range: the character GRU's, then each
         # tier's, as the carried state lays them out (a boundary tier's
@@ -1105,7 +1126,8 @@ class SegmentMemoryLM(nn.Module):
     ) -> tuple[torch.Tensor, StreamMemory | None]:
         """--documents: the streams marked in reset ([B] bool) begin a piece.
         Their carried state becomes the start state, and their records so far
-        are marked gone (position -1), so no later query sees them."""
+        are marked gone (position -1), so no later query sees them: the
+        word records and, with --char-memory, the character records."""
         streams = len(reset)
         device = self.start_state.device if self.start_state is not None else self.embed.weight.device
         at = torch.from_numpy(np.asarray(reset, dtype=bool)).to(device)
@@ -1114,8 +1136,11 @@ class SegmentMemoryLM(nn.Module):
             carried_hidden = torch.zeros(1, streams, self.carried_width(), device=device)
         carried_hidden = torch.where(at[None, :, None], start, carried_hidden)
         if memory is not None:
-            records, positions = memory
-            memory = (records, torch.where(at[:, None], torch.full_like(positions, -1), positions))
+
+            def gone(positions: torch.Tensor) -> torch.Tensor:
+                return torch.where(at[:, None], torch.full_like(positions, -1), positions)
+
+            memory = (memory[0], gone(memory[1])) + ((memory[2], gone(memory[3])) if len(memory) > 2 else ())
         return carried_hidden, memory
 
     def drop(self, x: torch.Tensor) -> torch.Tensor:
@@ -2016,12 +2041,17 @@ class SegmentMemoryLM(nn.Module):
         phrase_ends: torch.Tensor | None = None,
         sentence_ends: torch.Tensor | None = None,
         paragraph_ends: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        char_held: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, tuple[torch.Tensor, torch.Tensor] | None]:
         """segment_steps_streams' result, all at once (parallel_memory): one
         GRU call; segment k's record from the GRU's state at its last
         character; each attention block over every position, a position in
         segment k seeing the records the loop would hold there: those carried
-        in and those of segments before k, the last max_memory of them. With
+        in and those of segments before k, the last max_memory of them.
+        With --char-memory, char_held is the carried character records and
+        their positions ([B, M, H], [B, M]); the blocks see them and this
+        update's beside the word records, and the last char_memory of each
+        stream come back as the last result (None without). With
         the word tier, next_hidden is the character GRU's carried state and
         the word GRU's, side by side ([1, B, H + word_tier]), in and out; with
         the phrase tier too, the phrase GRU's after them ([1, B, H +
@@ -2067,6 +2097,35 @@ class SegmentMemoryLM(nn.Module):
         visible = visible & (record_positions >= 0)[:, None, :]  # --documents: a piece forgets the one before
         mem = self.memory_interface_norm(records)
         query_positions = torch.from_numpy(char_position).to(device)
+        memory_positions = record_positions
+        char_out = None
+        if char_held is not None:
+            # Character u's record: the GRU's state before u (the carried
+            # state for the update's first) and u's embedding. Padding gets
+            # position -1, which no query sees.
+            held_char, held_char_positions = char_held
+            span_embeddings = embeddings.new_zeros((streams, span_length, embeddings.shape[-1]))
+            span_embeddings[span_valid_t] = embeddings
+            before = torch.cat([next_hidden.transpose(0, 1), gru_states[:, :-1]], dim=1)  # [B, T, H]
+            char_records = torch.cat([held_char, self.char_writer(torch.cat([before, span_embeddings], dim=-1))], dim=1)
+            char_positions = torch.cat(
+                [held_char_positions, torch.where(span_valid_t, query_positions, torch.full_like(query_positions, -1))], dim=1
+            )
+            gap = query_positions[:, :, None] - char_positions[:, None, :]  # [B, T, M + T]
+            char_visible = (gap >= 0) & (gap < self.char_memory) & (char_positions >= 0)[:, None, :]
+            mem = torch.cat([mem, char_records], dim=1)
+            memory_positions = torch.cat([record_positions, char_positions], dim=1)
+            visible = torch.cat([visible, char_visible], dim=-1)
+            # The last char_memory records of each stream are carried: its
+            # real ones are the held ones, then its first L of this update's.
+            taken = held_char.shape[1] + span_valid_t.sum(dim=1, keepdim=True)  # [B, 1]
+            take = taken - self.char_memory + torch.arange(self.char_memory, device=device)[None, :]  # [B, N]
+            kept = take >= 0
+            take = take.clamp(min=0)
+            char_out = (
+                char_records.gather(1, take[..., None].expand(-1, -1, char_records.shape[-1])),
+                torch.where(kept, char_positions.gather(1, take), torch.full_like(take, -1)),
+            )
         state = gru_states
         if self.word_tier is not None:
             at_last = None
@@ -2105,7 +2164,7 @@ class SegmentMemoryLM(nn.Module):
                     state = state + paragraph_add
         for block in self.gated_xattn_blocks:
             state = block(
-                state, mem, query_positions=query_positions, memory_positions=record_positions,
+                state, mem, query_positions=query_positions, memory_positions=memory_positions,
                 use_rope=self.use_rope, memory_mask=visible,
             )
         context_norm_sum = 0.0
@@ -2126,6 +2185,7 @@ class SegmentMemoryLM(nn.Module):
             record_positions[:, -max_memory:],
             next_hidden,
             context_norm_sum,
+            char_out,
         )
 
     def segment_loss_streams(
@@ -2219,11 +2279,28 @@ class SegmentMemoryLM(nn.Module):
             )
         embeddings = self.drop(embeddings)
         embeddings = self.apply_input_rope(embeddings, flat_positions)
+        char_held = None
         if memory is None:
             records = embeddings.new_zeros((streams, 0, self.hidden_size))
             record_positions = torch.zeros((streams, 0), dtype=torch.long, device=device)
         else:
-            records, record_positions = memory
+            records, record_positions = memory[0], memory[1]
+            if len(memory) > 2:
+                char_held = (memory[2], memory[3])
+        if self.char_memory > 0:
+            if not self.parallel_memory(carry_hidden):
+                raise ValueError(
+                    "--char-memory needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
+                    "--carry-bound gru, --rope-positions char, a carried state"
+                )
+            if char_held is None:
+                char_held = (
+                    embeddings.new_zeros((streams, 0, self.hidden_size)),
+                    torch.zeros((streams, 0), dtype=torch.long, device=device),
+                )
+        else:
+            char_held = None
+        char_out = None
         zero_hidden = embeddings.new_zeros((1, streams, self.hidden_size))
         next_hidden = carried_hidden if carried_hidden is not None else zero_hidden
         if self.word_tier is not None:
@@ -2247,15 +2324,16 @@ class SegmentMemoryLM(nn.Module):
             if self.phrase_tier is not None:
                 phrase_ends = self.phrase_ends(read_ids, positions, valid)
             sentence_ends, paragraph_ends = self.boundary_ends(read_ids, positions, valid)
-            final_states, records, record_positions, next_hidden, context_norm_sum = self.parallel_memory_streams(
+            final_states, records, record_positions, next_hidden, context_norm_sum, char_out = self.parallel_memory_streams(
                 embeddings, valid, lengths, positions, ends, records, record_positions, next_hidden, max_memory,
-                score_mask, collect_stats, phrase_ends, sentence_ends, paragraph_ends,
+                score_mask, collect_stats, phrase_ends, sentence_ends, paragraph_ends, char_held=char_held,
             )
         else:
             final_states, records, record_positions, next_hidden, context_norm_sum = self.segment_steps_streams(
                 embeddings, valid, valid_t, lengths, positions, ends, records, record_positions, next_hidden,
                 zero_hidden, carry_hidden, feedback_state, max_memory, score_mask, collect_stats,
             )
+        memory_out = (records, record_positions) + (char_out if char_out is not None else ())
         head_in = self.drop(final_states)
         own_logits = self.gru_head(head_in)  # [N, V]
         logits, residual_logits, residual_alpha, _ = self.apply_prior_residual(
@@ -2285,7 +2363,7 @@ class SegmentMemoryLM(nn.Module):
             if self.training and residual_logits is not None and self.prior_residual_l2 > 0.0:
                 loss = loss + self.prior_residual_l2 * residual_logits.square().mean(dim=1).sum()
             stats["token_count"] = float(flat_positions.numel())
-            return loss, int(flat_positions.numel()), (records, record_positions), next_hidden, stats
+            return loss, int(flat_positions.numel()), memory_out, next_hidden, stats
 
         if score_mask is None:
             keep = torch.ones(flat_positions.numel(), dtype=torch.bool, device=device)
@@ -2317,7 +2395,7 @@ class SegmentMemoryLM(nn.Module):
             for block in self.gated_xattn_blocks if self.mixing != "none" else ():
                 stats["gate_sum"] += float(torch.tanh(block.gate_attn).abs().item() + torch.tanh(block.gate_mlp).abs().item())
                 stats["gate_count"] += 2.0
-        return loss, scored, (records, record_positions), next_hidden, stats
+        return loss, scored, memory_out, next_hidden, stats
 
     def segment_steps_streams(
         self,
@@ -2659,6 +2737,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--attention-layers", type=int, default=2)
     parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument(
+        "--char-memory",
+        type=int,
+        default=0,
+        metavar="N",
+        help="records at character resolution beside the word records, in the same attention blocks: character u "
+        "writes one from the GRU's state before it and its own embedding, and each character sees those of its last "
+        "N characters (itself included) in its piece (0: off; parallel memory path only)",
+    )
     parser.add_argument(
         "--word-tier",
         type=int,
@@ -4205,7 +4292,7 @@ def evaluate_documents(
         if len(keep) < len(active):
             index = torch.tensor(keep, dtype=torch.long, device=device)
             if keep:
-                memory = (memory[0][index], memory[1][index])
+                memory = tuple(part[index] for part in memory)
                 hidden = hidden[:, index]
             active = [active[j] for j in keep]
     stats["gate_sum"], stats["gate_count"] = gates
@@ -5092,6 +5179,7 @@ def main() -> None:
         newline_id=vocab.chars.index("\n") if "\n" in vocab.chars else None,
         top_down=args.top_down,
         tier_position_gate=args.tier_position_gate,
+        char_memory=args.char_memory,
     ).to(device)
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
@@ -5268,7 +5356,7 @@ def main() -> None:
             f"memory_state={args.memory_state} rope_positions={args.rope_positions} "
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
-            f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} word_tier={args.word_tier} "
+            f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} char_memory={args.char_memory} word_tier={args.word_tier} "
             f"phrase_tier={args.phrase_tier} phrase_marks={args.phrase_marks!r} tier_own_step={args.tier_own_step} prior_strength_gate={args.prior_strength_gate} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} drop_cache={','.join(drop_cache) or 'none'} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
@@ -5563,7 +5651,7 @@ def main() -> None:
                 step_profile.optimizer_sec += time.perf_counter() - t0
                 t0 = time.perf_counter()
                 if args.train_streams > 1:
-                    memory = (memory[0].detach(), memory[1])
+                    memory = tuple(part.detach() for part in memory)
                 else:
                     memory = [(state.detach(), position) for state, position in memory[-args.max_memory:]]
                 if carried_hidden is not None:
