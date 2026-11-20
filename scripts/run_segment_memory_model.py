@@ -2543,6 +2543,64 @@ def prior_rows_for_spans(
     return torch.from_numpy(np.concatenate([np.asarray(rows[start:end]) for start, end in spans])).to(device)
 
 
+def stream_groups(spans: list[tuple[int, int]], cap: int) -> list[slice]:
+    """--max-update-chars: an update's streams as contiguous groups. An
+    update runs padded to its longest span, streams x longest characters of
+    activations; past cap it runs as the fewest equal groups whose own size
+    (the group's streams x its longest span) is at most cap. One group, all
+    the streams, if the update fits or cap is 0."""
+    lengths = np.array([end - start for start, end in spans], dtype=np.int64)
+    streams = len(lengths)
+    if cap <= 0 or streams * int(lengths.max()) <= cap:
+        return [slice(0, streams)]
+    for count in range(2, streams + 1):
+        bounds = np.linspace(0, streams, count + 1).round().astype(int)
+        groups = [slice(int(a), int(b)) for a, b in zip(bounds[:-1], bounds[1:])]
+        if all((g.stop - g.start) * int(lengths[g].max()) <= cap for g in groups):
+            return groups
+    return [slice(b, b + 1) for b in range(streams)]
+
+
+def grouped_update(
+    model: "SegmentMemoryLM",
+    ids: torch.Tensor,
+    stream_segments: list[list[tuple[int, int]]],
+    groups: list[slice],
+    memory: StreamMemory | None,
+    carried_hidden: torch.Tensor | None,
+    max_memory: int,
+    **kwargs,
+) -> tuple[torch.Tensor, int, StreamMemory, torch.Tensor]:
+    """One training update of segment_loss_streams run in groups of streams
+    (--max-update-chars), for its backward too: each group's forward, then
+    its backward scaled by the whole update's characters, so the gradients
+    sum to the whole update's while only one group's activations are held.
+    The streams don't interact, so each group's memory and carried state
+    are those streams' own. Returns the summed loss (detached), the
+    characters, and every stream's memory and carried state."""
+    total = sum(end - start for segs in stream_segments for start, end in segs)
+    loss_sum = torch.zeros((), device=ids.device)
+    tokens = 0
+    memories, hiddens = [], []
+    for g in groups:
+        part_memory = None if memory is None else tuple(m[g] for m in memory)
+        part_hidden = None if carried_hidden is None else carried_hidden[:, g]
+        loss, part_tokens, part_memory, part_hidden, _ = model.segment_loss_streams(
+            ids, stream_segments[g], part_memory, max_memory, carried_hidden=part_hidden, **kwargs
+        )
+        if not torch.isfinite(loss):
+            raise FloatingPointError("non-finite training loss in a stream group")
+        (loss / total).backward()
+        loss_sum = loss_sum + loss.detach()
+        tokens += part_tokens
+        memories.append(tuple(m.detach() for m in part_memory))
+        hiddens.append(part_hidden.detach())
+    if tokens != total:
+        raise RuntimeError(f"grouped_update scored {tokens} characters, expected {total}")
+    memory_out = tuple(torch.cat(parts, dim=0) for parts in zip(*memories))
+    return loss_sum, tokens, memory_out, torch.cat(hiddens, dim=1)
+
+
 @dataclass(frozen=True)
 class SegmentMemoryRow:
     epoch: int
@@ -2787,6 +2845,15 @@ def parse_args() -> argparse.Namespace:
         help="run each update, in training and in scoring, under torch.autocast in bfloat16 (matmuls, linear "
         "layers, attention); losses, the memory and the carried state between updates stay float32. "
         "Batched path only (--train-streams and --eval-streams > 1)",
+    )
+    parser.add_argument(
+        "--max-update-chars",
+        type=int,
+        default=0,
+        metavar="N",
+        help="a training update runs padded to its longest stream: one whose streams x longest span passes N "
+        "characters runs as groups of streams, each group's forward and backward in turn; the same gradient in less "
+        "GPU memory (0: off; --train-streams > 1, no count prior)",
     )
     parser.add_argument(
         "--word-tier",
@@ -5227,6 +5294,9 @@ def main() -> None:
         if args.train_streams < 2 or args.eval_streams < 2:
             raise ValueError("--bf16 runs on the batched path only: give --train-streams and --eval-streams > 1")
         model.autocast_dtype = torch.bfloat16
+    if args.max_update_chars > 0 and (args.train_streams < 2 or args.count_prior != "none"):
+        raise ValueError("--max-update-chars splits batched updates without prior rows: give --train-streams > 1 "
+                         "and --count-prior none")
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
     if args.train_streams < 1:
@@ -5543,6 +5613,7 @@ def main() -> None:
             carried_hidden: torch.Tensor | None = None
             epoch_profile = EpochProfile()
             epoch_loss_sum = 0.0
+            epoch_split_updates = 0
             train_input_ids: torch.Tensor | None = None
             if train_unigram is not None:
                 noisy, changed = substitute(
@@ -5589,6 +5660,7 @@ def main() -> None:
                 t0 = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
                 step_profile.zero_sec += time.perf_counter() - t0
+                backward_done = False
                 t0 = time.perf_counter()
                 if args.train_streams > 1:
                     batch_streams = [segs[offset : offset + args.segments_per_update] for segs in stream_segments]
@@ -5615,18 +5687,39 @@ def main() -> None:
                         }
                     step_profile.rows_sec += time.perf_counter() - t0
                     t0 = time.perf_counter()
-                    loss, tokens, memory, carried_hidden, train_stats = model.segment_loss_streams(
-                        train_ids,
-                        batch_streams,
-                        memory,
-                        args.max_memory,
-                        carried_hidden=carried_hidden,
-                        carry_hidden=args.carry_hidden,
-                        feedback_state=args.feedback_state,
-                        token_feedback=args.token_feedback,
-                        input_ids=train_input_ids,
-                        **batch_rows,
-                    )
+                    groups = stream_groups(spans, args.max_update_chars)
+                    if len(groups) > 1:
+                        # --max-update-chars: forward and backward a group of streams at a time.
+                        if any(rows is not None for rows in batch_rows.values()):
+                            raise ValueError("--max-update-chars can't split prior rows")
+                        loss, tokens, memory, carried_hidden = grouped_update(
+                            model,
+                            train_ids,
+                            batch_streams,
+                            groups,
+                            memory,
+                            carried_hidden,
+                            args.max_memory,
+                            carry_hidden=args.carry_hidden,
+                            feedback_state=args.feedback_state,
+                            token_feedback=args.token_feedback,
+                            input_ids=train_input_ids,
+                        )
+                        backward_done = True
+                        epoch_split_updates += 1
+                    else:
+                        loss, tokens, memory, carried_hidden, train_stats = model.segment_loss_streams(
+                            train_ids,
+                            batch_streams,
+                            memory,
+                            args.max_memory,
+                            carried_hidden=carried_hidden,
+                            carry_hidden=args.carry_hidden,
+                            feedback_state=args.feedback_state,
+                            token_feedback=args.token_feedback,
+                            input_ids=train_input_ids,
+                            **batch_rows,
+                        )
                     batch_segments = batch_streams[0]
                 else:
                     batch_segments = train_segments[offset : offset + args.segments_per_update]
@@ -5687,7 +5780,8 @@ def main() -> None:
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite training loss at epoch={epoch} step={step}")
                 t0 = time.perf_counter()
-                (loss / tokens).backward()
+                if not backward_done:
+                    (loss / tokens).backward()
                 step_profile.backward_sec += time.perf_counter() - t0
                 t0 = time.perf_counter()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -5911,6 +6005,8 @@ def main() -> None:
             epoch_profile.checkpoint_sec += time.perf_counter() - t0
             if args.profile:
                 print(f"epoch={epoch} {profile_summary(epoch_profile)}", flush=True)
+            if args.max_update_chars > 0:
+                print(f"epoch={epoch} split_updates={epoch_split_updates} (--max-update-chars {args.max_update_chars})", flush=True)
             print(f"checkpoint={args.checkpoint_output}", flush=True)
             if improved_best:
                 print(
