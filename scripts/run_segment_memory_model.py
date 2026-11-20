@@ -719,6 +719,7 @@ class SegmentMemoryLM(nn.Module):
         tier_position_gate: bool = False,
         char_memory: int = 0,
         memory_attention: bool = True,
+        depth_records: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -1078,6 +1079,19 @@ class SegmentMemoryLM(nn.Module):
                 self.char_writer = nn.Sequential(
                     nn.Linear(hidden_size + embedding_size, hidden_size), nn.LayerNorm(hidden_size)
                 )
+        # --depth-records: block i > 1 reads records written from block i-1's
+        # output, as a transformer's layer reads keys and values made by the
+        # layer below; block 1 reads the GRU's, as without it. The same
+        # writers write every block's (no new parameters). A word record is
+        # written from the state at its last character, a character record
+        # from the state before the character and its embedding; so the
+        # state before an update's first character is carried, one per block
+        # past the first (carried_blocks), zeros at a piece's start. Each
+        # block's records are carried side by side ([.., blocks x H]).
+        # Parallel memory path only.
+        if depth_records and (mixing != "gated-xattn" or not memory_attention):
+            raise ValueError("--depth-records needs the gated blocks' attention: --mixing gated-xattn, with memory attention")
+        self.depth_records = depth_records and attention_layers > 1
         # --documents: the carried state a piece starts from, learned, through
         # tanh to stay in the GRUs' range: the character GRU's, then each
         # tier's, as the carried state lays them out (a boundary tier's
@@ -1129,7 +1143,21 @@ class SegmentMemoryLM(nn.Module):
         for tier in (self.sentence_tier, self.paragraph_tier):
             if tier is not None:
                 blocks.append((tier.carry_width(), tier.width))
+        if self.depth_carry_width():
+            blocks.append((self.depth_carry_width(), 0))
         return blocks
+
+    def depth_carry_width(self) -> int:
+        """--depth-records with character records: each block past the
+        first carries the state before the next update's first character."""
+        if not getattr(self, "depth_records", False) or self.char_memory == 0:
+            return 0
+        return (len(self.gated_xattn_blocks) - 1) * self.hidden_size
+
+    def record_width(self) -> int:
+        """A carried record's width: each block's side by side with
+        --depth-records."""
+        return self.hidden_size * (len(self.gated_xattn_blocks) if self.depth_records else 1)
 
     def carried_width(self) -> int:
         return sum(width for width, _ in self.carried_blocks())
@@ -2109,6 +2137,7 @@ class SegmentMemoryLM(nn.Module):
         phrase_hidden = parts.pop(0) if self.phrase_tier is not None else None
         sentence_carry = parts.pop(0) if self.sentence_tier is not None else None
         paragraph_carry = parts.pop(0) if self.paragraph_tier is not None else None
+        depth_carry = parts.pop(0) if self.depth_carry_width() else None  # [1, B, (blocks - 1) x H]
         paragraph_begun = top_down = None
         if self.top_down_char is not None:
             # --top-down: every character of stream b reads the paragraph state
@@ -2123,7 +2152,10 @@ class SegmentMemoryLM(nn.Module):
         last = torch.from_numpy(np.cumsum(lengths, axis=1) - 1).to(device)  # [B, K]: each segment's last character
         gru_terminal = gru_states[stream_index[:, None], last]  # [B, K, H]
         held = records.shape[1]
-        records = torch.cat([records, self.write_memory(gru_terminal)], dim=1)  # [B, held + K, H]
+        hidden_size = self.hidden_size
+        # --depth-records: the held records are each block's side by side.
+        held_words = list(records.split(hidden_size, dim=-1)) if self.depth_records else [records]
+        records = torch.cat([held_words[0], self.write_memory(gru_terminal)], dim=1)  # [B, held + K, H]
         record_positions = torch.cat([record_positions, torch.from_numpy(ends - 1).to(device)], dim=1)
         # Each row position's segment and character position. Padding takes
         # the last segment and position 0; its outputs are dropped.
@@ -2145,10 +2177,11 @@ class SegmentMemoryLM(nn.Module):
             # state for the update's first) and u's embedding. Padding gets
             # position -1, which no query sees.
             held_char, held_char_positions = char_held
+            held_chars = list(held_char.split(hidden_size, dim=-1)) if self.depth_records else [held_char]
             span_embeddings = embeddings.new_zeros((streams, span_length, embeddings.shape[-1]))
             span_embeddings[span_valid_t] = embeddings
             before = torch.cat([next_hidden.transpose(0, 1), gru_states[:, :-1]], dim=1)  # [B, T, H]
-            char_records = torch.cat([held_char, self.char_writer(torch.cat([before, span_embeddings], dim=-1))], dim=1)
+            char_records = torch.cat([held_chars[0], self.char_writer(torch.cat([before, span_embeddings], dim=-1))], dim=1)
             char_positions = torch.cat(
                 [held_char_positions, torch.where(span_valid_t, query_positions, torch.full_like(query_positions, -1))], dim=1
             )
@@ -2163,10 +2196,6 @@ class SegmentMemoryLM(nn.Module):
             take = taken - self.char_memory + torch.arange(self.char_memory, device=device)[None, :]  # [B, N]
             kept = take >= 0
             take = take.clamp(min=0)
-            char_out = (
-                char_records.gather(1, take[..., None].expand(-1, -1, char_records.shape[-1])),
-                torch.where(kept, char_positions.gather(1, take), torch.full_like(take, -1)),
-            )
         state = gru_states
         if self.word_tier is not None:
             at_last = None
@@ -2207,10 +2236,38 @@ class SegmentMemoryLM(nn.Module):
         if not self.memory_attention:
             # No records, word or character: each block's attention adds zero, its MLP still runs.
             block_mem, block_positions, block_visible = mem[:, :0], memory_positions[:, :0], visible[..., :0]
-        for block in self.gated_xattn_blocks:
+        word_parts, char_parts, depth_out = [records], [char_records] if char_held is not None else [], []
+        for i, block in enumerate(self.gated_xattn_blocks):
+            if i > 0 and self.depth_records:
+                # Block i's records, written from block i-1's output: a word's
+                # at its last character, a character's from the state before
+                # it (the carried one before the update's first) and its
+                # embedding. Positions and masks are block 1's.
+                word_i = torch.cat([held_words[i], self.write_memory(state[stream_index[:, None], last])], dim=1)
+                word_parts.append(word_i)
+                block_mem = self.memory_interface_norm(word_i)
+                if char_held is not None:
+                    carried_before = depth_carry[0, :, (i - 1) * hidden_size : i * hidden_size]  # [B, H]
+                    before_i = torch.cat([carried_before[:, None, :], state[:, :-1]], dim=1)  # [B, T, H]
+                    char_i = torch.cat(
+                        [held_chars[i], self.char_writer(torch.cat([before_i, span_embeddings], dim=-1))], dim=1
+                    )
+                    char_parts.append(char_i)
+                    block_mem = torch.cat([block_mem, char_i], dim=1)
+                    # the state before the next update's first character; a
+                    # stream with no characters keeps its carried one
+                    has_chars = torch.from_numpy(lengths.sum(axis=1) > 0).to(device)[:, None]
+                    depth_out.append(torch.where(has_chars, state[stream_index, last[:, -1]], carried_before))
             state = block(
                 state, block_mem, query_positions=query_positions, memory_positions=block_positions,
                 use_rope=self.use_rope, memory_mask=block_visible,
+            )
+        records = torch.cat(word_parts, dim=-1)  # [B, held + K, blocks x H] with --depth-records
+        if char_held is not None:
+            char_all = torch.cat(char_parts, dim=-1)
+            char_out = (
+                char_all.gather(1, take[..., None].expand(-1, -1, char_all.shape[-1])),
+                torch.where(kept, char_positions.gather(1, take), torch.full_like(take, -1)),
             )
         context_norm_sum = 0.0
         if collect_stats:
@@ -2224,6 +2281,8 @@ class SegmentMemoryLM(nn.Module):
         for carried in (phrase_hidden, sentence_carry, paragraph_carry):
             if carried is not None:
                 next_hidden = torch.cat([next_hidden, carried], dim=-1)
+        if depth_carry is not None:
+            next_hidden = torch.cat([next_hidden, torch.cat(depth_out, dim=-1)[None]], dim=-1)
         return (
             state[span_valid_t],
             records[:, -max_memory:],
@@ -2339,7 +2398,7 @@ class SegmentMemoryLM(nn.Module):
         embeddings = self.apply_input_rope(embeddings, flat_positions)
         char_held = None
         if memory is None:
-            records = embeddings.new_zeros((streams, 0, self.hidden_size))
+            records = embeddings.new_zeros((streams, 0, self.record_width()))
             record_positions = torch.zeros((streams, 0), dtype=torch.long, device=device)
         else:
             records, record_positions = memory[0], memory[1]
@@ -2353,7 +2412,7 @@ class SegmentMemoryLM(nn.Module):
                 )
             if char_held is None:
                 char_held = (
-                    embeddings.new_zeros((streams, 0, self.hidden_size)),
+                    embeddings.new_zeros((streams, 0, self.record_width())),
                     torch.zeros((streams, 0), dtype=torch.long, device=device),
                 )
         else:
@@ -2366,6 +2425,11 @@ class SegmentMemoryLM(nn.Module):
                 "--no-memory-attention needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
                 "--carry-bound gru, --rope-positions char, a carried state"
             )
+        if self.depth_records and not self.parallel_memory(carry_hidden):
+            raise ValueError(
+                "--depth-records needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
+                "--carry-bound gru, --rope-positions char, a carried state"
+            )
         if self.word_tier is not None:
             if not self.parallel_memory(carry_hidden):
                 raise ValueError(
@@ -2374,6 +2438,8 @@ class SegmentMemoryLM(nn.Module):
                 )
             if carried_hidden is None:
                 next_hidden = embeddings.new_zeros((1, streams, self.carried_width()))
+        if carried_hidden is None and self.depth_carry_width():
+            next_hidden = embeddings.new_zeros((1, streams, self.carried_width()))
         context_norm_sum = 0.0
         if self.whole_span_gru(carry_hidden, feedback_state):
             _, span_valid_t, span_out = self.span_gru(embeddings, lengths, next_hidden)
@@ -2883,6 +2949,13 @@ def parse_args() -> argparse.Namespace:
         help="records at character resolution beside the word records, in the same attention blocks: character u "
         "writes one from the GRU's state before it and its own embedding, and each character sees those of its last "
         "N characters (itself included) in its piece (0: off; parallel memory path only)",
+    )
+    parser.add_argument(
+        "--depth-records",
+        action="store_true",
+        help="each attention block past the first reads records written, by the same writers, from the block before "
+        "it's output instead of the GRU's state: the memory gets deeper with the blocks, as in a transformer "
+        "(parallel memory path only)",
     )
     parser.add_argument(
         "--bf16",
@@ -5335,6 +5408,7 @@ def main() -> None:
         tier_position_gate=args.tier_position_gate,
         char_memory=args.char_memory,
         memory_attention=not args.no_memory_attention,
+        depth_records=args.depth_records,
     ).to(device)
     if args.bf16:
         if args.train_streams < 2 or args.eval_streams < 2:
