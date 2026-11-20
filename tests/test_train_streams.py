@@ -46,9 +46,9 @@ def make_model(seed=0, layers=1, **overrides):
     o = {**BASE, **overrides}
     torch.manual_seed(seed)
     model = runner.SegmentMemoryLM(
-        V, H, H,
+        V, o.get("embedding_size", H), H,
         use_rope=o["use_rope"], rope_positions=o["rope_positions"], memory_state=o["memory_state"],
-        memory_record=o["memory_record"], rnn_core="gru", attn_interface_norm="none", mixing=o.get("mixing", "gated-xattn"),
+        memory_record=o["memory_record"], rnn_core=o.get("rnn_core", "gru"), attn_interface_norm="none", mixing=o.get("mixing", "gated-xattn"),
         attention_layers=layers, attention_heads=2, input_rope=o["input_rope"], feedback_gate_bias=-1.0,
         feedback_delta_cap=1.0, prior_strength=1.0, prior_residual_scale=1.0, prior_residual_l2=o["prior_residual_l2"],
         prior_residual_gate=o["prior_residual_gate"], prior_residual_gate_max=2.0, prior_residual_gate_features=3,
@@ -79,6 +79,8 @@ def make_model(seed=0, layers=1, **overrides):
         depth_records=o.get("depth_records", False),
         char_kv=o.get("char_kv", False),
         word_records=o.get("word_records", True),
+        word_pool=o.get("word_pool", "last"),
+        words_beyond_chars=o.get("words_beyond_chars", False),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():

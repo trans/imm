@@ -743,6 +743,8 @@ class SegmentMemoryLM(nn.Module):
         depth_records: bool = False,
         char_kv: bool = False,
         word_records: bool = True,
+        word_pool: str = "last",
+        words_beyond_chars: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -819,6 +821,13 @@ class SegmentMemoryLM(nn.Module):
         elif rnn_core == "tanh":
             self.rnn = nn.RNN(embedding_size, hidden_size, nonlinearity="tanh", batch_first=True)
             self.cell = nn.RNNCell(embedding_size, hidden_size, nonlinearity="tanh")
+        elif rnn_core == "none":
+            # --rnn-core none: no character recurrence; a character's state,
+            # the first block's input, is its embedding (projected to the
+            # hidden width when the widths differ). Checked with the blocks
+            # below.
+            self.rnn = self.cell = None
+            self.core_in = nn.Identity() if embedding_size == hidden_size else nn.Linear(embedding_size, hidden_size)
         else:
             raise ValueError(f"unknown rnn_core: {rnn_core}")
         self.query = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -1130,6 +1139,34 @@ class SegmentMemoryLM(nn.Module):
         if not word_records and (char_memory == 0 or mixing != "gated-xattn" or not memory_attention):
             raise ValueError("--no-word-records needs character records attended: --char-memory N, --mixing gated-xattn")
         self.word_records = word_records
+        # --rnn-core none: attention alone. The blocks are the model's only
+        # mixing across characters, so they must read character records
+        # rebuilt at every depth (--depth-records), as a transformer's layers
+        # do; the tiers read the GRU and are refused. Parallel memory path
+        # only.
+        if rnn_core == "none":
+            if char_memory == 0 or mixing != "gated-xattn" or not memory_attention or not self.depth_records:
+                raise ValueError(
+                    "--rnn-core none needs character records attended at every depth: --char-memory N, "
+                    "--mixing gated-xattn, --depth-records, --attention-layers > 1"
+                )
+            if word_tier or phrase_tier or sentence_tier or paragraph_tier or top_down:
+                raise ValueError("--rnn-core none takes no tiers: they read the character GRU")
+        # --word-pool mean: a word record is written from the mean of the
+        # block's input over the word's characters, not from the state at its
+        # last character.
+        if word_pool not in ("last", "mean"):
+            raise ValueError(f"unknown word_pool: {word_pool}")
+        if word_pool == "mean" and (not word_records or mixing != "gated-xattn" or not memory_attention):
+            raise ValueError("--word-pool mean needs word records attended: --mixing gated-xattn, with word records")
+        self.word_pool = word_pool
+        # --words-beyond-chars: a character sees a word's record only when
+        # the whole word is out of its character records' reach (the word's
+        # last character --char-memory or more back), so the two kinds don't
+        # overlap and the word records reach further at the same count.
+        if words_beyond_chars and (char_memory == 0 or not word_records or mixing != "gated-xattn" or not memory_attention):
+            raise ValueError("--words-beyond-chars needs word and character records attended: --char-memory N")
+        self.words_beyond_chars = words_beyond_chars
         # --documents: the carried state a piece starts from, learned, through
         # tanh to stay in the GRUs' range: the character GRU's, then each
         # tier's, as the carried state lays them out (a boundary tier's
@@ -1770,6 +1807,11 @@ class SegmentMemoryLM(nn.Module):
             raise ValueError(
                 "--no-word-records runs on the batched parallel path only: give --train-streams and --eval-streams > 1"
             )
+        if self.rnn is None or self.word_pool != "last" or self.words_beyond_chars:
+            raise ValueError(
+                "--rnn-core none, --word-pool mean and --words-beyond-chars run on the batched parallel path only: "
+                "give --train-streams and --eval-streams > 1"
+            )
         if self.prior_strength_gate is not None:
             raise ValueError("--prior-strength-gate runs on the batched path only: give --train-streams and --eval-streams > 1")
         if token_feedback != "none":
@@ -2133,8 +2175,28 @@ class SegmentMemoryLM(nn.Module):
         span_valid_t = torch.from_numpy(span_valid).to(embeddings.device)
         span_grid = embeddings.new_zeros((lengths.shape[0], span_valid.shape[1], embeddings.shape[-1]))
         span_grid[span_valid_t] = embeddings
+        if self.rnn is None:  # --rnn-core none: each character's state is its own (projected) embedding
+            return span_valid, span_valid_t, self.core_in(span_grid)
         span_out, _ = self.rnn(span_grid, initial_hidden.contiguous())
         return span_valid, span_valid_t, span_out
+
+    def word_summaries(
+        self, state: torch.Tensor, at_last: torch.Tensor, segment_of_t: torch.Tensor, span_valid_t: torch.Tensor,
+        lengths: np.ndarray,
+    ) -> torch.Tensor:
+        """What each of this update's segments writes its record from
+        ([B, K, H]): with --word-pool last, the state at its last character
+        (at_last, [B, K, H]); with mean, the mean of state ([B, T, H]) over
+        its characters, in float32 (zeros for a segment of no characters)."""
+        if self.word_pool == "last":
+            return at_last
+        streams, count = lengths.shape
+        width = state.shape[-1]
+        where = segment_of_t.masked_fill(~span_valid_t, 0)[..., None].expand(-1, -1, width)  # padding adds zeros
+        sums = state.new_zeros((streams, count, width), dtype=torch.float32)
+        sums.scatter_add_(1, where, state.float() * span_valid_t[..., None])
+        counts = torch.from_numpy(lengths).to(state.device).clamp(min=1)[..., None]
+        return (sums / counts).to(state.dtype)
 
     def parallel_memory_streams(
         self,
@@ -2197,11 +2259,6 @@ class SegmentMemoryLM(nn.Module):
         hidden_size = self.hidden_size
         # --depth-records: the held records are each block's side by side.
         held_words = list(records.split(hidden_size, dim=-1)) if self.depth_records else [records]
-        if self.word_records:
-            records = torch.cat([held_words[0], self.write_memory(gru_terminal)], dim=1)  # [B, held + K, H]
-            record_positions = torch.cat([record_positions, torch.from_numpy(ends - 1).to(device)], dim=1)
-        else:  # --no-word-records: none held, none written; every mask below is [.., 0] wide
-            records = held_words[0]
         # Each row position's segment and character position. Padding takes
         # the last segment and position 0; its outputs are dropped.
         segment_of = np.full((streams, span_length), count - 1, dtype=np.int64)
@@ -2209,12 +2266,20 @@ class SegmentMemoryLM(nn.Module):
         char_position = np.zeros((streams, span_length), dtype=np.int64)
         char_position[span_valid] = positions[valid]
         segment_of_t = torch.from_numpy(segment_of).to(device)
+        query_positions = torch.from_numpy(char_position).to(device)
+        if self.word_records:
+            written = self.word_summaries(gru_states, gru_terminal, segment_of_t, span_valid_t, lengths)
+            records = torch.cat([held_words[0], self.write_memory(written)], dim=1)  # [B, held + K, H]
+            record_positions = torch.cat([record_positions, torch.from_numpy(ends - 1).to(device)], dim=1)
+        else:  # --no-word-records: none held, none written; every mask below is [.., 0] wide
+            records = held_words[0]
         seen_until = held + segment_of_t  # [B, T]: records before this one are written
         record_index = torch.arange(records.shape[1], device=device)
         visible = (record_index < seen_until[..., None]) & (record_index >= seen_until[..., None] - max_memory)
         visible = visible & (record_positions >= 0)[:, None, :]  # --documents: a piece forgets the one before
+        if self.words_beyond_chars:  # a word whose last character is out of the character records' reach
+            visible = visible & (query_positions[:, :, None] - record_positions[:, None, :] >= self.char_memory)
         mem = self.memory_interface_norm(records) if self.word_records else records
-        query_positions = torch.from_numpy(char_position).to(device)
         memory_positions = record_positions
         char_out = None
         if char_held is not None:
@@ -2291,7 +2356,8 @@ class SegmentMemoryLM(nn.Module):
                 # it (the carried one before the update's first) and its
                 # embedding. Positions and masks are block 1's.
                 if self.word_records:
-                    word_i = torch.cat([held_words[i], self.write_memory(state[stream_index[:, None], last])], dim=1)
+                    written = self.word_summaries(state, state[stream_index[:, None], last], segment_of_t, span_valid_t, lengths)
+                    word_i = torch.cat([held_words[i], self.write_memory(written)], dim=1)
                     block_mem = self.memory_interface_norm(word_i)
                 else:
                     word_i = block_mem = held_words[i]
@@ -2484,6 +2550,13 @@ class SegmentMemoryLM(nn.Module):
             raise ValueError(
                 "--no-word-records needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
                 "--carry-bound gru, --rope-positions char, a carried state"
+            )
+        if (self.rnn is None or self.word_pool != "last" or self.words_beyond_chars) and not self.parallel_memory(
+            carry_hidden
+        ):
+            raise ValueError(
+                "--rnn-core none, --word-pool mean and --words-beyond-chars need the parallel memory path: "
+                "--mixing gated-xattn, --memory-state gru, --carry-bound gru, --rope-positions char, a carried state"
             )
         if self.word_tier is not None:
             if not self.parallel_memory(carry_hidden):
@@ -2887,7 +2960,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--embedding-size", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=128)
-    parser.add_argument("--rnn-core", choices=["gru", "tanh"], default="gru")
+    parser.add_argument(
+        "--rnn-core",
+        choices=["gru", "tanh", "none"],
+        default="gru",
+        help="the character recurrence; none: attention alone, a character's state its embedding (needs "
+        "--char-memory, --depth-records, more than one attention block, no tiers; parallel memory path only)",
+    )
+    parser.add_argument(
+        "--stop-after-epoch",
+        type=int,
+        default=0,
+        metavar="N",
+        help="stop after epoch N, the schedule still --epochs long, so the run reads against a full run's epoch N "
+        "(a screen; 0: run every epoch)",
+    )
     parser.add_argument("--attn-interface-norm", choices=["none", "attention", "context", "layer"], default="none")
     parser.add_argument("--max-memory", type=int, default=32)
     parser.add_argument("--no-rope", action="store_true")
@@ -3010,6 +3097,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="no word records: the attention blocks read the character records only (needs --char-memory; "
         "--max-memory is then unused)",
+    )
+    parser.add_argument(
+        "--word-pool",
+        choices=["last", "mean"],
+        default="last",
+        help="what a word record is written from: the block input at the word's last character, or its mean over "
+        "the word's characters (parallel memory path only)",
+    )
+    parser.add_argument(
+        "--words-beyond-chars",
+        action="store_true",
+        help="a character sees a word's record only when the word's last character is --char-memory or more back, "
+        "out of the character records' reach (needs --char-memory and word records)",
     )
     parser.add_argument(
         "--char-kv",
@@ -5478,7 +5578,11 @@ def main() -> None:
         depth_records=args.depth_records,
         char_kv=args.char_kv,
         word_records=not args.no_word_records,
+        word_pool=args.word_pool,
+        words_beyond_chars=args.words_beyond_chars,
     ).to(device)
+    if not 0 <= args.stop_after_epoch <= args.epochs:
+        raise ValueError(f"--stop-after-epoch must be in [0, --epochs], got {args.stop_after_epoch}")
     if args.bf16:
         if args.train_streams < 2 or args.eval_streams < 2:
             raise ValueError("--bf16 runs on the batched path only: give --train-streams and --eval-streams > 1")
@@ -6203,6 +6307,11 @@ def main() -> None:
                     f"best_epoch={best_epoch} best_step={best_step} best_val_ppl={best_val_ppl:.3f}",
                     flush=True,
                 )
+            if args.stop_after_epoch and epoch >= args.stop_after_epoch:
+                # A screen: the schedule is --epochs long, so its epochs read
+                # against a full run's.
+                print(f"stopped after epoch {epoch} of {args.epochs} (--stop-after-epoch)", flush=True)
+                break
 
 
 if __name__ == "__main__":
