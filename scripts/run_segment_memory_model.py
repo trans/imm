@@ -273,16 +273,18 @@ class GatedCrossAttentionBlock(nn.Module):
             return x
         rope_part = x[..., : self.rope_dim]
         pass_part = x[..., self.rope_dim :]
-        # positions: [T], shared by the batch, or [B, T], one row per stream
+        # positions: [T], shared by the batch, or [B, T], one row per stream.
+        # The angles and the rotation in float32, also under --bf16, whose 8
+        # bits hold integers exactly only to 256.
         shape = (1, 1, -1, 1) if positions.dim() == 1 else (positions.shape[0], 1, positions.shape[1], 1)
-        angles = positions.to(device=x.device, dtype=x.dtype).view(*shape) * self.rope_inv_freq.to(
-            dtype=x.dtype
-        ).view(1, 1, 1, -1)
+        angles = positions.to(device=x.device, dtype=torch.float32).view(*shape) * self.rope_inv_freq.float().view(
+            1, 1, 1, -1
+        )
         cos = torch.cos(angles)
         sin = torch.sin(angles)
-        even = rope_part[..., 0::2]
-        odd = rope_part[..., 1::2]
-        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
+        even = rope_part[..., 0::2].float()
+        odd = rope_part[..., 1::2].float()
+        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2).to(x.dtype)
         if pass_part.numel() == 0:
             return rotated
         return torch.cat([rotated, pass_part], dim=-1)
@@ -315,6 +317,15 @@ class GatedCrossAttentionBlock(nn.Module):
                 query_positions = torch.zeros(query_count, device=hidden.device)
             if memory_positions is None:
                 memory_positions = torch.arange(-memory_count, 0, device=hidden.device)
+            if use_rope:
+                # RoPE scores by the gap between a query and a key, so count
+                # each stream's positions from its last query: the same
+                # scores, in small numbers. Character offsets into the text
+                # run to 1e8, where float32 can't hold position x frequency to
+                # within a radian.
+                origin = query_positions.amax(dim=-1, keepdim=True)
+                query_positions = query_positions - origin
+                memory_positions = memory_positions - origin
             query = self.apply_rope(query, query_positions, use_rope)
             key = self.apply_rope(key, memory_positions, use_rope)
             if memory_mask is not None:
@@ -1331,14 +1342,12 @@ class SegmentMemoryLM(nn.Module):
             return x
         rope_part = x[:, : self.rope_dim]
         pass_part = x[:, self.rope_dim :]
-        angles = positions.to(device=x.device, dtype=x.dtype).unsqueeze(1) * self.rope_inv_freq.to(
-            dtype=x.dtype
-        ).unsqueeze(0)
+        angles = positions.to(device=x.device, dtype=torch.float32).unsqueeze(1) * self.rope_inv_freq.float().unsqueeze(0)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
-        even = rope_part[:, 0::2]
-        odd = rope_part[:, 1::2]
-        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(1)
+        even = rope_part[:, 0::2].float()
+        odd = rope_part[:, 1::2].float()
+        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(1).to(x.dtype)
         if pass_part.numel() == 0:
             return rotated
         return torch.cat([rotated, pass_part], dim=1)
@@ -1348,14 +1357,12 @@ class SegmentMemoryLM(nn.Module):
             return x
         rope_part = x[:, : self.embed_rope_dim]
         pass_part = x[:, self.embed_rope_dim :]
-        angles = positions.to(device=x.device, dtype=x.dtype).unsqueeze(1) * self.input_rope_inv_freq.to(
-            dtype=x.dtype
-        ).unsqueeze(0)
+        angles = positions.to(device=x.device, dtype=torch.float32).unsqueeze(1) * self.input_rope_inv_freq.float().unsqueeze(0)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
-        even = rope_part[:, 0::2]
-        odd = rope_part[:, 1::2]
-        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(1)
+        even = rope_part[:, 0::2].float()
+        odd = rope_part[:, 1::2].float()
+        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(1).to(x.dtype)
         if pass_part.numel() == 0:
             return rotated
         return torch.cat([rotated, pass_part], dim=1)
