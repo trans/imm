@@ -59,7 +59,7 @@ class GroupedUpdateTest(unittest.TestCase):
                 block.gate_mlp.fill_(0.5)
         return model
 
-    def updates(self, grouped: bool, streams=5, updates=3, per_update=6, **extra):
+    def updates(self, grouped: bool, streams=5, updates=3, per_update=6, resets=None, **extra):
         ids, _ = corpus(n=600)
         stream_segments = runner.split_streams(ragged_segments(len(ids) - 1, longest=7), streams)
         model = self.model(**extra)
@@ -68,6 +68,8 @@ class GroupedUpdateTest(unittest.TestCase):
         for u in range(updates):
             batch = [segs[u * per_update : (u + 1) * per_update] for segs in stream_segments]
             model.zero_grad(set_to_none=True)
+            if resets is not None:  # --documents, as the training loop does it: the start state, a parameter
+                hidden, memory = model.reset_streams(hidden, memory, np.array(resets[u]))
             if grouped:
                 spans = [(s[0][0], s[-1][1]) for s in batch]
                 groups = runner.stream_groups(spans, streams * max(e - s for s, e in spans) // 3)
@@ -87,6 +89,8 @@ class GroupedUpdateTest(unittest.TestCase):
 
     def check(self, **extra) -> None:
         whole, split = self.updates(False, **extra), self.updates(True, **extra)
+        if extra.get("resets"):
+            self.assertIn("start_state", whole[0][2])
         for (l1, t1, g1, m1, h1), (l2, t2, g2, m2, h2) in zip(whole, split):
             self.assertEqual(t1, t2)
             self.assertAlmostEqual(l1, l2, places=4)
@@ -104,6 +108,12 @@ class GroupedUpdateTest(unittest.TestCase):
 
     def test_grouped_equals_whole_with_documents(self) -> None:
         self.check(documents=True)
+
+    def test_grouped_equals_whole_across_piece_starts(self) -> None:
+        # Streams that begin a piece take the learned start state, one
+        # graph shared by every group: it must get its gradient once.
+        resets = [[True] * 5, [True, False, True, False, False], [False, True, False, False, True]]
+        self.check(documents=True, resets=resets)
 
     def test_grouped_under_bf16_is_finite_and_float32(self) -> None:
         ids, _ = corpus(n=600)

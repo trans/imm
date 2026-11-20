@@ -2583,15 +2583,23 @@ def grouped_update(
     its backward scaled by the whole update's characters, so the gradients
     sum to the whole update's while only one group's activations are held.
     The streams don't interact, so each group's memory and carried state
-    are those streams' own. Returns the summed loss (detached), the
-    characters, and every stream's memory and carried state."""
+    are those streams' own. An input that carries a graph (with
+    --documents, the start state a stream takes when it begins a piece,
+    one graph for every stream) enters the groups as a leaf, and its
+    gradient goes back through that graph once, after the last group.
+    Returns the summed loss (detached), the characters, and every stream's
+    memory and carried state."""
     total = sum(end - start for segs in stream_segments for start, end in segs)
     loss_sum = torch.zeros((), device=ids.device)
     tokens = 0
     memories, hiddens = [], []
+    inputs = ([] if carried_hidden is None else [carried_hidden]) + ([] if memory is None else list(memory))
+    leaves = [x.detach().requires_grad_() if x.requires_grad else x for x in inputs]
+    hidden_in = None if carried_hidden is None else leaves[0]
+    memory_in = None if memory is None else tuple(leaves[0 if carried_hidden is None else 1 :])
     for g in groups:
-        part_memory = None if memory is None else tuple(m[g] for m in memory)
-        part_hidden = None if carried_hidden is None else carried_hidden[:, g]
+        part_memory = None if memory_in is None else tuple(m[g] for m in memory_in)
+        part_hidden = None if hidden_in is None else hidden_in[:, g]
         loss, part_tokens, part_memory, part_hidden, _ = model.segment_loss_streams(
             ids, stream_segments[g], part_memory, max_memory, carried_hidden=part_hidden, **kwargs
         )
@@ -2604,6 +2612,9 @@ def grouped_update(
         hiddens.append(part_hidden.detach())
     if tokens != total:
         raise RuntimeError(f"grouped_update scored {tokens} characters, expected {total}")
+    pending = [(x, leaf.grad) for x, leaf in zip(inputs, leaves) if x is not leaf and leaf.grad is not None]
+    if pending:
+        torch.autograd.backward([x for x, _ in pending], [grad for _, grad in pending])
     memory_out = tuple(torch.cat(parts, dim=0) for parts in zip(*memories))
     return loss_sum, tokens, memory_out, torch.cat(hiddens, dim=1)
 
