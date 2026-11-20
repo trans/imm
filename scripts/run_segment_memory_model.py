@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
 import csv
 import gc
 import hashlib
@@ -263,6 +264,17 @@ class GatedCrossAttentionBlock(nn.Module):
             nn.Linear(mlp_mult * hidden_size, hidden_size),
         )
         self.gate_mlp = nn.Parameter(torch.zeros(1))
+        # --char-kv: the character records' own LayerNorm and key and value
+        # projections (add_char_kv); None, they share the word records'.
+        self.ln_kv_char = self.k_proj_char = self.v_proj_char = None
+
+    def add_char_kv(self) -> None:
+        """Give the records after kind_split (the character records) their
+        own LayerNorm and key and value projections, copies of the shared
+        ones: the block starts as it was, and the two kinds can part."""
+        self.ln_kv_char = copy.deepcopy(self.ln_kv)
+        self.k_proj_char = copy.deepcopy(self.k_proj)
+        self.v_proj_char = copy.deepcopy(self.v_proj)
 
     def drop(self, x: torch.Tensor) -> torch.Tensor:
         # Skipped at 0, so a run without dropout draws no random numbers for it.
@@ -298,10 +310,12 @@ class GatedCrossAttentionBlock(nn.Module):
         use_rope: bool = True,
         return_diagnostics: bool = False,
         memory_mask: torch.Tensor | None = None,
+        kind_split: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """memory_mask ([B, T, M] bool), if given, says which records each
         query may see; a query that sees none gets no attention output, as
-        with an empty memory."""
+        with an empty memory. kind_split: with --char-kv, the records from
+        it on are character records, keyed and valued by their own maps."""
         stats = empty_stats()
         if memory_mask is not None and return_diagnostics:
             raise ValueError("memory_mask has no diagnostics")
@@ -309,10 +323,17 @@ class GatedCrossAttentionBlock(nn.Module):
             batch_size, query_count, _ = hidden.shape
             memory_count = memory.shape[1]
             query_norm = self.ln_q(hidden)
-            memory_norm = self.ln_kv(memory)
             query = self.q_proj(query_norm).view(batch_size, query_count, self.heads, self.head_dim).transpose(1, 2)
-            key = self.k_proj(memory_norm).view(batch_size, memory_count, self.heads, self.head_dim).transpose(1, 2)
-            value = self.v_proj(memory_norm).view(batch_size, memory_count, self.heads, self.head_dim).transpose(1, 2)
+            if self.k_proj_char is not None and kind_split is not None:
+                words = self.ln_kv(memory[:, :kind_split])
+                chars = self.ln_kv_char(memory[:, kind_split:])
+                key = torch.cat([self.k_proj(words), self.k_proj_char(chars)], dim=1)
+                value = torch.cat([self.v_proj(words), self.v_proj_char(chars)], dim=1)
+            else:
+                memory_norm = self.ln_kv(memory)
+                key, value = self.k_proj(memory_norm), self.v_proj(memory_norm)
+            key = key.view(batch_size, memory_count, self.heads, self.head_dim).transpose(1, 2)
+            value = value.view(batch_size, memory_count, self.heads, self.head_dim).transpose(1, 2)
             if query_positions is None:
                 query_positions = torch.zeros(query_count, device=hidden.device)
             if memory_positions is None:
@@ -720,6 +741,7 @@ class SegmentMemoryLM(nn.Module):
         char_memory: int = 0,
         memory_attention: bool = True,
         depth_records: bool = False,
+        char_kv: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -1092,6 +1114,15 @@ class SegmentMemoryLM(nn.Module):
         if depth_records and (mixing != "gated-xattn" or not memory_attention):
             raise ValueError("--depth-records needs the gated blocks' attention: --mixing gated-xattn, with memory attention")
         self.depth_records = depth_records and attention_layers > 1
+        # --char-kv: in each block, the character records get their own
+        # LayerNorm and key and value projections, copies of the word
+        # records' at the start (GatedCrossAttentionBlock.add_char_kv).
+        if char_kv and (char_memory == 0 or mixing != "gated-xattn" or not memory_attention):
+            raise ValueError("--char-kv needs character records attended: --char-memory N, --mixing gated-xattn")
+        self.char_kv = char_kv
+        if char_kv:
+            for block in self.gated_xattn_blocks:
+                block.add_char_kv()
         # --documents: the carried state a piece starts from, learned, through
         # tanh to stay in the GRUs' range: the character GRU's, then each
         # tier's, as the carried state lays them out (a boundary tier's
@@ -2237,6 +2268,8 @@ class SegmentMemoryLM(nn.Module):
             # No records, word or character: each block's attention adds zero, its MLP still runs.
             block_mem, block_positions, block_visible = mem[:, :0], memory_positions[:, :0], visible[..., :0]
         word_parts, char_parts, depth_out = [records], [char_records] if char_held is not None else [], []
+        # --char-kv: the word records come first, held then this update's
+        kind_split = records.shape[1] if self.char_kv and self.memory_attention else None
         for i, block in enumerate(self.gated_xattn_blocks):
             if i > 0 and self.depth_records:
                 # Block i's records, written from block i-1's output: a word's
@@ -2260,7 +2293,7 @@ class SegmentMemoryLM(nn.Module):
                     depth_out.append(torch.where(has_chars, state[stream_index, last[:, -1]], carried_before))
             state = block(
                 state, block_mem, query_positions=query_positions, memory_positions=block_positions,
-                use_rope=self.use_rope, memory_mask=block_visible,
+                use_rope=self.use_rope, memory_mask=block_visible, kind_split=kind_split,
             )
         records = torch.cat(word_parts, dim=-1)  # [B, held + K, blocks x H] with --depth-records
         if char_held is not None:
@@ -2949,6 +2982,12 @@ def parse_args() -> argparse.Namespace:
         help="records at character resolution beside the word records, in the same attention blocks: character u "
         "writes one from the GRU's state before it and its own embedding, and each character sees those of its last "
         "N characters (itself included) in its piece (0: off; parallel memory path only)",
+    )
+    parser.add_argument(
+        "--char-kv",
+        action="store_true",
+        help="in each attention block, the character records get their own LayerNorm and key and value projections "
+        "(copies of the word records' at the start) instead of sharing the word records' (needs --char-memory)",
     )
     parser.add_argument(
         "--depth-records",
@@ -5409,6 +5448,7 @@ def main() -> None:
         char_memory=args.char_memory,
         memory_attention=not args.no_memory_attention,
         depth_records=args.depth_records,
+        char_kv=args.char_kv,
     ).to(device)
     if args.bf16:
         if args.train_streams < 2 or args.eval_streams < 2:
