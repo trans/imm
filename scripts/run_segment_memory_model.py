@@ -157,6 +157,18 @@ def mean_or_none(total: float, count: float) -> float | None:
     return total / count
 
 
+class GRU(nn.GRU):
+    """nn.GRU that runs in float32 under torch.autocast (--bf16). Autocast
+    would run cuDNN's GRU in float16, whose small gradients underflow without
+    loss scaling; the recurrence is also where precision matters most."""
+
+    def forward(self, input: torch.Tensor, hx: torch.Tensor | None = None):
+        if torch.is_autocast_enabled(input.device.type):
+            with torch.autocast(input.device.type, enabled=False):
+                return super().forward(input.float(), None if hx is None else hx.float())
+        return super().forward(input, hx)
+
+
 class CrossAttentionBlock(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
@@ -365,7 +377,7 @@ class WordTier(nn.Module):
         super().__init__()
         self.width = width
         self.own_step = own_step
-        self.rnn = nn.GRU(hidden_size, width, batch_first=True)
+        self.rnn = GRU(hidden_size, width, batch_first=True)
         self.proj = nn.Linear(width, hidden_size)
         self.gate = nn.Parameter(torch.zeros(1))
 
@@ -412,7 +424,7 @@ class PhraseTier(nn.Module):
         super().__init__()
         self.width = width
         self.own_step = own_step
-        self.rnn = nn.GRU(word_width, width, batch_first=True)
+        self.rnn = GRU(word_width, width, batch_first=True)
         self.proj = nn.Linear(width, hidden_size)
         self.gate = nn.Parameter(torch.zeros(1))
 
@@ -501,7 +513,7 @@ class BoundaryTier(nn.Module):
         self.centroid = centroid
         self.bptt = bptt
         self.step_width = in_width * (2 if centroid else 1)
-        self.rnn = nn.GRU(self.step_width, width, batch_first=True)
+        self.rnn = GRU(self.step_width, width, batch_first=True)
         self.proj = nn.Linear(width, hidden_size)
         self.gate = nn.Parameter(torch.zeros(1))
         self.position = None
@@ -638,6 +650,9 @@ class BoundaryTier(nn.Module):
 
 
 class SegmentMemoryLM(nn.Module):
+    # --bf16: segment_loss_streams runs under torch.autocast in this dtype.
+    autocast_dtype: torch.dtype | None = None
+
     def __init__(
         self,
         vocab_size: int,
@@ -763,7 +778,7 @@ class SegmentMemoryLM(nn.Module):
         self.embed_rope_dim = embedding_size - embedding_size % 2
         self.embed = nn.Embedding(vocab_size, embedding_size)
         if rnn_core == "gru":
-            self.rnn = nn.GRU(embedding_size, hidden_size, batch_first=True)
+            self.rnn = GRU(embedding_size, hidden_size, batch_first=True)
             self.cell = nn.GRUCell(embedding_size, hidden_size)
         elif rnn_core == "tanh":
             self.rnn = nn.RNN(embedding_size, hidden_size, nonlinearity="tanh", batch_first=True)
@@ -2196,6 +2211,19 @@ class SegmentMemoryLM(nn.Module):
         )
 
     def segment_loss_streams(
+        self, ids: torch.Tensor, *args, **kwargs
+    ) -> tuple[torch.Tensor, int, StreamMemory, torch.Tensor, dict[str, float]]:
+        """_segment_loss_streams, under torch.autocast in autocast_dtype if
+        that is set (--bf16). The loss, the memory and the carried state come
+        back in float32, so nothing outside an update sees bfloat16."""
+        if self.autocast_dtype is None:
+            return self._segment_loss_streams(ids, *args, **kwargs)
+        with torch.autocast(ids.device.type, dtype=self.autocast_dtype):
+            loss, scored, memory, hidden, stats = self._segment_loss_streams(ids, *args, **kwargs)
+        memory = tuple(m.float() if torch.is_floating_point(m) else m for m in memory)
+        return loss.float(), scored, memory, hidden.float(), stats
+
+    def _segment_loss_streams(
         self,
         ids: torch.Tensor,
         stream_segments: list[list[tuple[int, int]]],
@@ -2752,6 +2780,13 @@ def parse_args() -> argparse.Namespace:
         help="records at character resolution beside the word records, in the same attention blocks: character u "
         "writes one from the GRU's state before it and its own embedding, and each character sees those of its last "
         "N characters (itself included) in its piece (0: off; parallel memory path only)",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="run each update, in training and in scoring, under torch.autocast in bfloat16 (matmuls, linear "
+        "layers, attention); losses, the memory and the carried state between updates stay float32. "
+        "Batched path only (--train-streams and --eval-streams > 1)",
     )
     parser.add_argument(
         "--word-tier",
@@ -5188,6 +5223,10 @@ def main() -> None:
         tier_position_gate=args.tier_position_gate,
         char_memory=args.char_memory,
     ).to(device)
+    if args.bf16:
+        if args.train_streams < 2 or args.eval_streams < 2:
+            raise ValueError("--bf16 runs on the batched path only: give --train-streams and --eval-streams > 1")
+        model.autocast_dtype = torch.bfloat16
     if args.count_prior == "frozen":
         model.zero_prediction_heads()
     if args.train_streams < 1:
@@ -5363,7 +5402,7 @@ def main() -> None:
             f"memory_state={args.memory_state} rope_positions={args.rope_positions} "
             f"memory_record={args.memory_record} rnn_core={args.rnn_core} "
             f"attn_interface_norm={args.attn_interface_norm} "
-            f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} char_memory={args.char_memory} word_tier={args.word_tier} "
+            f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} char_memory={args.char_memory} bf16={args.bf16} word_tier={args.word_tier} "
             f"phrase_tier={args.phrase_tier} phrase_marks={args.phrase_marks!r} tier_own_step={args.tier_own_step} prior_strength_gate={args.prior_strength_gate} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} drop_cache={','.join(drop_cache) or 'none'} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
