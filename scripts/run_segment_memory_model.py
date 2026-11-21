@@ -699,6 +699,94 @@ class BoundaryTier(nn.Module):
         return torch.tanh(self.gate) * add, carry_out, seg_after
 
 
+class GRUTree(nn.Module):
+    """A binary tree of GRUs over the character GRU (--tree-levels N): level
+    k (1..N) steps at the characters p where (p + 1) % 2^k == 0, p counted
+    from the start of the piece (--documents) or of the stream, over level
+    k - 1's state after its step at p (level 1 over the character GRU's
+    state at p). Each level's state is carried from update to update; the
+    schedule rides along as the place of an update's first character, mod
+    2^N, so it doesn't depend on where updates are cut.
+
+    Every character t gets, from each level, that level's state after its
+    latest step at or before t (its step at t included: that state has read
+    characters <= t only), or the carried state if it hasn't stepped yet this
+    update, projected to the hidden size, times tanh(gate_k). The gates start
+    at 0, so a model starts as the character GRU alone. One GRU call a level
+    an update; level k's is about T / 2^k steps long."""
+
+    def __init__(self, hidden_size: int, width: int, levels: int) -> None:
+        super().__init__()
+        self.levels = levels
+        self.width = width
+        self.rnns = nn.ModuleList([GRU(hidden_size if k == 0 else width, width, batch_first=True) for k in range(levels)])
+        self.projs = nn.ModuleList([nn.Linear(width, hidden_size) for _ in range(levels)])
+        self.gates = nn.Parameter(torch.zeros(levels))
+
+    def forward(
+        self,
+        char_states: torch.Tensor,
+        lengths: torch.Tensor,
+        carry: torch.Tensor,
+        phase: torch.Tensor,
+        drop=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """char_states [B, T, H]: the character GRU's state at each row
+        position, a stream's characters first, then padding; lengths [B]
+        long: each stream's characters; carry [1, B, N x width]: each
+        level's state, level 1's first; phase [1, B, 1]: the place, in its
+        piece or stream, of each stream's first character this update, mod
+        2^N (a float, as it rides in the carried state). drop: dropout on
+        each character's read (None: none, and each state is projected once,
+        then read). Returns what each position adds to its state [B, T, H],
+        the carry out and the phase out."""
+        streams, span, _ = char_states.shape
+        device = char_states.device
+        rows = torch.arange(streams, device=device)
+        t = torch.arange(span, device=device)
+        c = phase[0, :, 0].round().long()  # [B]
+        held = carry[0].unflatten(-1, (self.levels, self.width))  # [B, N, width]
+        lower = char_states  # level k - 1's states at its steps
+        add = None
+        out = []
+        for k in range(1, self.levels + 1):
+            size = 1 << k
+            q = c // size  # [B]: level k's steps before this update (mod 2^(N - k))
+            n = (c + lengths) // size - q  # [B]: its steps this update
+            # The most any stream can take, so the call's length is known
+            # without reading the phase back; past a stream's n they are
+            # padding, read by no one.
+            steps = (span + size - 1) // size
+            i = torch.arange(steps, device=device)[None, :]
+            if k == 1:
+                # step i at the row position j where p + 1 = c + j + 1 = (q + 1 + i) 2^k
+                src = (q[:, None] + 1 + i) * size - 1 - c[:, None]
+            else:
+                # every other step of level k - 1 (those whose p + 1 is a
+                # multiple of 2^k): its steps 1 - b, 3 - b, ..., b the bit
+                # 2^(k - 1) of c (b = 1: level k - 1's first step this
+                # update is level k's first too)
+                src = 2 * i + 1 - (c[:, None] // (size // 2)) % 2
+            src = src.clamp(max=lower.shape[1] - 1)
+            inputs = lower.gather(1, src[..., None].expand(-1, -1, lower.shape[-1]))
+            h0 = held[:, k - 1]
+            states, _ = self.rnns[k - 1](inputs, h0.unsqueeze(0).contiguous())  # [B, steps, width]
+            after = torch.cat([h0[:, None].to(states.dtype), states], dim=1)  # [B, steps + 1, width]: after j steps
+            index = ((c[:, None] + t[None, :] + 1) // size - q[:, None]).clamp(max=steps)  # [B, T]: steps at or before t
+            if drop is None:
+                read = self.projs[k - 1](after)
+                read = read.gather(1, index[..., None].expand(-1, -1, read.shape[-1]))
+            else:
+                read = self.projs[k - 1](drop(after.gather(1, index[..., None].expand(-1, -1, self.width))))
+            read = torch.tanh(self.gates[k - 1 : k]) * read  # [1], as WordTier's gate: the read in float32
+            add = read if add is None else add + read
+            out.append(after[rows, n])
+            lower = states
+        # float32 whatever the carry's dtype: exact up to 2^24 (bfloat16 only to 256)
+        phase_out = ((c + lengths) % (1 << self.levels)).float()[None, :, None]
+        return add, torch.cat(out, dim=-1).unsqueeze(0), phase_out
+
+
 class SegmentMemoryLM(nn.Module):
     # --bf16: segment_loss_streams runs under torch.autocast in this dtype.
     autocast_dtype: torch.dtype | None = None
@@ -763,6 +851,8 @@ class SegmentMemoryLM(nn.Module):
         word_records: bool = True,
         word_pool: str = "last",
         words_beyond_chars: bool = False,
+        tree_levels: int = 0,
+        tree_width: int = 0,
     ) -> None:
         super().__init__()
         if not 0.0 <= prior_dropout < 1.0:
@@ -1151,11 +1241,43 @@ class SegmentMemoryLM(nn.Module):
         if char_kv:
             for block in self.gated_xattn_blocks:
                 block.add_char_kv()
+        # --tree-levels N: GRUs alone, a binary tree of them over the
+        # character GRU (GRUTree, each level tree_width wide, the hidden size
+        # if 0), its states and the schedule carried after the character
+        # GRU's. No attention or MLP blocks, no records, no tiers. Built under
+        # a forked RNG, so every other parameter starts as it would without
+        # it. Parallel memory path only.
+        if tree_levels < 0 or tree_width < 0:
+            raise ValueError(f"tree_levels and tree_width must be >= 0, got {tree_levels} and {tree_width}")
+        if tree_width and not tree_levels:
+            raise ValueError("--tree-width is the tree's levels' width: give --tree-levels too")
+        self.tree = None
+        if tree_levels > 0:
+            if tree_levels > 24:
+                raise ValueError(f"--tree-levels {tree_levels}: at most 24 (the schedule is carried as a float32 count mod 2^N)")
+            if rnn_core != "gru":
+                raise ValueError("--tree-levels steps over the character GRU: give --rnn-core gru")
+            if mixing != "gated-xattn" or attention_layers != 0:
+                raise ValueError(
+                    "--tree-levels is GRUs only, on the parallel memory path: give --mixing gated-xattn --attention-layers 0"
+                )
+            if word_records or char_memory:
+                raise ValueError("--tree-levels reads no records: give --no-word-records, and no --char-memory")
+            if word_tier or phrase_tier or sentence_tier or paragraph_tier or top_down:
+                raise ValueError("--tree-levels takes no tiers (--word-tier and the tiers over it): the tree replaces them")
+            with torch.random.fork_rng(devices=[]):
+                self.tree = GRUTree(hidden_size, tree_width or hidden_size, tree_levels)
         # --no-word-records: the blocks attend to the character records only;
-        # memory_writer and memory_interface_norm go unused. Parallel memory
-        # path only.
-        if not word_records and (char_memory == 0 or mixing != "gated-xattn" or not memory_attention):
-            raise ValueError("--no-word-records needs character records attended: --char-memory N, --mixing gated-xattn")
+        # memory_writer and memory_interface_norm go unused. Or, with
+        # --attention-layers 0 and no character records, there are no blocks
+        # and no records of any kind: the character GRU alone (with
+        # --tree-levels, its tree). Parallel memory path only.
+        no_blocks = attention_layers == 0 and char_memory == 0 and mixing == "gated-xattn"
+        if not word_records and not no_blocks and (char_memory == 0 or mixing != "gated-xattn" or not memory_attention):
+            raise ValueError(
+                "--no-word-records needs character records attended (--char-memory N, --mixing gated-xattn), "
+                "or no blocks at all (--attention-layers 0, no --char-memory)"
+            )
         self.word_records = word_records
         # --rnn-core none: attention alone. The blocks are the model's only
         # mixing across characters, so they must read character records
@@ -1190,9 +1312,10 @@ class SegmentMemoryLM(nn.Module):
         self.words_beyond_chars = words_beyond_chars
         # --documents: the carried state a piece starts from, learned, through
         # tanh to stay in the GRUs' range: the character GRU's, then each
-        # tier's, as the carried state lays them out (a boundary tier's
-        # buffer and running sum start empty instead). Zero at the start, the
-        # state a stream starts from without it. Parallel memory path only.
+        # tier's or tree level's, as the carried state lays them out (a
+        # boundary tier's buffer and running sum and the tree's schedule
+        # start empty instead). Zero at the start, the state a stream starts
+        # from without it. Parallel memory path only.
         self.start_state = None
         if documents:
             self.start_state = nn.Parameter(torch.zeros(sum(learned for _, learned in self.carried_blocks())))
@@ -1231,7 +1354,8 @@ class SegmentMemoryLM(nn.Module):
         """The batched path's carried state, block by block: (width, how much
         of it at its start is a state a piece starts from). The character
         GRU's, the word tier's, the phrase tier's, then each boundary tier's
-        carried vector."""
+        carried vector; with --tree-levels, the tree's levels' states side by
+        side, then its schedule (GRUTree's phase), a block of its own."""
         blocks = [(self.hidden_size, self.hidden_size)]
         for size in (self.word_tier_size, self.phrase_tier_size):
             if size:
@@ -1239,6 +1363,8 @@ class SegmentMemoryLM(nn.Module):
         for tier in (self.sentence_tier, self.paragraph_tier):
             if tier is not None:
                 blocks.append((tier.carry_width(), tier.width))
+        if getattr(self, "tree", None) is not None:
+            blocks += [(self.tree.levels * self.tree.width,) * 2, (1, 0)]
         if self.depth_carry_width():
             blocks.append((self.depth_carry_width(), 0))
         return blocks
@@ -1820,6 +1946,8 @@ class SegmentMemoryLM(nn.Module):
         say); the targets are always ids."""
         if self.word_tier is not None:
             raise ValueError("--word-tier runs on the batched parallel path only: give --train-streams and --eval-streams > 1")
+        if self.tree is not None:
+            raise ValueError("--tree-levels runs on the batched parallel path only: give --train-streams and --eval-streams > 1")
         if not self.memory_attention:
             raise ValueError(
                 "--no-memory-attention runs on the batched parallel path only: give --train-streams and --eval-streams > 1"
@@ -2260,7 +2388,8 @@ class SegmentMemoryLM(nn.Module):
         end a phrase (phrase_tier only). With the sentence and paragraph
         tiers, their carried vectors follow (carried_blocks), and
         sentence_ends and paragraph_ends [B, K] mark their boundaries
-        (boundary_ends)."""
+        (boundary_ends). With --tree-levels, the tree's levels' states and
+        its phase follow ([1, B, N x width], [1, B, 1])."""
         device = embeddings.device
         streams, count, _ = valid.shape
         parts = list(next_hidden.split([width for width, _ in self.carried_blocks()], dim=-1))
@@ -2269,6 +2398,8 @@ class SegmentMemoryLM(nn.Module):
         phrase_hidden = parts.pop(0) if self.phrase_tier is not None else None
         sentence_carry = parts.pop(0) if self.sentence_tier is not None else None
         paragraph_carry = parts.pop(0) if self.paragraph_tier is not None else None
+        tree_hidden = parts.pop(0) if self.tree is not None else None
+        tree_phase = parts.pop(0) if self.tree is not None else None
         depth_carry = parts.pop(0) if self.depth_carry_width() else None  # [1, B, (blocks - 1) x H]
         paragraph_begun = top_down = None
         if self.top_down_char is not None:
@@ -2370,6 +2501,15 @@ class SegmentMemoryLM(nn.Module):
                         begun=paragraph_begun, reader=state,
                     )
                     state = state + paragraph_add
+        if self.tree is not None:
+            # each level's read, from the character GRU's states; dropout on
+            # each character's read, as the word tier has it
+            dropping = self.training and self.dropout > 0.0
+            tree_add, tree_hidden, tree_phase = self.tree(
+                gru_states, torch.from_numpy(lengths.sum(axis=1)).to(device), tree_hidden, tree_phase,
+                self.drop if dropping else None,
+            )
+            state = state + tree_add
         block_mem, block_positions, block_visible = mem, memory_positions, visible
         if not self.memory_attention:
             # No records, word or character: each block's attention adds zero, its MLP still runs.
@@ -2422,7 +2562,7 @@ class SegmentMemoryLM(nn.Module):
         next_hidden = self.bound_carry(stream_last, stream_last).unsqueeze(0)
         if word_hidden is not None:
             next_hidden = torch.cat([next_hidden, word_hidden], dim=-1)
-        for carried in (phrase_hidden, sentence_carry, paragraph_carry):
+        for carried in (phrase_hidden, sentence_carry, paragraph_carry, tree_hidden, tree_phase):
             if carried is not None:
                 next_hidden = torch.cat([next_hidden, carried], dim=-1)
         if depth_carry is not None:
@@ -2564,6 +2704,11 @@ class SegmentMemoryLM(nn.Module):
         char_out = None
         zero_hidden = embeddings.new_zeros((1, streams, self.hidden_size))
         next_hidden = carried_hidden if carried_hidden is not None else zero_hidden
+        if self.tree is not None and not self.parallel_memory(carry_hidden):
+            raise ValueError(
+                "--tree-levels needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
+                "--carry-bound gru, --rope-positions char, a carried state"
+            )
         if not self.memory_attention and not self.parallel_memory(carry_hidden):
             raise ValueError(
                 "--no-memory-attention needs the parallel memory path: --mixing gated-xattn, --memory-state gru, "
@@ -2595,6 +2740,8 @@ class SegmentMemoryLM(nn.Module):
             if carried_hidden is None:
                 next_hidden = embeddings.new_zeros((1, streams, self.carried_width()))
         if carried_hidden is None and self.depth_carry_width():
+            next_hidden = embeddings.new_zeros((1, streams, self.carried_width()))
+        if self.tree is not None and carried_hidden is None:  # a stream's start: every level from zeros, at place 0
             next_hidden = embeddings.new_zeros((1, streams, self.carried_width()))
         context_norm_sum = 0.0
         if self.whole_span_gru(carry_hidden, feedback_state):
@@ -2680,6 +2827,9 @@ class SegmentMemoryLM(nn.Module):
             for block in self.gated_xattn_blocks if self.mixing != "none" else ():
                 stats["gate_sum"] += float(torch.tanh(block.gate_attn).abs().item() + torch.tanh(block.gate_mlp).abs().item())
                 stats["gate_count"] += 2.0
+            if self.tree is not None:  # mean_gate: the tree's levels' |tanh(gate)|
+                stats["gate_sum"] += float(torch.tanh(self.tree.gates).abs().sum().item())
+                stats["gate_count"] += float(self.tree.levels)
         return loss, scored, memory_out, next_hidden, stats
 
     def segment_steps_streams(
@@ -3124,7 +3274,8 @@ def parse_args() -> argparse.Namespace:
         "--no-word-records",
         action="store_true",
         help="no word records: the attention blocks read the character records only (needs --char-memory; "
-        "--max-memory is then unused)",
+        "--max-memory is then unused); with --attention-layers 0 and no --char-memory, no blocks and no records "
+        "at all, the character GRU alone",
     )
     parser.add_argument(
         "--word-pool",
@@ -3177,6 +3328,25 @@ def parse_args() -> argparse.Namespace:
         help="a second GRU of this width that steps once a segment, over the character GRU's state at each "
         "segment's end; each character gets its state after the previous segment, gated, added before the "
         "attention blocks (0: off; parallel memory path only)",
+    )
+    parser.add_argument(
+        "--tree-levels",
+        type=int,
+        default=0,
+        metavar="N",
+        help="GRUs alone, a binary tree of N GRUs over the character GRU: level k steps at each character p with "
+        "(p + 1) %% 2^k == 0 (p counted from the start of the piece with --documents, else of the stream), over "
+        "level k - 1's state after its step there (level 1 over the character GRU's); each character gets each "
+        "level's state after its latest step at or before it, projected, gated (the gates start at 0) and added "
+        "to its GRU state, which the head reads. Needs --attention-layers 0 --no-word-records, no --char-memory "
+        "and no tiers (0: off; parallel memory path only)",
+    )
+    parser.add_argument(
+        "--tree-width",
+        type=int,
+        default=0,
+        metavar="W",
+        help="each --tree-levels level's GRU width (0: --hidden-size)",
     )
     parser.add_argument(
         "--phrase-tier",
@@ -5609,6 +5779,8 @@ def main() -> None:
         word_records=not args.no_word_records,
         word_pool=args.word_pool,
         words_beyond_chars=args.words_beyond_chars,
+        tree_levels=args.tree_levels,
+        tree_width=args.tree_width,
     ).to(device)
     if not 0 <= args.stop_after_epoch <= args.epochs:
         raise ValueError(f"--stop-after-epoch must be in [0, --epochs], got {args.stop_after_epoch}")
@@ -5796,6 +5968,7 @@ def main() -> None:
             f"attn_interface_norm={args.attn_interface_norm} "
             f"mixing={args.mixing} attention_layers={args.attention_layers} attention_heads={args.attention_heads} char_memory={args.char_memory} bf16={args.bf16} word_tier={args.word_tier} "
             f"phrase_tier={args.phrase_tier} phrase_marks={args.phrase_marks!r} tier_own_step={args.tier_own_step} prior_strength_gate={args.prior_strength_gate} "
+            f"tree_levels={args.tree_levels} tree_width={model.tree.width if model.tree is not None else 0} "
             f"carry_hidden={args.carry_hidden} train_streams={args.train_streams} memory_path={memory_path} compact_rows={args.compact_rows} row_readahead={args.row_readahead} drop_cache={','.join(drop_cache) or 'none'} "
             f"feedback_state={args.feedback_state} carry_bound={args.carry_bound} carry_scale={args.carry_scale} token_feedback={args.token_feedback} input_rope={args.input_rope} "
             f"feedback_gate_bias={args.feedback_gate_bias} feedback_delta_cap={args.feedback_delta_cap} "
@@ -6294,6 +6467,9 @@ def main() -> None:
                 f"lr={optimizer.param_groups[0]['lr']:.4g}",
                 flush=True,
             )
+            if model.tree is not None:  # each level's tanh(gate), level 1 first
+                gates = torch.tanh(model.tree.gates.detach()).tolist()
+                print(f"epoch={epoch} tree_gates={','.join(f'{g:.4f}' for g in gates)}", flush=True)
             t0 = time.perf_counter()
             improved_best = best_val_ppl is None or val_ppl < best_val_ppl
             if improved_best:

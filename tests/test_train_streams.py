@@ -81,6 +81,8 @@ def make_model(seed=0, layers=1, **overrides):
         word_records=o.get("word_records", True),
         word_pool=o.get("word_pool", "last"),
         words_beyond_chars=o.get("words_beyond_chars", False),
+        tree_levels=o.get("tree_levels", 0),
+        tree_width=o.get("tree_width", 0),
     )
     # Random heads and gates, not the zeroed start, so every path carries signal.
     with torch.no_grad():
