@@ -1,0 +1,19 @@
+slot 123 granted 2026-11-19T22:39:44-05:00
+code 1edcb56 0 changed files
+probe start 2026-11-19T22:39:44-05:00
+probe exit=0 2026-11-19T22:39:55-05:00
+normal segments=351382; worst window 864 characters; devices cuda
+h448 L3 heads8 tier392:   353.8 ms/update,   65.0k chars/s, peak 5.46 GiB (longest stream 498); 8 epochs ~3.6 h unsplit
+  cap 64 x 704: an unsplit update of 64 x 700 characters: peak 7.12 GiB, 488 ms
+  cap 64 x 640: an unsplit update of 64 x 640 characters: peak 6.62 GiB, 444 ms
+  the worst update (64 x 864) split at cap 40960: 2 groups, peak 4.56 GiB, 631 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 4.39 GiB, 430 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 3.85 GiB, 204 ms
+CHOICE h=448 l=3 heads=8 tier=392 cap=40960
+chose h=448 l=3 heads=8 tier=392 cap=40960
+check start pg19s100m_h192_par_l2_w168_own_np_doc_mm128_do0_cm1024_bf16_check 2026-11-19T22:39:55-05:00
+grep: runs/pg19s100m_h192_par_l2_w168_own_np_doc_mm128_do0_cm1024_bf16_check.log: No such file or directory
+check end 2026-11-19T22:49:46-05:00 epoch 1 val_ppl=3.771 (fp32: 3.711) train_sec=535.02
+bf16 check failed: stopping
+ended 123 @imm
+slot ended 2026-11-19T22:49:46-05:00

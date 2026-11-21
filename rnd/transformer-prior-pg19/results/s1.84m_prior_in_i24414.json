@@ -1,0 +1,168 @@
+{
+  "model": "char transformer (imm transformer_baseline.CharGPT) + gated count prior on the logits, and the prior's log-probs and features in its input",
+  "config": {
+    "config": "/home/trans/Projects/air/experiments/prior_scaling/pg19split20m_cfg.json",
+    "output": "/home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/tx/s1.84m_prior_in_i24414.json",
+    "prior": "/home/trans/Projects/air/mobius/runs/imm/pg19split20m_gated_d16_pg200m",
+    "prior_input": true,
+    "prior_dropout": 0.0,
+    "layers": 4,
+    "heads": 4,
+    "width": 192,
+    "block": 256,
+    "dropout": 0.2,
+    "batch": 64,
+    "iters": 24414,
+    "lr": 0.001,
+    "min_lr": 0.0001,
+    "warmup": 100,
+    "weight_decay": 0.1,
+    "eval_every": 2500,
+    "seed": 1337,
+    "device": "cuda",
+    "save": null
+  },
+  "transformer_baseline_commit": "43057d9",
+  "params": 1859532,
+  "transformer_params": 1838784,
+  "split": {
+    "train_input": "data/pg19/imm-split-20m/train_corpus.txt",
+    "eval_input": "data/pg19/imm-split-20m/heldout_corpus.txt",
+    "eval_chars": 250000
+  },
+  "prior_only_heldout_ppl": 3.532043319413781,
+  "prior_gate_features": 11,
+  "heldout_ppl": 3.157825687801068,
+  "heldout_bits_per_char": 1.6589315365288413,
+  "best_heldout_ppl": 3.157825687801068,
+  "best_step": 24414,
+  "protocol": "every held-out character after the first, up to block characters of context",
+  "curve": [
+    {
+      "step": 0,
+      "heldout_ppl": 3.630774455003573,
+      "mean_gate": 1.0010395050048828,
+      "sec": 1.3059640519786626,
+      "ablated_heldout_ppl": {
+        "own": 93.73503889914079,
+        "out_only": 3.630774455003573,
+        "neither": 93.73503889914079
+      }
+    },
+    {
+      "step": 2500,
+      "heldout_ppl": 3.3369414977526204,
+      "mean_gate": 0.9323463581047623,
+      "sec": 110.3126110911835,
+      "ablated_heldout_ppl": {
+        "own": 52.03197984807617,
+        "out_only": 3.799718425001017,
+        "neither": 92.33131717997537
+      }
+    },
+    {
+      "step": 5000,
+      "heldout_ppl": 3.2899203178856804,
+      "mean_gate": 0.8861432997192255,
+      "sec": 172.96413648012094,
+      "ablated_heldout_ppl": {
+        "own": 40.86764584771259,
+        "out_only": 4.002949886733569,
+        "neither": 205.64890478013493
+      }
+    },
+    {
+      "step": 7500,
+      "heldout_ppl": 3.252808972038732,
+      "mean_gate": 0.8818326645186159,
+      "sec": 235.5077437730506,
+      "ablated_heldout_ppl": {
+        "own": 39.47393276408575,
+        "out_only": 3.758901951241268,
+        "neither": 190.24395788699417
+      }
+    },
+    {
+      "step": 10000,
+      "heldout_ppl": 3.2494391880251214,
+      "mean_gate": 0.8717268408578639,
+      "sec": 298.2887859910261,
+      "ablated_heldout_ppl": {
+        "own": 30.490334013110683,
+        "out_only": 3.7808523012173665,
+        "neither": 138.1878583075507
+      }
+    },
+    {
+      "step": 12500,
+      "heldout_ppl": 3.2178208806957467,
+      "mean_gate": 0.8582159440751715,
+      "sec": 362.00660182512365,
+      "ablated_heldout_ppl": {
+        "own": 28.54876060594958,
+        "out_only": 3.7004061297946995,
+        "neither": 138.07001635339464
+      }
+    },
+    {
+      "step": 15000,
+      "heldout_ppl": 3.1922029466107387,
+      "mean_gate": 0.8736137267737852,
+      "sec": 425.43062564800493,
+      "ablated_heldout_ppl": {
+        "own": 27.7885709031586,
+        "out_only": 3.711772139860393,
+        "neither": 99.57524625351252
+      }
+    },
+    {
+      "step": 17500,
+      "heldout_ppl": 3.177602911526267,
+      "mean_gate": 0.8568474731319274,
+      "sec": 489.21947979112156,
+      "ablated_heldout_ppl": {
+        "own": 23.893857784058287,
+        "out_only": 3.6975807148410462,
+        "neither": 98.59137605782502
+      }
+    },
+    {
+      "step": 20000,
+      "heldout_ppl": 3.1679925097897437,
+      "mean_gate": 0.8514500221025787,
+      "sec": 552.6547328929882,
+      "ablated_heldout_ppl": {
+        "own": 23.166956997589097,
+        "out_only": 3.938790097042584,
+        "neither": 81.13980151946203
+      }
+    },
+    {
+      "step": 22500,
+      "heldout_ppl": 3.1579613369662627,
+      "mean_gate": 0.842344185042939,
+      "sec": 616.3836703000125,
+      "ablated_heldout_ppl": {
+        "own": 21.76590466607168,
+        "out_only": 3.9644240771707278,
+        "neither": 95.05499237146432
+      }
+    },
+    {
+      "step": 24414,
+      "heldout_ppl": 3.157825687801068,
+      "mean_gate": 0.8669941935741559,
+      "sec": 665.381563608069,
+      "ablated_heldout_ppl": {
+        "own": 22.595555002575402,
+        "out_only": 3.8557023480813895,
+        "neither": 88.85808612662261
+      }
+    }
+  ],
+  "ablated_heldout_ppl": {
+    "own": 22.595555002575402,
+    "out_only": 3.8557023480813895,
+    "neither": 88.85808612662261
+  }
+}

@@ -1,0 +1,28 @@
+249999 characters, 43854 words; 6.42 words a phrase (',;:.!?'), 14.63 a sentence ('.!?')
+                                                       chars    word41 word41_own word20_own word41_own vs word41 word20_own vs word41
+all                                                   249999    3.1084    3.1011    3.1155         -0.24%         +0.23%
+word: at its first character                           43801    3.3729    3.3792    3.4120         +0.19%         +1.16%
+word: inside it                                       162344    2.0290    2.0256    2.0297         -0.17%         +0.04%
+word: at its last character                            43854   13.8971   13.7717   13.8995         -0.90%         +0.02%
+phrase: 1st word, not its last character               29015    2.7063    2.7020    2.7024         -0.16%         -0.15%
+phrase: 1st word, its last character                    6833   16.3742   16.0429   16.3351         -2.02%         -0.24%
+phrase: 2nd word, not its last character               26959    2.2614    2.2629    2.2670         +0.06%         +0.25%
+phrase: 2nd word, its last character                    5805   13.9134   13.8860   14.0051         -0.20%         +0.66%
+phrase: 3rd word, not its last character               23979    2.1234    2.1251    2.1326         +0.08%         +0.44%
+phrase: 3rd word, its last character                    5104   13.3780   13.3103   13.3822         -0.51%         +0.03%
+phrase: 4th-6th word, not its last character           55477    2.2005    2.1993    2.2076         -0.05%         +0.32%
+phrase: 4th-6th word, its last character               11701   13.4964   13.4174   13.5335         -0.59%         +0.27%
+phrase: 7th+ word, not its last character              70715    2.1897    2.1848    2.1976         -0.23%         +0.36%
+phrase: 7th+ word, its last character                  14411   13.3388   13.1989   13.2944         -1.05%         -0.33%
+sentence: 1st word, not its last character             13427    3.4437    3.4240    3.4165         -0.57%         -0.79%
+sentence: 1st word, its last character                  2999   17.6237   17.0473   17.3949         -3.27%         -1.30%
+sentence: 2nd word, not its last character             12760    2.3157    2.3163    2.3119         +0.03%         -0.16%
+sentence: 2nd word, its last character                  2712   13.7862   13.8684   14.0462         +0.60%         +1.89%
+sentence: 3rd word, not its last character             11520    2.1034    2.1062    2.1153         +0.13%         +0.57%
+sentence: 3rd word, its last character                  2508   14.1928   13.9832   14.0002         -1.48%         -1.36%
+sentence: 4th-6th word, not its last character         30830    2.1952    2.1976    2.1995         +0.11%         +0.19%
+sentence: 4th-6th word, its last character              6628   13.9932   13.9827   14.0574         -0.08%         +0.46%
+sentence: 7th+ word, not its last character           137608    2.1920    2.1892    2.2010         -0.13%         +0.41%
+sentence: 7th+ word, its last character                29007   13.5241   13.3980   13.5241         -0.93%         -0.00%
+phrase: last word of a phrase, its last character       6832   15.7589   14.9481   15.1700         -5.15%         -3.74%
+sentence: last word of a sentence, its last character    2998   17.4628   15.7078   15.8034        -10.05%         -9.50%

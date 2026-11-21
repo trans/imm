@@ -1,0 +1,12 @@
+slot 105 granted 2026-11-18T21:18:25-05:00
+start tx1.84m_np_100m_b1024 block=1024 batch=16 dropout=0.2 2026-11-18T21:18:25-05:00
+end tx1.84m_np_100m_b1024 exit=0 2026-11-18T21:35:51-05:00 result: heldout_ppl=3.6878 best=3.6878@48728 -> /home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/scale/tx1.84m_np_100m_b1024.json
+start tx1.84m_np_100m_do0 block=256 batch=64 dropout=0.0 2026-11-18T21:35:51-05:00
+end tx1.84m_np_100m_do0 exit=0 2026-11-18T21:50:35-05:00 result: heldout_ppl=3.2065 best=3.2065@48728 -> /home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/scale/tx1.84m_np_100m_do0.json
+start tx1.84m_np_100m_do1 block=256 batch=64 dropout=0.1 2026-11-18T21:50:35-05:00
+end tx1.84m_np_100m_do1 exit=0 2026-11-18T22:05:42-05:00 result: heldout_ppl=3.3099 best=3.3099@48728 -> /home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/scale/tx1.84m_np_100m_do1.json
+ended 105 @imm
+slot ended 2026-11-18T22:05:42-05:00
+char losses tx1.84m_np_100m_b1024 exit=0 heldout_ppl=3.6878 params=1986240 2026-11-18T22:05:59-05:00
+char losses tx1.84m_np_100m_do0 exit=0 heldout_ppl=3.2060 params=1838784 2026-11-18T22:06:14-05:00
+char losses tx1.84m_np_100m_do1 exit=0 heldout_ppl=3.3097 params=1838784 2026-11-18T22:06:29-05:00

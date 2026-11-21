@@ -1,0 +1,64 @@
+A = /home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/imm-run/runs/char_losses_pg19s100m_h192_par_l2_w168_own_np_doc_mm128_e8_best.npz
+B = /home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/scale/char_losses_tx1.84m_np_100m_b1024.npz
+
+imm 3.3927  tx 3.6878  gap -8.001% (nats -0.08339)
+
+-- place in the word (where the prediction is made)
+at a word's first character                                  43801  17.5%  imm   3.6342  tx   3.8049   -4.49% ±0.26  share of gap   +9.6%
+inside a word                                               162344  64.9%  imm   2.2429  tx   2.4527   -8.56% ±0.15  share of gap  +69.6%
+at a word's last (predicting the next word's first)          43854  17.5%  imm  14.6599  tx  16.1766   -9.38% ±0.27  share of gap  +20.7%
+  ... ending a phrase                                         6832   2.7%  imm  14.0077  tx  15.3249   -8.60% ±0.93  share of gap   +2.9%
+  ... ending a sentence                                       2998   1.2%  imm  13.8971  tx  14.9934   -7.31% ±1.59  share of gap   +1.1%
+-- what is predicted
+a lowercase letter                                          181415  72.6%  imm   3.6180  tx   3.9431   -8.25% ±0.13  share of gap  +74.9%
+an uppercase letter                                           8390   3.4%  imm  25.1679  tx  27.6584   -9.00% ±1.02  share of gap   +3.8%
+a space or newline                                           48681  19.5%  imm   1.4204  tx   1.4993   -5.26% ±0.21  share of gap  +12.6%
+punctuation or digit                                         11513   4.6%  imm  11.3576  tx  13.2954  -14.57% ±0.96  share of gap   +8.7%
+-- the prior's own loss on the target (nats)
+prior loss in [0, 0.1)                                       74634  29.9%  imm   1.1999  tx   1.2746   -5.86% ±0.14  share of gap  +21.6%
+prior loss in [0.1, 0.5)                                     52852  21.1%  imm   1.6746  tx   1.7910   -6.50% ±0.20  share of gap  +17.0%
+prior loss in [0.5, 1.5)                                     48605  19.4%  imm   3.5570  tx   3.8526   -7.67% ±0.27  share of gap  +18.6%
+prior loss in [1.5, 3)                                       46319  18.5%  imm   9.1912  tx  10.0739   -8.76% ±0.32  share of gap  +20.4%
+prior loss in [3, 6)                                         24885  10.0%  imm  30.3126  tx  35.4330  -14.45% ±0.54  share of gap  +18.6%
+prior loss in [6, 99)                                         2704   1.1%  imm 280.1445  tx 373.8684  -25.07% ±3.19  share of gap   +3.7%
+-- the prior's entropy (entropy_norm)
+entropy 0                                                   104840  41.9%  imm   1.8041  tx   1.9565   -7.79% ±0.16  share of gap  +40.8%
+entropy in (0.000, 0.139]                                    44589  17.8%  imm   2.6929  tx   2.9300   -8.09% ±0.28  share of gap  +18.0%
+entropy in (0.139, 0.152]                                    29356  11.7%  imm   5.7301  tx   6.2804   -8.76% ±0.37  share of gap  +12.9%
+entropy in (0.152, 0.272]                                    35189  14.1%  imm   5.5729  tx   6.0836   -8.39% ±0.35  share of gap  +14.8%
+entropy in (0.272, 9.000]                                    36025  14.4%  imm  11.4009  tx  12.3250   -7.50% ±0.35  share of gap  +13.5%
+-- the prior's matched depth (depth_norm)
+depth_norm in (-1, 0.25]                                      4096   1.6%  imm   7.8456  tx   7.6853   +2.09% ±1.82  share of gap   -0.4%
+depth_norm in (0.25, 0.5]                                    71815  28.7%  imm   3.8346  tx   4.0978   -6.42% ±0.26  share of gap  +22.9%
+depth_norm in (0.5, 0.75]                                   119909  48.0%  imm   3.1996  tx   3.5107   -8.86% ±0.15  share of gap  +53.4%
+depth_norm in (0.75, 0.99]                                   45176  18.1%  imm   3.1031  tx   3.4029   -8.81% ±0.23  share of gap  +20.0%
+depth_norm in (0.99, 9]                                       9003   3.6%  imm   2.9796  tx   3.2845   -9.28% ±0.52  share of gap   +4.2%
+-- the transformer's context in its window (targets with < 256 back)
+first 256 characters of the text                               255   0.1%  imm   3.7764  tx   4.1381   -8.74% ±4.19  share of gap   +0.1%
+
+all                                                   249999 100.0%  imm   3.3927  tx   3.6878   -8.00% ±0.12  share +100.0%
+-- the target's place in its 5,000-character held-out piece
+chars 0-256 of the piece                               12799   5.1%  imm   3.6104  tx   4.1239  -12.45% ±0.71  share   +8.2%
+chars 256-1000 of the piece                            37200  14.9%  imm   3.3469  tx   3.6128   -7.36% ±0.30  share  +13.6%
+chars 1000-2500 of the piece                           75000  30.0%  imm   3.3818  tx   3.6661   -7.75% ±0.21  share  +29.0%
+chars 2500-5000 of the piece                          125000  50.0%  imm   3.3914  tx   3.6812   -7.87% ±0.16  share  +49.2%
+-- the target's word, earlier in the same piece
+a word's character, the word new in this piece        108335  43.3%  imm   4.3658  tx   4.8796  -10.53% ±0.19  share  +57.8%
+a word's character, the word seen before in this piece   83111  33.2%  imm   3.5614  tx   3.7610   -5.31% ±0.19  share  +21.7%
+  ... and capitalized                                   5147   2.1%  imm  20.8652  tx  22.2438   -6.20% ±1.38  share   +1.6%
+not in a word (space, punctuation)                     58553  23.4%  imm   1.9861  tx   2.1362   -7.02% ±0.24  share  +20.5%
+-- where imm trails: the d24 prior's loss >= 3 nats
+prior >= 3, word new in this piece                     14791   5.9%  imm  44.0573  tx  52.4666  -16.03% ±0.68  share  +12.4%
+prior >= 3, word seen before in this piece              8847   3.5%  imm  35.5622  tx  40.7612  -12.75% ±0.96  share   +5.8%
+prior >= 3, not in a word                               3951   1.6%  imm  23.9500  tx  29.8763  -19.84% ±2.32  share   +4.2%
+prior >= 3, chars 0-1000 of the piece                   5528   2.2%  imm  39.6041  tx  49.4217  -19.87% ±1.56  share   +5.9%
+prior >= 3, chars 1000-5000 of the piece               22061   8.8%  imm  37.2305  tx  43.5135  -14.44% ±0.61  share  +16.5%
+-- a repeated word: words since its last occurrence in this piece
+repeat, 1-16 words back                                20410   8.2%  imm   2.9730  tx   3.1092   -4.38% ±0.38  share   +4.4%
+  ... capitalized                                       1432   0.6%  imm  13.2290  tx  13.3144   -0.64% ±2.50  share   +0.0%
+repeat, 16-64 words back                               26442  10.6%  imm   3.5289  tx   3.6704   -3.85% ±0.36  share   +5.0%
+  ... capitalized                                       1871   0.7%  imm  21.1076  tx  21.2066   -0.47% ±2.53  share   +0.0%
+repeat, 64-256 words back                              25278  10.1%  imm   4.0057  tx   4.2734   -6.26% ±0.36  share   +7.8%
+  ... capitalized                                       1446   0.6%  imm  28.9912  tx  34.1645  -15.14% ±2.45  share   +1.1%
+repeat, 256-more words back                            10981   4.4%  imm   3.8858  tx   4.2340   -8.23% ±0.48  share   +4.5%
+  ... capitalized                                        398   0.2%  imm  30.8229  tx  37.1146  -16.95% ±3.59  share   +0.4%

@@ -1,0 +1,3 @@
+12:03:46 available=8887MB swap_used=8136MB gpu=62MiB | pid=3185671 VmRSS:=29MB RssAnon:=22MB VmSwap:=0MB 
+12:04:46 available=5391MB swap_used=9929MB gpu=3148MiB | pid=3185671 VmRSS:=4801MB RssAnon:=4515MB VmSwap:=301MB 
+12:05:46 available=4806MB swap_used=9351MB gpu=7424MiB | pid=3185671 VmRSS:=5159MB RssAnon:=4846MB VmSwap:=300MB 

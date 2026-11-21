@@ -1,0 +1,11 @@
+03:39:44 available=8654MB swap_used=5012MB gpu=62MiB
+03:40:44 available=4640MB swap_used=5932MB gpu=4076MiB | pid=3698841 VmRSS:=5634MB RssAnon:=5098MB VmSwap:=304MB 
+03:41:44 available=4494MB swap_used=5839MB gpu=4296MiB | pid=3698841 VmRSS:=5636MB RssAnon:=5099MB VmSwap:=304MB 
+03:42:44 available=4545MB swap_used=5823MB gpu=4678MiB | pid=3698841 VmRSS:=5637MB RssAnon:=5100MB VmSwap:=304MB 
+03:43:45 available=4497MB swap_used=5811MB gpu=4678MiB | pid=3698841 VmRSS:=5637MB RssAnon:=5101MB VmSwap:=304MB 
+03:44:45 available=4506MB swap_used=5803MB gpu=4678MiB | pid=3698841 VmRSS:=5637MB RssAnon:=5101MB VmSwap:=304MB 
+03:45:45 available=4427MB swap_used=5780MB gpu=4678MiB | pid=3698841 VmRSS:=5637MB RssAnon:=5101MB VmSwap:=304MB 
+03:46:45 available=4352MB swap_used=5744MB gpu=4678MiB | pid=3698841 VmRSS:=5637MB RssAnon:=5101MB VmSwap:=304MB 
+03:47:45 available=4352MB swap_used=5738MB gpu=4738MiB | pid=3698841 VmRSS:=5637MB RssAnon:=5101MB VmSwap:=304MB 
+03:48:45 available=4393MB swap_used=5735MB gpu=4738MiB | pid=3698841 VmRSS:=5637MB RssAnon:=5101MB VmSwap:=304MB 
+03:49:45 available=4404MB swap_used=5739MB gpu=4746MiB | pid=3698841 VmRSS:=5637MB RssAnon:=5101MB VmSwap:=304MB 

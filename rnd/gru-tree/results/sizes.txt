@@ -1,0 +1,10 @@
+h192 e192 levels10 width128: 1,523,754 trained of 3,336,042 (-64,403 against slot 127's 1,588,157); start_state 1,472, embed 18,432, rnn 222,336, gru_head 18,528, tree.gates 10, tree.rnns 1,015,296, tree.projs 247,680
+h192 e192 levels10 width131: 1,575,741 trained of 3,388,029 (-12,416 against slot 127's 1,588,157); start_state 1,502, embed 18,432, rnn 222,336, gru_head 18,528, tree.gates 10, tree.rnns 1,061,493, tree.projs 253,440
+h192 e192 levels10 width132: 1,593,298 trained of 3,405,586 (+5,141 against slot 127's 1,588,157); start_state 1,512, embed 18,432, rnn 222,336, gru_head 18,528, tree.gates 10, tree.rnns 1,077,120, tree.projs 255,360
+h256 e256 levels10 width114: 1,574,970 trained of 4,712,058 (-13,187 against slot 127's 1,588,157); start_state 1,396, embed 24,576, rnn 394,752, gru_head 24,672, tree.gates 10, tree.rnns 835,164, tree.projs 294,400
+h256 e256 levels10 width115: 1,591,421 trained of 4,728,509 (+3,264 against slot 127's 1,588,157); start_state 1,406, embed 24,576, rnn 394,752, gru_head 24,672, tree.gates 10, tree.rnns 849,045, tree.projs 296,960
+h192 e192 levels8 width149: 1,583,109 trained of 3,395,397 (-5,048 against slot 127's 1,588,157); start_state 1,384, embed 18,432, rnn 222,336, gru_head 18,528, tree.gates 8, tree.rnns 1,092,021, tree.projs 230,400
+h192 e192 levels8 width150: 1,598,732 trained of 3,411,020 (+10,575 against slot 127's 1,588,157); start_state 1,392, embed 18,432, rnn 222,336, gru_head 18,528, tree.gates 8, tree.rnns 1,106,100, tree.projs 231,936
+h144 e144 levels10 width144: 1,616,218 trained of 2,671,450 (+28,061 against slot 127's 1,588,157); start_state 1,584, embed 13,824, rnn 125,280, gru_head 13,920, tree.gates 10, tree.rnns 1,252,800, tree.projs 208,800
+h142 e142 levels10 width142: 1,572,188 trained of 2,600,276 (-15,969 against slot 127's 1,588,157); start_state 1,562, embed 13,632, rnn 121,836, gru_head 13,728, tree.gates 10, tree.rnns 1,218,360, tree.projs 203,060
+peak_rss_mb=1247 exit=0

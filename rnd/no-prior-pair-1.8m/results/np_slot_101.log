@@ -1,0 +1,12 @@
+slot 101 granted 2026-11-18T19:14:15-05:00
+code 91c3c55 0 changed files
+start imm pg19s100m_h192_par_l2_w168_own_np_doc_mm128_e8 2026-11-18T19:14:15-05:00
+  args: --count-prior none --prior-residual-gate none --prior-input none --prior-residual-state-features= --prior-residual-scale 1.0 --prior-residual-l2 0.05 --train-streams 64 --eval-streams 64 --lr 1e-3 --segment-rule word --max-memory 128 --segments-per-update 64 --dropout 0.2 --lr-schedule cosine --min-lr 1e-4 --carry-bound gru --memory-state gru --hidden-size 192 --embedding-size 192 --prefetch-ahead 4 --attention-layers 2 --word-tier 168 --tier-own-step --documents data/pg19/imm-split-100m/manifest.json --epochs 8
+end imm exit=0 2026-11-18T20:24:06-05:00 best_val_ppl=3.393
+char losses imm exit=0 char_losses heldout_ppl=3.3927 2026-11-18T20:25:23-05:00
+imm tokens per epoch=99795945; transformer iters=48728 (798359552 characters)
+start tx tx1.84m_np_100m 2026-11-18T20:25:23-05:00
+end tx exit=0 2026-11-18T20:40:28-05:00 result: heldout_ppl=3.5788 best=3.5788@48728 -> /home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/scale/tx1.84m_np_100m.json
+ended 101 @imm
+slot ended 2026-11-18T20:40:28-05:00
+char losses tx exit=0 heldout_ppl=3.5788 params=1838784 2026-11-18T20:40:45-05:00

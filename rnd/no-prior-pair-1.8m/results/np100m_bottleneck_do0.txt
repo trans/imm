@@ -1,0 +1,41 @@
+                                               targets   share      imm      tx   prior   imm vs tx
+all                                             249999  100.0%    3.393   3.206   3.068    +5.82% ±0.13
+not in a word (space, punctuation)               58553   13.2%    1.986   1.966   2.337    +1.04% ±0.24
+-- the letter's place in its word
+first letter (which word comes next)             44302   39.2%   14.894  14.435  13.748    +3.18% ±0.27
+second letter                                    42538   17.8%    3.601   3.380   3.154    +6.55% ±0.26
+third letter                                     34645   13.5%    3.277   2.989   2.648    +9.63% ±0.34
+fourth letter on                                 69961   16.4%    2.042   1.867   1.577    +9.38% ±0.27
+-- new in the piece
+  all its letters                               108531   52.4%    4.371   4.109   3.464    +6.39% ±0.20
+  first letter                                   19563   20.2%   23.267  22.920  20.747    +1.52% ±0.41
+  second letter                                  19380   10.8%    5.524   5.263   4.459    +4.96% ±0.39
+  third letter on                                69588   21.4%    2.560   2.365   1.952    +8.21% ±0.27
+  third letter on, words of 6+ letters           49546   15.0%    2.517   2.314   1.900    +8.78% ±0.33
+  third letter on, prior >= 3 nats                3539    4.4%   46.407  50.166  79.896    -7.49% ±2.45
+-- repeat, < 256 chars back (in tx's window)
+  all its letters                                40416   15.3%    3.177   2.803   2.969   +13.33% ±0.31
+  first letter                                   13445    9.1%    7.899   7.492   7.886    +5.44% ±0.48
+  second letter                                  12321    2.9%    2.052   1.824   2.011   +12.47% ±0.50
+  third letter on                                14650    3.3%    1.990   1.633   1.681   +21.88% ±0.61
+  third letter on, words of 6+ letters            4885    1.8%    3.123   2.211   2.031   +41.22% ±1.44
+  third letter on, prior >= 3 nats                 525    0.6%   41.046  19.490  75.877   +110.61% ±8.03
+-- repeat, 256-1,000 back
+  all its letters                                25351   11.4%    3.946   3.810   3.397    +3.58% ±0.37
+  first letter                                    7199    6.1%   13.238  12.846  12.017    +3.05% ±0.67
+  second letter                                   6818    2.4%    2.899   2.862   2.631    +1.30% ±0.62
+  third letter on                                11334    2.9%    2.202   2.091   1.776    +5.32% ±0.62
+  third letter on, words of 6+ letters            4689    1.6%    2.898   2.637   1.921    +9.89% ±1.24
+  third letter on, prior >= 3 nats                 486    0.6%   39.083  49.629  68.637   -21.25% ±5.87
+-- repeat, 1,000+ back
+  all its letters                                17148    7.7%    3.965   3.768   3.355    +5.21% ±0.44
+  first letter                                    4095    3.8%   17.452  16.763  15.122    +4.11% ±0.89
+  second letter                                   4019    1.7%    3.712   3.510   3.208    +5.77% ±0.81
+  third letter on                                 9034    2.2%    2.085   1.977   1.730    +5.47% ±0.63
+  third letter on, words of 6+ letters            4186    1.1%    2.309   2.145   1.747    +7.63% ±1.12
+  third letter on, prior >= 3 nats                 313    0.4%   34.354  41.050  68.814   -16.31% ±7.29
+-- the letters only copying can give: third on, prior >= 3 nats
+  new in the piece                                3539    4.4%   46.407  50.166  79.896    -7.49% ±2.45
+  repeat, < 256 chars back (in tx's window)        525    0.6%   41.046  19.490  75.877   +110.61% ±8.03
+  repeat, 256-1,000 back                           486    0.6%   39.083  49.629  68.637   -21.25% ±5.87
+  repeat, 1,000+ back                              313    0.4%   34.354  41.050  68.814   -16.31% ±7.29

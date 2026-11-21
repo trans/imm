@@ -1,0 +1,8 @@
+slot 131 granted 2026-11-20T08:26:01-05:00
+code 878686e 0 changed files
+start imm pg19s100m_h192_par_l2_w168_own_np_doc_mm128_do0_cm1024_charkv_bf16_e8 2026-11-20T08:26:01-05:00
+  args: --count-prior none --prior-residual-gate none --prior-input none --prior-residual-state-features= --prior-residual-scale 1.0 --prior-residual-l2 0.05 --train-streams 64 --eval-streams 64 --lr 1e-3 --segment-rule word --max-memory 128 --segments-per-update 64 --dropout 0.0 --lr-schedule cosine --min-lr 1e-4 --carry-bound gru --memory-state gru --prefetch-ahead 4 --tier-own-step --char-memory 1024 --documents data/pg19/imm-split-100m/manifest.json --epochs 8 --hidden-size 192 --embedding-size 192 --attention-layers 2 --attention-heads 4 --word-tier 168 --char-kv --bf16
+end imm pg19s100m_h192_par_l2_w168_own_np_doc_mm128_do0_cm1024_charkv_bf16_e8 exit=0 2026-11-20T09:54:45-05:00 best_val_ppl=3.045
+char losses pg19s100m_h192_par_l2_w168_own_np_doc_mm128_do0_cm1024_charkv_bf16_e8 (fp32) exit=0 char_losses heldout_ppl=3.0449 2026-11-20T09:55:54-05:00
+ended 131 @imm
+slot ended 2026-11-20T09:55:54-05:00

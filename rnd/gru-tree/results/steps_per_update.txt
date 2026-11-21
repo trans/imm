@@ -1,0 +1,13 @@
+10,000,000 characters, 400 pieces, 1,756,552 segments, mean 5.693 characters
+425 updates of 64 streams: a stream's characters an update mean 364.4, sd 31.4, 1st-99th percentile 307-464; an update's longest stream mean 475, max 715; 23,319 characters an update in all
+level  1 (every    2): steps an update mean 182.17; fewer than 2 in   0% (, more)
+level  2 (every    4): steps an update mean  91.08; fewer than 2 in   0% (, more)
+level  3 (every    8): steps an update mean  45.54; fewer than 2 in   0% (, more)
+level  4 (every   16): steps an update mean  22.76; fewer than 2 in   0% (, more)
+level  5 (every   32): steps an update mean  11.38; fewer than 2 in   0% (, more)
+level  6 (every   64): steps an update mean   5.69; fewer than 2 in   0% (2: 0%, 3: 0%, more)
+level  7 (every  128): steps an update mean   2.84; fewer than 2 in   0% (1: 0%, 2: 20%, 3: 76%, more)
+level  8 (every  256): steps an update mean   1.42; fewer than 2 in  59% (0: 0%, 1: 59%, 2: 41%, 3: 0%)
+level  9 (every  512): steps an update mean   0.70; fewer than 2 in 100% (0: 30%, 1: 70%, 2: 0%)
+level 10 (every 1024): steps an update mean   0.35; fewer than 2 in 100% (0: 65%, 1: 35%)
+peak_rss_mb=580 exit=0

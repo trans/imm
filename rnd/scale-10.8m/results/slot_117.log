@@ -1,0 +1,11 @@
+slot 117 granted 2026-11-19T17:43:19-05:00
+probe start 2026-11-19T17:43:19-05:00
+probe exit=0 2026-11-19T17:43:43-05:00
+start tx10.8m_np_100m_b1024_do0 dropout=0.0 2026-11-19T17:43:43-05:00
+end tx10.8m_np_100m_b1024_do0 exit=0 2026-11-19T18:49:16-05:00 result: heldout_ppl=2.7462 best=2.7445@47500 -> /home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/s10/tx10.8m_np_100m_b1024_do0.json
+start tx10.8m_np_100m_b1024_do1 dropout=0.1 2026-11-19T18:49:16-05:00
+end tx10.8m_np_100m_b1024_do1 exit=0 2026-11-19T19:56:26-05:00 result: heldout_ppl=2.7877 best=2.7877@48728 -> /home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/s10/tx10.8m_np_100m_b1024_do1.json
+ended 117 @imm
+slot ended 2026-11-19T19:56:26-05:00
+char losses tx10.8m_np_100m_b1024_do0 exit=0 heldout_ppl=2.7458 params=11051904 2026-11-19T19:59:11-05:00
+char losses tx10.8m_np_100m_b1024_do1 exit=0 heldout_ppl=2.7877 params=11051904 2026-11-19T20:02:14-05:00

@@ -1,0 +1,8 @@
+normal segments=351382; worst window 864 characters; devices cuda
+h448 L3 heads8 tier392:   396.6 ms/update,   58.0k chars/s, peak 5.51 GiB (longest stream 498); 8 epochs ~4.1 h unsplit
+  cap 64 x 704: an unsplit update of 64 x 700 characters: peak 7.18 GiB, 550 ms
+  cap 64 x 640: an unsplit update of 64 x 640 characters: peak 6.68 GiB, 503 ms
+  the worst update (64 x 864) split at cap 40960: 2 groups, peak 4.59 GiB, 685 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 4.39 GiB, 443 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 3.95 GiB, 239 ms
+CHOICE h=448 l=3 heads=8 tier=392 cap=40960

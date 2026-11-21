@@ -1,0 +1,9 @@
+segments=351383 mean_len=5.69
+N=  256 C=   0:  152.1 ms/update   152.1k chars/s  peak 2.15 GiB allocated  first loss 4.569158  longest stream 498
+N=  256 C= 128:  151.7 ms/update   151.3k chars/s  peak 2.11 GiB allocated  first loss 4.569158  longest stream 498
+N= 1024 C= 128:  280.5 ms/update    82.4k chars/s  peak 3.48 GiB allocated  first loss 4.569119  longest stream 498
+N= 1024 C= 256:  249.6 ms/update    92.4k chars/s  peak 2.87 GiB allocated  first loss 4.569119  longest stream 498
+N= 1024 C=   0:  218.9 ms/update   105.5k chars/s  peak 2.96 GiB allocated  first loss 4.569119  longest stream 498
+N=256 C=128: first loss differs from C=0 by 0.00e+00
+N=1024 C=128: first loss differs from C=0 by 0.00e+00
+N=1024 C=256: first loss differs from C=0 by 0.00e+00

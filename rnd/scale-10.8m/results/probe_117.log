@@ -1,0 +1,22 @@
+code 7f8238e
+h192 L2 heads4 tier168 fp32:   235.2 ms/update    99.2k chars/s  peak 2.96 GiB allocated  epoch ~18 min (scaled from slot 115)
+h192 L2 heads4 tier168 tf32:   215.4 ms/update   105.9k chars/s  peak 2.96 GiB allocated  epoch ~17 min (scaled from slot 115)
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I20261119 17:43:31.302687 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 226492416 bytes (free: 211288064, total: 8272019456).
+I20261119 17:43:31.500040 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 226492416 bytes (free: 98041856, total: 8272019456).
+I20261119 17:43:31.582832 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 56623104 bytes (free: 51904512, total: 8272019456).
+I20261119 17:43:31.598971 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 56623104 bytes (free: 54001664, total: 8272019456).
+(448, 3, 8, 392, False): out of GPU memory (CUDA out of memory. Tried to allocate 54.00 MiB. GPU 0 has a total capacity of 7.70 GiB of which 51.50 MiB is free. Incl)
+I20261119 17:43:32.302378 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 226492416 bytes (free: 211288064, total: 8272019456).
+I20261119 17:43:32.464054 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 226492416 bytes (free: 98041856, total: 8272019456).
+I20261119 17:43:32.533828 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 56623104 bytes (free: 51904512, total: 8272019456).
+I20261119 17:43:32.544325 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 56623104 bytes (free: 54001664, total: 8272019456).
+(448, 3, 8, 392, True): out of GPU memory (CUDA out of memory. Tried to allocate 54.00 MiB. GPU 0 has a total capacity of 7.70 GiB of which 51.50 MiB is free. Incl)
+I20261119 17:43:33.220261 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 257949696 bytes (free: 74973184, total: 8272019456).
+I20261119 17:43:35.294352 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 262144000 bytes (free: 127401984, total: 8272019456).
+h512 L2 heads8 tier448 fp32:   636.7 ms/update    36.7k chars/s  peak 6.37 GiB allocated  epoch ~49 min (scaled from slot 115)
+I20261119 17:43:41.633610 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 161480704 bytes (free: 26738688, total: 8272019456).
+I20261119 17:43:41.815763 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 81788928 bytes (free: 83361792, total: 8272019456).
+I20261119 17:43:41.866047 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 81788928 bytes (free: 3670016, total: 8272019456).
+I20261119 17:43:41.866151 140356821478336 CUDACachingAllocator.cpp:4092] memory allocation failed with OOM on device 0 while trying to allocate 81788928 bytes (free: 3670016, total: 8272019456).
+(384, 4, 8, 336, False): out of GPU memory (CUDA out of memory. Tried to allocate 78.00 MiB. GPU 0 has a total capacity of 7.70 GiB of which 3.50 MiB is free. Inclu)

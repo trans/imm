@@ -1,0 +1,13 @@
+normal segments=351382; worst window 864 characters; devices cuda
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak 4.44 GiB, 208 ms
+arm W: h192 L4 heads4 {'char_memory': 512, 'word_records': True, 'word_pool': 'mean', 'words_beyond_chars': False, 'memory_record': 'raw', 'max_memory': 600} at cap 36864:   205.3 ms/update,  113.5k chars/s, peak 4.64 GiB (longest stream 498, 0 of 10 split); 3 epochs ~47 min, 8 ~2.1 h
+  the worst update (64 x 864) split at cap 36864: 2 groups, peak 4.12 GiB, 340 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 3.49 GiB, 292 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 3.37 GiB, 146 ms
+CHOICE arm=W cap=36864
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak 3.57 GiB, 171 ms
+arm S: h192 L4 heads4 {'char_memory': 64, 'word_records': True, 'word_pool': 'mean', 'words_beyond_chars': True, 'memory_record': 'raw', 'max_memory': 960} at cap 36864:   161.2 ms/update,  141.3k chars/s, peak 3.96 GiB (longest stream 498, 0 of 10 split); 3 epochs ~37 min, 8 ~1.7 h
+  the worst update (64 x 864) split at cap 36864: 2 groups, peak 3.73 GiB, 326 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 3.20 GiB, 233 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 3.08 GiB, 141 ms
+CHOICE arm=S cap=36864

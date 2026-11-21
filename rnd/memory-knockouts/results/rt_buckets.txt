@@ -1,0 +1,22 @@
+                                                    targets    full     word GRU off       memory off
+all                                                  249999  2.7757    +0.57% ±0.06    +0.52% ±0.05
+-- place in the word (where the prediction is made)
+at a word's first character                           43801  3.0372    +0.29% ±0.11    +0.84% ±0.12
+inside a word                                        162344  1.8240    +0.51% ±0.07    +0.34% ±0.07
+at a word's last (predicting the next word's first)    43854 12.0060    +1.07% ±0.17    +0.87% ±0.14
+  ... not ending a phrase                             37022 11.8144    +0.45% ±0.16    +0.97% ±0.13
+  ... ending a phrase                                  6832 13.0997    +4.48% ±0.68    +0.34% ±0.52
+  ... ending a sentence                                2998 13.2941   +10.32% ±1.31    +0.06% ±0.90
+-- what is predicted
+a lowercase letter                                   181415  2.8746    +0.02% ±0.05    +0.33% ±0.05
+an uppercase letter                                    8390 19.8572    +3.74% ±0.73    +0.48% ±0.56
+a space or newline                                    48681  1.3710    +1.62% ±0.15    +0.51% ±0.14
+punctuation or digit                                  11513  7.5254    +2.59% ±0.59    +3.67% ±0.55
+-- the target's word, earlier in the same 5,000-character piece
+a new word in this piece                             108335  3.3427    +0.26% ±0.07    +0.11% ±0.06
+a repeat, 1-16 words back                             20410  2.5484    +0.54% ±0.19    +1.82% ±0.18
+a repeat, 16-64 words back                            26442  2.9310    +0.06% ±0.17    +0.83% ±0.16
+a repeat, 64-256 words back                           25278  3.2516    +0.03% ±0.16    +0.19% ±0.16
+a repeat, 256 or more words back                      10981  3.1666    +0.02% ±0.20    +0.28% ±0.20
+  ... its capital letter, 16-64 words back             1871 17.1263    +0.96% ±1.59    +0.21% ±1.46
+  ... its capital letter, 64 or more back              1844 24.0256    +3.55% ±1.30    +0.69% ±1.13

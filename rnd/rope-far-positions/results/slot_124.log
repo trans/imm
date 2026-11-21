@@ -1,0 +1,22 @@
+slot 124 granted 2026-11-19T22:56:46-05:00
+code cac43fb 0 changed files
+probe start 2026-11-19T22:56:46-05:00
+probe exit=0 2026-11-19T22:56:58-05:00
+normal segments=351382; worst window 864 characters; devices cuda
+h448 L3 heads8 tier392:   396.6 ms/update,   58.0k chars/s, peak 5.51 GiB (longest stream 498); 8 epochs ~4.1 h unsplit
+  cap 64 x 704: an unsplit update of 64 x 700 characters: peak 7.18 GiB, 550 ms
+  cap 64 x 640: an unsplit update of 64 x 640 characters: peak 6.68 GiB, 503 ms
+  the worst update (64 x 864) split at cap 40960: 2 groups, peak 4.59 GiB, 685 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 4.39 GiB, 443 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 3.95 GiB, 239 ms
+CHOICE h=448 l=3 heads=8 tier=392 cap=40960
+chose h=448 l=3 heads=8 tier=392 cap=40960
+check fp32 start 2026-11-19T22:56:58-05:00
+check fp32 end 2026-11-19T23:14:28-05:00 epoch 1 val_ppl=3.742
+check bf16 start 2026-11-19T23:14:28-05:00
+check bf16 end 2026-11-19T23:25:29-05:00 epoch 1 val_ppl=3.643 (fp32 3.742; before the fix, fp32 3.711, bf16 3.771)
+start imm pg19s100m_h448_par_l3_w392_own_np_doc_mm128_do0_cm1024_rel_bf16_e8 2026-11-19T23:25:29-05:00
+  args: --count-prior none --prior-residual-gate none --prior-input none --prior-residual-state-features= --prior-residual-scale 1.0 --prior-residual-l2 0.05 --train-streams 64 --eval-streams 64 --lr 1e-3 --segment-rule word --max-memory 128 --segments-per-update 64 --dropout 0.0 --lr-schedule cosine --min-lr 1e-4 --carry-bound gru --memory-state gru --prefetch-ahead 4 --tier-own-step --char-memory 1024 --documents data/pg19/imm-split-100m/manifest.json --epochs 8 --hidden-size 448 --embedding-size 448 --attention-layers 3 --attention-heads 8 --word-tier 392 --bf16 --max-update-chars 40960
+end imm pg19s100m_h448_par_l3_w392_own_np_doc_mm128_do0_cm1024_rel_bf16_e8 exit=1 2026-11-19T23:26:20-05:00 best_val_ppl=98.016
+ended 124 @imm
+slot ended 2026-11-19T23:26:20-05:00

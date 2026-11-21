@@ -1,0 +1,7 @@
+normal segments=351382; worst window 864 characters; devices cuda
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak 4.54 GiB, 254 ms
+arm R: h192 L4 heads4 {'char_memory': 512, 'word_records': True, 'word_pool': 'rotated-mean', 'words_beyond_chars': True, 'memory_record': 'raw', 'max_memory': 600} at cap 36864:   216.8 ms/update,  103.4k chars/s, peak 4.73 GiB (longest stream 498, 0 of 10 split); 3 epochs ~50 min, 8 ~2.2 h
+  the worst update (64 x 864) split at cap 36864: 2 groups, peak 4.20 GiB, 407 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 3.49 GiB, 311 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 3.37 GiB, 159 ms
+CHOICE arm=R cap=36864

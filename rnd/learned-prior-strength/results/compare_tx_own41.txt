@@ -1,0 +1,34 @@
+imm 3.1011  tx 3.0989  gap +0.070% (nats +0.00070)
+
+-- place in the word (where the prediction is made)
+at a word's first character                                  43801  17.5%  imm   3.3792  tx   3.3644   +0.44% ±0.19  share of gap +109.2%
+inside a word                                               162344  64.9%  imm   2.0256  tx   2.0360   -0.51% ±0.11  share of gap -474.7%
+at a word's last (predicting the next word's first)          43854  17.5%  imm  13.7717  tx  13.5174   +1.88% ±0.25  share of gap +465.5%
+  ... ending a phrase                                         6832   2.7%  imm  14.9481  tx  14.3580   +4.11% ±0.93  share of gap +156.7%
+  ... ending a sentence                                       2998   1.2%  imm  15.7078  tx  15.2593   +2.94% ±1.65  share of gap  +49.5%
+-- what is predicted
+a lowercase letter                                          181415  72.6%  imm   3.2307  tx   3.2205   +0.32% ±0.09  share of gap +327.0%
+an uppercase letter                                           8390   3.4%  imm  27.7381  tx  27.4170   +1.17% ±1.09  share of gap  +55.6%
+a space or newline                                           48681  19.5%  imm   1.4087  tx   1.4496   -2.82% ±0.19  share of gap -793.2%
+punctuation or digit                                         11513   4.6%  imm   9.2638  tx   8.5699   +8.10% ±0.86  share of gap +510.5%
+-- the prior's own loss on the target (nats)
+prior loss in [0, 0.1)                                       60908  24.4%  imm   1.0243  tx   1.0269   -0.25% ±0.03  share of gap  -87.0%
+prior loss in [0.1, 0.5)                                     53383  21.4%  imm   1.2272  tx   1.2284   -0.09% ±0.10  share of gap  -28.4%
+prior loss in [0.5, 1.5)                                     52424  21.0%  imm   2.3481  tx   2.4072   -2.45% ±0.18  share of gap -741.7%
+prior loss in [1.5, 3)                                       51264  20.5%  imm   7.2534  tx   7.5652   -4.12% ±0.24  share of gap -1228.8%
+prior loss in [3, 6)                                         28597  11.4%  imm  35.6983  tx  33.0588   +7.98% ±0.44  share of gap +1251.1%
+prior loss in [6, 99)                                         3423   1.4%  imm 613.6756  tx 379.9241  +61.53% ±2.58  share of gap +934.8%
+-- the prior's entropy (entropy_norm)
+entropy 0                                                    90956  36.4%  imm   1.4897  tx   1.4867   +0.20% ±0.11  share of gap +104.5%
+entropy in (0.000, 0.139]                                    46324  18.5%  imm   2.2928  tx   2.3086   -0.68% ±0.22  share of gap -181.3%
+entropy in (0.139, 0.173]                                    33205  13.3%  imm   4.6336  tx   4.5944   +0.85% ±0.29  share of gap +160.8%
+entropy in (0.173, 0.291]                                    40192  16.1%  imm   4.9163  tx   4.9194   -0.06% ±0.26  share of gap  -14.4%
+entropy in (0.291, 9.000]                                    39322  15.7%  imm  10.7323  tx  10.7178   +0.14% ±0.28  share of gap  +30.4%
+-- the prior's matched depth (depth_norm)
+depth_norm in (-1, 0.25]                                      3775   1.5%  imm   8.5093  tx   9.0238   -5.70% ±1.71  share of gap -126.2%
+depth_norm in (0.25, 0.5]                                    54405  21.8%  imm   3.7089  tx   3.6907   +0.49% ±0.26  share of gap +152.1%
+depth_norm in (0.5, 0.75]                                   109585  43.8%  imm   2.9251  tx   2.9235   +0.05% ±0.12  share of gap  +34.2%
+depth_norm in (0.75, 0.99]                                   59106  23.6%  imm   2.8510  tx   2.8425   +0.30% ±0.15  share of gap +100.4%
+depth_norm in (0.99, 9]                                      23128   9.3%  imm   2.8226  tx   2.8355   -0.46% ±0.23  share of gap  -60.4%
+-- the transformer's context in its window (targets with < 256 back)
+first 256 characters of the text                               255   0.1%  imm   3.8263  tx   3.7212   +2.82% ±4.84  share of gap   +4.0%

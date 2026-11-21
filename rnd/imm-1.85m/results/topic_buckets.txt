@@ -1,0 +1,26 @@
+all                                                   249999 100.0%  imm   2.7757  tx   2.8130   -1.33% ±0.07  share +100.0%
+-- the target's place in its 5,000-character held-out piece
+chars 0-256 of the piece                               12799   5.1%  imm   3.0973  tx   3.1223   -0.80% ±0.44  share   +3.1%
+chars 256-1000 of the piece                            37200  14.9%  imm   2.7670  tx   2.7948   -0.99% ±0.19  share  +11.1%
+chars 1000-2500 of the piece                           75000  30.0%  imm   2.7516  tx   2.7909   -1.41% ±0.14  share  +31.9%
+chars 2500-5000 of the piece                          125000  50.0%  imm   2.7617  tx   2.8018   -1.43% ±0.10  share  +53.9%
+-- the target's word, earlier in the same piece
+a word's character, the word new in this piece        108335  43.3%  imm   3.3427  tx   3.3637   -0.62% ±0.09  share  +20.3%
+a word's character, the word seen before in this piece   83111  33.2%  imm   2.9529  tx   3.0053   -1.74% ±0.12  share  +43.8%
+  ... and capitalized                                   5147   2.1%  imm  16.8872  tx  19.2711  -12.37% ±1.21  share  +20.4%
+not in a word (space, punctuation)                     58553  23.4%  imm   1.8026  tx   1.8398   -2.02% ±0.20  share  +35.9%
+-- where imm trails: the d24 prior's loss >= 3 nats
+prior >= 3, word new in this piece                     14791   5.9%  imm  57.1034  tx  56.2826   +1.46% ±0.48  share   -6.4%
+prior >= 3, word seen before in this piece              8847   3.5%  imm  46.6173  tx  46.5646   +0.11% ±0.75  share   -0.3%
+prior >= 3, not in a word                               3951   1.6%  imm  24.0174  tx  23.1180   +3.89% ±2.00  share   -4.5%
+prior >= 3, chars 0-1000 of the piece                   5528   2.2%  imm  52.2550  tx  51.5937   +1.28% ±1.11  share   -2.1%
+prior >= 3, chars 1000-5000 of the piece               22061   8.8%  imm  46.0912  tx  45.4592   +1.39% ±0.50  share   -9.1%
+-- a repeated word: words since its last occurrence in this piece
+repeat, 1-16 words back                                20410   8.2%  imm   2.5484  tx   2.5780   -1.15% ±0.25  share   +7.1%
+  ... capitalized                                       1432   0.6%  imm  10.5296  tx  11.6100   -9.31% ±2.28  share   +4.2%
+repeat, 16-64 words back                               26442  10.6%  imm   2.9310  tx   3.0191   -2.92% ±0.24  share  +23.5%
+  ... capitalized                                       1871   0.7%  imm  17.1263  tx  20.7892  -17.62% ±2.33  share  +10.9%
+repeat, 64-256 words back                              25278  10.1%  imm   3.2516  tx   3.2964   -1.36% ±0.21  share  +10.4%
+  ... capitalized                                       1446   0.6%  imm  23.7557  tx  26.1471   -9.15% ±1.94  share   +4.2%
+repeat, 256-more words back                            10981   4.4%  imm   3.1666  tx   3.1945   -0.88% ±0.29  share   +2.9%
+  ... capitalized                                        398   0.2%  imm  25.0322  tx  27.5713   -9.21% ±2.79  share   +1.2%

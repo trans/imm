@@ -1,0 +1,7 @@
+L=384: windows over 25.1143%; updates split ~100.0%
+L=448: windows over 2.0803%; updates split ~74.0%
+L=512: windows over 0.6147%; updates split ~32.6%
+L=576: windows over 0.2336%; updates split ~13.9%
+L=640: windows over 0.0630%; updates split ~4.0%
+L=704: windows over 0.0210%; updates split ~1.3%
+L=768: windows over 0.0018%; updates split ~0.1%

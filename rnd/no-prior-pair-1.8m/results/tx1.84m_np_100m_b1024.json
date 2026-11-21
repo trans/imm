@@ -1,0 +1,167 @@
+{
+  "model": "char transformer (imm transformer_baseline.CharGPT)",
+  "config": {
+    "config": "/home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/imm-run/configs/pg19split100m_noprior.json",
+    "output": "/home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/scale/tx1.84m_np_100m_b1024.json",
+    "prior": "none",
+    "prior_input": false,
+    "prior_dropout": 0.0,
+    "distill": 0.0,
+    "layers": 4,
+    "heads": 4,
+    "width": 192,
+    "block": 1024,
+    "dropout": 0.2,
+    "batch": 16,
+    "iters": 48728,
+    "lr": 0.001,
+    "min_lr": 0.0001,
+    "warmup": 100,
+    "weight_decay": 0.1,
+    "eval_every": 2500,
+    "seed": 1337,
+    "device": "cuda",
+    "save": "/home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/scale/tx1.84m_np_100m_b1024.pt"
+  },
+  "transformer_baseline_commit": "43057d9",
+  "params": 1986240,
+  "transformer_params": 1986240,
+  "split": {
+    "train_input": "data/pg19/imm-split-100m/train_corpus.txt",
+    "eval_input": "data/pg19/imm-split-100m/heldout_corpus.txt",
+    "eval_chars": 250000
+  },
+  "heldout_ppl": 3.687842223582562,
+  "heldout_bits_per_char": 1.8827769344754604,
+  "best_heldout_ppl": 3.687842223582562,
+  "best_step": 48728,
+  "protocol": "every held-out character after the first, up to block characters of context",
+  "curve": [
+    {
+      "step": 0,
+      "heldout_ppl": 102.87678286068387,
+      "mean_gate": null,
+      "sec": 0.6611625631339848
+    },
+    {
+      "step": 2500,
+      "heldout_ppl": 6.32134642277698,
+      "mean_gate": null,
+      "sec": 53.17498722812161
+    },
+    {
+      "step": 5000,
+      "heldout_ppl": 5.212390880335321,
+      "mean_gate": null,
+      "sec": 105.69246453791857
+    },
+    {
+      "step": 7500,
+      "heldout_ppl": 4.745084444550883,
+      "mean_gate": null,
+      "sec": 158.24757651193067
+    },
+    {
+      "step": 10000,
+      "heldout_ppl": 4.55981369750321,
+      "mean_gate": null,
+      "sec": 210.90444186609238
+    },
+    {
+      "step": 12500,
+      "heldout_ppl": 4.442013461877925,
+      "mean_gate": null,
+      "sec": 263.52052847412415
+    },
+    {
+      "step": 15000,
+      "heldout_ppl": 4.298903125824626,
+      "mean_gate": null,
+      "sec": 316.34867418091744
+    },
+    {
+      "step": 17500,
+      "heldout_ppl": 4.1883100720901405,
+      "mean_gate": null,
+      "sec": 369.81804365408607
+    },
+    {
+      "step": 20000,
+      "heldout_ppl": 4.146523039425713,
+      "mean_gate": null,
+      "sec": 423.718104934087
+    },
+    {
+      "step": 22500,
+      "heldout_ppl": 4.055954247397627,
+      "mean_gate": null,
+      "sec": 477.19333330192603
+    },
+    {
+      "step": 25000,
+      "heldout_ppl": 3.9894915946849987,
+      "mean_gate": null,
+      "sec": 530.7013791899662
+    },
+    {
+      "step": 27500,
+      "heldout_ppl": 3.9469712040939844,
+      "mean_gate": null,
+      "sec": 584.6396060721017
+    },
+    {
+      "step": 30000,
+      "heldout_ppl": 3.894721135012825,
+      "mean_gate": null,
+      "sec": 637.81674267794
+    },
+    {
+      "step": 32500,
+      "heldout_ppl": 3.8536750825192785,
+      "mean_gate": null,
+      "sec": 690.91831240803
+    },
+    {
+      "step": 35000,
+      "heldout_ppl": 3.8310894112367406,
+      "mean_gate": null,
+      "sec": 744.0397782919463
+    },
+    {
+      "step": 37500,
+      "heldout_ppl": 3.778020989559349,
+      "mean_gate": null,
+      "sec": 797.1468873869162
+    },
+    {
+      "step": 40000,
+      "heldout_ppl": 3.7564199379460845,
+      "mean_gate": null,
+      "sec": 850.281725958921
+    },
+    {
+      "step": 42500,
+      "heldout_ppl": 3.728262037967326,
+      "mean_gate": null,
+      "sec": 903.3890909720212
+    },
+    {
+      "step": 45000,
+      "heldout_ppl": 3.708138573681395,
+      "mean_gate": null,
+      "sec": 956.7091744700447
+    },
+    {
+      "step": 47500,
+      "heldout_ppl": 3.6922960552099116,
+      "mean_gate": null,
+      "sec": 1010.2381004130002
+    },
+    {
+      "step": 48728,
+      "heldout_ppl": 3.687842223582562,
+      "mean_gate": null,
+      "sec": 1036.5292394920252
+    }
+  ]
+}

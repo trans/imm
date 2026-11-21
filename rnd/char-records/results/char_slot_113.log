@@ -1,0 +1,10 @@
+slot 113 granted 2026-11-19T09:39:18-05:00
+code d4199c6 0 changed files
+  f"max={float(o[0, :, 5].nan_to_num().abs().max()):.3g}; peak {torch.cuda.max_memory_allocated() >> 20} MiB")
+efficient kernel: ok; empty row nan=False max=0; peak 567 MiB
+start imm pg19s100m_h192_par_l2_w168_own_np_doc_mm128_do0_cm256_e8 2026-11-19T09:39:20-05:00
+  args: --count-prior none --prior-residual-gate none --prior-input none --prior-residual-state-features= --prior-residual-scale 1.0 --prior-residual-l2 0.05 --train-streams 64 --eval-streams 64 --lr 1e-3 --segment-rule word --max-memory 128 --segments-per-update 64 --dropout 0.0 --lr-schedule cosine --min-lr 1e-4 --carry-bound gru --memory-state gru --hidden-size 192 --embedding-size 192 --prefetch-ahead 4 --attention-layers 2 --word-tier 168 --tier-own-step --char-memory 256 --documents data/pg19/imm-split-100m/manifest.json --epochs 8
+end imm exit=0 2026-11-19T11:16:37-05:00 best_val_ppl=3.152
+char losses imm exit=0 char_losses heldout_ppl=3.1519 2026-11-19T11:17:35-05:00
+ended 113 @imm
+slot ended 2026-11-19T11:17:35-05:00

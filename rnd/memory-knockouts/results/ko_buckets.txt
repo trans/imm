@@ -1,0 +1,22 @@
+                                                    targets    full     word GRU off       memory off         both off    overlap
+all                                                  249999  2.7757   +12.34% ±0.16    +1.30% ±0.04   +18.63% ±0.18     +4.25%
+-- place in the word (where the prediction is made)
+at a word's first character                           43801  3.0372    +1.35% ±0.09    +0.73% ±0.07    +2.51% ±0.12     +0.42%
+inside a word                                        162344  1.8240    +2.66% ±0.07    +1.47% ±0.05   +10.40% ±0.12     +5.97%
+at a word's last (predicting the next word's first)    43854 12.0060   +73.75% ±0.86    +1.24% ±0.08   +79.16% ±0.88     +1.85%
+  ... not ending a phrase                             37022 11.8144   +19.80% ±0.54    +1.15% ±0.08   +22.18% ±0.54     +0.82%
+  ... ending a phrase                                  6832 13.0997   +1202.83% ±3.82    +1.70% ±0.30   +1326.09% ±4.00     +7.64%
+  ... ending a sentence                                2998 13.2941   +7766.51% ±5.72    +1.81% ±0.56   +8578.59% ±5.97     +8.37%
+-- what is predicted
+a lowercase letter                                   181415  2.8746    +4.04% ±0.10    +0.27% ±0.03    +4.30% ±0.11     -0.02%
+an uppercase letter                                    8390 19.8572   +385.35% ±3.07    +2.07% ±0.30   +403.36% ±3.15     +1.61%
+a space or newline                                    48681  1.3710    +8.71% ±0.22    +5.75% ±0.16   +45.05% ±0.33    +26.18%
+punctuation or digit                                  11513  7.5254   +48.84% ±1.60    -1.36% ±0.29   +34.45% ±1.74     -8.42%
+-- the target's word, earlier in the same 5,000-character piece
+a new word in this piece                             108335  3.3427    +6.48% ±0.20    +0.20% ±0.04    +6.76% ±0.21     +0.07%
+a repeat, 1-16 words back                             20410  2.5484   +24.83% ±0.78    +1.71% ±0.10   +26.43% ±0.79     -0.42%
+a repeat, 16-64 words back                            26442  2.9310   +22.06% ±0.64    +0.68% ±0.09   +22.40% ±0.65     -0.39%
+a repeat, 64-256 words back                           25278  3.2516   +15.83% ±0.59    -0.00% ±0.09   +15.85% ±0.61     +0.02%
+a repeat, 256 or more words back                      10981  3.1666    +9.83% ±0.70    -0.05% ±0.11    +9.88% ±0.73     +0.09%
+  ... its capital letter, 16-64 words back             1871 17.1263   +439.16% ±6.38    +1.28% ±0.67   +439.73% ±6.41     -1.16%
+  ... its capital letter, 64 or more back              1844 24.0256   +482.24% ±6.87    +1.37% ±0.73   +516.77% ±7.11     +4.50%

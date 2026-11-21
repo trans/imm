@@ -1,0 +1,24 @@
+                                                      targets  mean factor     sd  < 0.5  > 1.5
+all                                                    249999        0.844  0.321  13.1%   4.1%
+-- place in the word (where the prediction is made)
+at a word's first character                             43801        0.769  0.346  21.8%   5.6%
+inside a word                                          162344        0.876  0.315  10.7%   3.9%
+at a word's last (predicting the next word's first)     43854        0.804  0.299  13.3%   3.2%
+  ... not ending a phrase                               37022        0.751  0.248  15.1%   0.8%
+  ... ending a phrase                                    6832        1.089  0.378   3.5%  16.5%
+  ... ending a sentence                                  2998        1.368  0.325   0.1%  36.0%
+-- what is predicted
+a lowercase letter                                     181415        0.756  0.279  17.4%   1.8%
+an uppercase letter                                      8390        1.130  0.374   4.0%  18.2%
+a space or newline                                      48681        1.063  0.290   1.3%   8.4%
+punctuation or digit                                    11513        1.107  0.311   1.7%  11.0%
+-- the word's place in its sentence
+word 1                                                  16426        1.152  0.334   2.4%  16.4%
+word 2-4                                                42844        0.886  0.320  10.0%   4.5%
+word 5-12                                               80486        0.837  0.312  12.8%   3.5%
+word 13+                                               110243        0.787  0.296  16.1%   2.5%
+-- the target's place in its piece
+chars 0-256                                             12799        1.053  0.297   1.6%   8.2%
+chars 256-1000                                          37200        0.924  0.322   7.3%   5.7%
+chars 1000-2500                                         75000        0.847  0.318  12.5%   4.0%
+chars 2500-5000                                        125000        0.798  0.311  16.4%   3.2%

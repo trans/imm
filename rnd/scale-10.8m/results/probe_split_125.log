@@ -1,0 +1,21 @@
+normal segments=351382; worst window 864 characters; devices cuda
+h448 L3 heads8 tier392:   397.5 ms/update,   57.9k chars/s, peak 6.25 GiB (longest stream 498); 8 epochs ~4.1 h unsplit
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+W20261119 23:29:05.273942 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+W20261119 23:29:05.393740 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+W20261119 23:29:05.393880 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+  cap 64 x 704: an unsplit update of 64 x 700 characters: peak inf GiB, nan ms
+W20261119 23:29:05.583464 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+W20261119 23:29:05.584892 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+  cap 64 x 672: an unsplit update of 64 x 672 characters: peak inf GiB, nan ms
+W20261119 23:29:05.872572 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+W20261119 23:29:05.984090 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+W20261119 23:29:06.007670 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+W20261119 23:29:06.009926 140100911619008 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+  cap 64 x 640: an unsplit update of 64 x 640 characters: peak inf GiB, nan ms
+  cap 64 x 608: an unsplit update of 64 x 608 characters: peak 7.16 GiB, 489 ms
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak 6.90 GiB, 465 ms
+  the worst update (64 x 864) split at cap 36864: 2 groups, peak 5.33 GiB, 686 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 5.14 GiB, 428 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 4.69 GiB, 244 ms
+CHOICE h=448 l=3 heads=8 tier=392 cap=36864

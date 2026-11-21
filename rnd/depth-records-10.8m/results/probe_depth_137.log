@@ -1,0 +1,30 @@
+normal segments=351382; worst window 864 characters; devices cuda
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+W20261120 13:03:18.612495 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18612224, total: 8272019456).
+W20261120 13:03:18.619966 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 20709376, total: 8272019456).
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak inf GiB, nan ms
+W20261120 13:03:18.885196 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18612224, total: 8272019456).
+W20261120 13:03:18.899121 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 20709376, total: 8272019456).
+W20261120 13:03:18.900911 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 20709376, total: 8272019456).
+  cap 64 x 544: an unsplit update of 64 x 544 characters: peak inf GiB, nan ms
+W20261120 13:03:19.157229 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18612224, total: 8272019456).
+W20261120 13:03:19.173067 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18612224, total: 8272019456).
+W20261120 13:03:19.174883 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18612224, total: 8272019456).
+  cap 64 x 512: an unsplit update of 64 x 512 characters: peak inf GiB, nan ms
+W20261120 13:03:19.425277 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 16515072, total: 8272019456).
+W20261120 13:03:19.468799 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 16515072, total: 8272019456).
+  cap 64 x 480: an unsplit update of 64 x 480 characters: peak inf GiB, nan ms
+W20261120 13:03:19.720921 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 16515072, total: 8272019456).
+W20261120 13:03:19.761636 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 16515072, total: 8272019456).
+W20261120 13:03:19.765939 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 16515072, total: 8272019456).
+  cap 64 x 448: an unsplit update of 64 x 448 characters: peak inf GiB, nan ms
+W20261120 13:03:20.059696 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 16515072, total: 8272019456).
+W20261120 13:03:20.099539 139940241140672 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18612224, total: 8272019456).
+  cap 64 x 416: an unsplit update of 64 x 416 characters: peak inf GiB, nan ms
+  cap 64 x 384: an unsplit update of 64 x 384 characters: peak 7.04 GiB, 377 ms
+  cap 64 x 352: an unsplit update of 64 x 352 characters: peak 6.78 GiB, 360 ms
+h448 L3 heads8 tier392 depth at cap 22528:   423.8 ms/update,   54.0k chars/s, peak 5.22 GiB (longest stream 498, 10 of 10 split); 8 epochs ~4.3 h
+  the worst update (64 x 864) split at cap 22528: 3 groups, peak 5.39 GiB, 746 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 6.03 GiB, 472 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 5.85 GiB, 271 ms
+CHOICE h=448 l=3 heads=8 tier=392 cap=22528

@@ -1,0 +1,15 @@
+normal segments=351382; worst window 864 characters
+h192 L2 heads4 tier168 bf16:   128.3 ms/update   180.6k chars/s  peak 2.29 GiB, worst case 3.84 GiB  epoch ~10 min, 8 epochs ~1.3 h
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+W20261119 21:34:47.905841 140042055248832 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 9961472, total: 8272019456).
+W20261119 21:34:48.011416 140042055248832 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 18350080, total: 8272019456).
+h448 L3 heads8 tier392 bf16:   376.6 ms/update    61.2k chars/s  peak 5.46 GiB, worst case inf GiB  epoch ~29 min, 8 epochs ~3.9 h
+W20261119 21:34:52.167696 140042055248832 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 14155776, total: 8272019456).
+W20261119 21:34:52.268036 140042055248832 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 22544384, total: 8272019456).
+W20261119 21:34:52.273020 140042055248832 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 22544384, total: 8272019456).
+h512 L2 heads8 tier448 bf16:   293.9 ms/update    78.2k chars/s  peak 5.00 GiB, worst case inf GiB  epoch ~23 min, 8 epochs ~3.0 h
+W20261119 21:34:57.696856 140042055248832 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 14155776, total: 8272019456).
+W20261119 21:34:57.819411 140042055248832 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 20447232, total: 8272019456).
+W20261119 21:34:57.823786 140042055248832 CUDACachingAllocator.cpp:623] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 20447232, total: 8272019456).
+h384 L4 heads8 tier336 bf16:   396.4 ms/update    58.2k chars/s  peak 5.65 GiB, worst case inf GiB  epoch ~30 min, 8 epochs ~4.1 h
+CHOICE none
