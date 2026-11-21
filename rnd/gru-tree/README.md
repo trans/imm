@@ -1,7 +1,7 @@
 ---
 title:    A GRU-only binary tree
 kind:     experiment
-status:   planned
+status:   running
 outcome:  n/a
 question: >-
   Without attention or memory records, can a stack of GRUs, each level
@@ -58,10 +58,17 @@ recurrence gets little gradient.
 
 ## How to rerun
 
-The run script, its slot and its tag will be added here when it runs. The
-model's flags, on top of the standard run's (`base` in the `half-lr-10.8m`
-entry's `lr10_slot.sh`, without `--tier-own-step` and `--char-memory`, which
-the tree refuses):
+**The first screen** (approved 2026-11-21): `tree_slot.sh <slot>`, from a
+worktree at `8818093`, tag `rnd/gru-tree/slot<N>` once it runs.
+- It runs `probe_tree.py` (each arm's `--max-update-chars` cap and speed).
+- Then two arms, each stopped after epoch 3 of the 8-epoch schedule:
+  - **T:** the tree, h192, 10 levels of width 132;
+  - **G:** the plain character GRU at the same size, h498, no tree: the
+    control.
+
+The model's flags, on top of the standard run's (`base` in the
+`half-lr-10.8m` entry's `lr10_slot.sh`, without `--tier-own-step` and
+`--char-memory`, which the tree refuses):
 
 ```text
 --hidden-size 192 --embedding-size 192 --attention-layers 0 --no-word-records
