@@ -1,8 +1,8 @@
 ---
 title:    Weight updates every two characters
 kind:     experiment
-status:   running
-outcome:  n/a
+status:   concluded
+outcome:  negative
 question: >-
   If a character GRU's weights are updated every 2 characters, so the error
   reaches back only 2 steps, how much worse does it predict than with a
@@ -10,8 +10,10 @@ question: >-
 answer: >-
   Stage 1: updated every 2 characters, the tiny GRU scores 7.473 against
   6.012 with a 256-character window (+24.3%), between counting models that
-  see 2 and 3 characters back (8.03, 6.11). Stage 2 (level 1 on top,
-  updated on its own two steps) is running.
+  see 2 and 3 characters back (8.03, 6.11). Stage 2: level 1 on top,
+  updated on its own two steps, makes it worse: 8.165, +9.3% against the
+  2-character GRU alone and +14.6% against one of the same size (7.123),
+  though its gate opens to 0.68. It is worse on the training text too.
 opened:   2026-11-21
 updated:  2026-11-21
 code:     standalone, this directory (tiny_tbptt.py); no branch
@@ -114,4 +116,36 @@ perplexity per character after 2,000,000 training characters:
 - Every arm bumps up at 1.5M characters: the one stream reads a stretch of
   text unlike the held-out pieces.
 - Time: 1,240–1,320 s for each 2-character arm, ~275 s for each 256 arm.
+
+### 2026-11-21: stage 2, level 1 on top
+
+`run2.sh`, CPU, the four arms side by side, 18:12–18:55 EST. Held-out
+perplexity per character after 2,000,000 training characters:
+
+| model | parameters | 3e-5 | 1e-4 |
+|---|---:|---:|---:|
+| character GRU 128 + level 1, each on its own two steps | 208,609 | **8.165** | 8.712 |
+| character GRU 215, every 2 characters (same size) | 208,125 | **7.123** | 7.263 |
+| character GRU 128, every 2 characters (stage 1) | 93,024 | **7.473** | 7.506 |
+| character GRU 128, every 256 characters (stage 1, at 1e-3) | 93,024 | 6.012 | |
+
+- **Level 1 makes it worse:** +9.3% against the 2-character GRU it sits
+  on, +14.6% against a character GRU of the same size.
+- **It is used:** its gate, tanh(g), rose steadily: 0.26, 0.36, 0.44, 0.51,
+  0.57, 0.62, 0.65, 0.68 at each 250,000 characters (3e-5).
+- **It learns worse, not just generalises worse.** The loss on the
+  training text as it was read, over the last 250,000 characters: 7.17
+  with level 1 against 6.78 without (3e-5), and 6.71 against 5.76 for the
+  same-size GRU (1e-4).
+- Time: ~2,535 s for each level-1 arm, ~2,200 s for each same-size control,
+  four at once.
+
+**Reading it** (the lead agent's, untested): the two levels learn on
+different clocks. The character level changes its weights and the output
+layer every 2 characters, to fit predictions that include level 1's read;
+level 1 changes every 4, to fit a character level that has since changed
+once. Level 1 also gets only a detached copy of the character state, so
+all it can add is what it carries across its own two steps. A test: the
+same model with both levels updated together every 4 characters, against
+a character GRU updated every 4.
 

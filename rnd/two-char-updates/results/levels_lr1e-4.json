@@ -1,0 +1,102 @@
+{
+ "args": {
+  "lr": "0.0001",
+  "train_chars": "2000000",
+  "eval_every": "250000",
+  "embed": "64",
+  "hidden": "128",
+  "width": "128",
+  "clip": "1.0",
+  "seed": "1",
+  "threads": "2",
+  "out": "results/levels_lr1e-4.json"
+ },
+ "params": 208609,
+ "curve": [
+  {
+   "chars": 0,
+   "heldout_ppl": 96.00582044485616,
+   "gate": 0.0,
+   "sec": 0.0
+  },
+  {
+   "chars": 250000,
+   "char_updates": 125005,
+   "level_updates": 62502,
+   "heldout_ppl": 10.940076260924197,
+   "train_ppl": 9.328713138040783,
+   "gate": 0.4209,
+   "sec": 327.3
+  },
+  {
+   "chars": 500000,
+   "char_updates": 250010,
+   "level_updates": 125005,
+   "heldout_ppl": 8.84515857183337,
+   "train_ppl": 7.1872083726274605,
+   "gate": 0.5066,
+   "sec": 656.3
+  },
+  {
+   "chars": 750000,
+   "char_updates": 375015,
+   "level_updates": 187507,
+   "heldout_ppl": 8.458453153401564,
+   "train_ppl": 6.970158851310395,
+   "gate": 0.5243,
+   "sec": 982.2
+  },
+  {
+   "chars": 1000000,
+   "char_updates": 500020,
+   "level_updates": 250010,
+   "heldout_ppl": 8.542959472775335,
+   "train_ppl": 6.980613148661429,
+   "gate": 0.5622,
+   "sec": 1307.2
+  },
+  {
+   "chars": 1250000,
+   "char_updates": 625025,
+   "level_updates": 312512,
+   "heldout_ppl": 8.086751773863448,
+   "train_ppl": 6.960941892152094,
+   "gate": 0.5877,
+   "sec": 1634.0
+  },
+  {
+   "chars": 1500000,
+   "char_updates": 750030,
+   "level_updates": 375015,
+   "heldout_ppl": 8.836558288800884,
+   "train_ppl": 6.488315043920853,
+   "gate": 0.6046,
+   "sec": 1962.3
+  },
+  {
+   "chars": 1750000,
+   "char_updates": 875035,
+   "level_updates": 437517,
+   "heldout_ppl": 8.354865019831715,
+   "train_ppl": 6.706458147728156,
+   "gate": 0.6207,
+   "sec": 2272.5
+  },
+  {
+   "chars": 1999920,
+   "char_updates": 1000000,
+   "level_updates": 500000,
+   "heldout_ppl": 8.712320167495301,
+   "gate": 0.6497,
+   "sec": 2533.4
+  }
+ ],
+ "final": {
+  "chars": 1999920,
+  "char_updates": 1000000,
+  "level_updates": 500000,
+  "heldout_ppl": 8.712320167495301,
+  "gate": 0.6497,
+  "sec": 2533.4
+ }
+}
