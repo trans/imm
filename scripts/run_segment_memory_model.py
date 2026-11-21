@@ -158,6 +158,24 @@ def mean_or_none(total: float, count: float) -> float | None:
     return total / count
 
 
+def word_place_rotation(values: torch.Tensor, place: torch.Tensor) -> torch.Tensor:
+    """values [B, T, W] (float32), each turned by its character's place in
+    its word (place [B, T], 0 for a word's first character), as RoPE turns
+    a key: pair k is dimensions k and k + W // 2, turned by place x
+    16 ** (-k / (W // 2 - 1)) radians, from 1 radian a place down to 1/16,
+    so that every pair turns noticeably over a word of up to 16 characters.
+    An odd last dimension stays as it is. A word's first character is not
+    turned."""
+    half = values.shape[-1] // 2
+    if half == 0:
+        return values
+    steps = torch.arange(half, device=values.device, dtype=torch.float32) / max(half - 1, 1)
+    angle = place.to(torch.float32)[..., None] * 16.0 ** (-steps)  # [B, T, half]
+    cos, sin = angle.cos(), angle.sin()
+    a, b = values[..., :half], values[..., half : 2 * half]
+    return torch.cat([a * cos - b * sin, a * sin + b * cos, values[..., 2 * half :]], dim=-1)
+
+
 class GRU(nn.GRU):
     """nn.GRU that runs in float32 under torch.autocast (--bf16). Autocast
     would run cuDNN's GRU in float16, whose small gradients underflow without
@@ -1154,11 +1172,14 @@ class SegmentMemoryLM(nn.Module):
                 raise ValueError("--rnn-core none takes no tiers: they read the character GRU")
         # --word-pool mean: a word record is written from the mean of the
         # block's input over the word's characters, not from the state at its
-        # last character.
-        if word_pool not in ("last", "mean"):
+        # last character. rotated-mean: each character's input is first turned
+        # by its place in the word, as RoPE turns a key by its position, so
+        # the mean keeps the letters' order (the plain mean of the first
+        # block's input is a bag of letters). No parameters.
+        if word_pool not in ("last", "mean", "rotated-mean"):
             raise ValueError(f"unknown word_pool: {word_pool}")
-        if word_pool == "mean" and (not word_records or mixing != "gated-xattn" or not memory_attention):
-            raise ValueError("--word-pool mean needs word records attended: --mixing gated-xattn, with word records")
+        if word_pool != "last" and (not word_records or mixing != "gated-xattn" or not memory_attention):
+            raise ValueError(f"--word-pool {word_pool} needs word records attended: --mixing gated-xattn, with word records")
         self.word_pool = word_pool
         # --words-beyond-chars: a character sees a word's record only when
         # the whole word is out of its character records' reach (the word's
@@ -2187,14 +2208,21 @@ class SegmentMemoryLM(nn.Module):
         """What each of this update's segments writes its record from
         ([B, K, H]): with --word-pool last, the state at its last character
         (at_last, [B, K, H]); with mean, the mean of state ([B, T, H]) over
-        its characters, in float32 (zeros for a segment of no characters)."""
+        its characters, in float32 (zeros for a segment of no characters);
+        with rotated-mean, the mean of each character's state turned by its
+        place in the word (word_place_rotation)."""
         if self.word_pool == "last":
             return at_last
         streams, count = lengths.shape
         width = state.shape[-1]
+        values = state.float()
+        if self.word_pool == "rotated-mean":
+            starts = torch.from_numpy(np.cumsum(lengths, axis=1) - lengths).to(state.device)  # [B, K]
+            place = torch.arange(state.shape[1], device=state.device)[None, :] - starts.gather(1, segment_of_t)
+            values = word_place_rotation(values, place.clamp(min=0))  # padding's place is dropped below
         where = segment_of_t.masked_fill(~span_valid_t, 0)[..., None].expand(-1, -1, width)  # padding adds zeros
         sums = state.new_zeros((streams, count, width), dtype=torch.float32)
-        sums.scatter_add_(1, where, state.float() * span_valid_t[..., None])
+        sums.scatter_add_(1, where, values * span_valid_t[..., None])
         counts = torch.from_numpy(lengths).to(state.device).clamp(min=1)[..., None]
         return (sums / counts).to(state.dtype)
 
@@ -3100,10 +3128,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--word-pool",
-        choices=["last", "mean"],
+        choices=["last", "mean", "rotated-mean"],
         default="last",
-        help="what a word record is written from: the block input at the word's last character, or its mean over "
-        "the word's characters (parallel memory path only)",
+        help="what a word record is written from: the block input at the word's last character, its mean over "
+        "the word's characters, or that mean with each character first turned by its place in the word, so the "
+        "letters' order counts (parallel memory path only)",
     )
     parser.add_argument(
         "--words-beyond-chars",

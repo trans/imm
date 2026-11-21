@@ -4,8 +4,9 @@
 character's embedding (projected when the widths differ), and with
 --depth-records each block reads character records rebuilt from the block
 below, as a transformer's layers do. --word-pool mean: a word record is
-written from the mean of the block's input over the word's characters.
---words-beyond-chars: a character sees a word's record only once the word's
+written from the mean of the block's input over the word's characters;
+rotated-mean turns each character's input by its place in the word first,
+so the letters' order counts. --words-beyond-chars: a character sees a word's record only once the word's
 last character is --char-memory or more back. Each: an update split in
 pieces is the whole update; the records are what they say, checked by hand;
 refused where it can't run. --stop-after-epoch is a CLI flag."""
@@ -14,6 +15,7 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -32,6 +34,16 @@ def model_of(layers=2, **extra):
             block.gate_attn.fill_(0.7)
             block.gate_mlp.fill_(0.5)
     return model
+
+
+def turned(rows, places):
+    """rows [n, W] each turned by its place (word_place_rotation, done here as
+    complex numbers): pair k (k, k + W // 2) times exp(i place 16 ** (-k / (W // 2 - 1)))."""
+    half = rows.shape[-1] // 2
+    rate = 16.0 ** (-torch.arange(half, dtype=torch.float64) / max(half - 1, 1))
+    z = torch.complex(rows[:, :half].double(), rows[:, half : 2 * half].double())
+    z = z * torch.polar(torch.ones_like(rate), torch.as_tensor(places, dtype=torch.float64)[:, None] * rate)
+    return torch.cat([z.real, z.imag, rows[:, 2 * half :].double()], dim=-1).to(rows.dtype)
 
 
 def capture(model, fn):
@@ -93,6 +105,8 @@ class AttentionOnlyTest(unittest.TestCase):
             dict(word_records=False, layers=3),
             dict(word_pool="mean"),
             dict(word_pool="mean", words_beyond_chars=True),
+            dict(word_pool="rotated-mean", words_beyond_chars=True),
+            dict(word_pool="rotated-mean", layers=3),
             dict(words_beyond_chars=True, layers=3),
         )
         for extra in cases:
@@ -130,10 +144,10 @@ class AttentionOnlyTest(unittest.TestCase):
                         self.assertGreater(float(ga[name].abs().sum()), 0.0, name)
 
     def test_a_word_record_is_the_mean_over_its_characters(self) -> None:
-        for alone in (True, False):
-            with self.subTest(rnn_none=alone):
+        for alone, pool in ((True, "mean"), (False, "mean"), (True, "rotated-mean"), (False, "rotated-mean")):
+            with self.subTest(rnn_none=alone, word_pool=pool):
                 extra = {} if alone else dict(rnn_core="gru")
-                model = model_of(word_pool="mean", **extra)
+                model = model_of(word_pool=pool, **extra)
                 model.eval()
                 part = [s[:5] for s in self.segs]
                 with torch.no_grad():
@@ -145,10 +159,40 @@ class AttentionOnlyTest(unittest.TestCase):
                                 end = start + e - s
                                 # the record sits at the word's last character
                                 self.assertEqual(int(kw["memory_positions"][b, k]), int(kw["query_positions"][b, end - 1]))
-                                want = model.memory_interface_norm(model.write_memory(hidden[b, start:end].mean(dim=0)))
+                                rows = hidden[b, start:end]
+                                if pool == "rotated-mean":
+                                    rows = turned(rows, list(range(end - start)))
+                                want = model.memory_interface_norm(model.write_memory(rows.mean(dim=0)))
                                 torch.testing.assert_close(memory[b, k], want, rtol=1e-5, atol=1e-5, msg=f"block {i} {b} {k}")
                                 start = end
                     self.assertEqual(sorted({i for i, *_ in seen}), [0, 1])
+
+    def test_rotated_mean_keeps_the_letters_order(self) -> None:
+        width = 7  # an odd last dimension stays as it is
+        torch.manual_seed(1)
+        x, y, z = torch.randn(3, width)
+        state = torch.stack([x, y, y, x, z, x, y, z])[None]  # words: xy, yx, z, xyz
+        lengths = np.array([[2, 2, 1, 3]])
+        segment_of_t = torch.tensor([[0, 0, 1, 1, 2, 3, 3, 3]])
+        span_valid_t = torch.ones_like(segment_of_t, dtype=torch.bool)
+        got = {}
+        for pool in ("mean", "rotated-mean"):
+            model = model_of(word_pool=pool)
+            got[pool] = model.word_summaries(state, None, segment_of_t, span_valid_t, lengths)[0]
+        plain, rotated = got["mean"], got["rotated-mean"]
+        torch.testing.assert_close(plain[0], plain[1])  # a bag of letters
+        self.assertGreater(float((rotated[0] - rotated[1]).abs().max()), 0.1)
+        torch.testing.assert_close(rotated[0], (x + turned(y[None], [1])[0]) / 2)
+        torch.testing.assert_close(rotated[1], (y + turned(x[None], [1])[0]) / 2)
+        torch.testing.assert_close(rotated[2], z)  # a word's first character isn't turned
+        torch.testing.assert_close(rotated[3], turned(torch.stack([x, y, z]), [0, 1, 2]).mean(dim=0))
+        torch.testing.assert_close(rotated[:, -1], plain[:, -1])  # the odd dimension
+        # each turn keeps a character's length; padding adds nothing
+        torch.testing.assert_close(turned(state[0], list(range(8))).norm(dim=-1), state[0].norm(dim=-1))
+        padded = torch.cat([state, torch.randn(1, 3, width)], dim=1)
+        pad_segment = torch.cat([segment_of_t, torch.full((1, 3), 3)], dim=1)
+        pad_valid = torch.cat([span_valid_t, torch.zeros(1, 3, dtype=torch.bool)], dim=1)
+        torch.testing.assert_close(model.word_summaries(padded, None, pad_segment, pad_valid, lengths)[0], rotated)
 
     def test_words_beyond_chars_is_the_mask_and_nothing_else(self) -> None:
         for extra in (dict(), dict(rnn_core="gru")):
@@ -189,6 +233,8 @@ class AttentionOnlyTest(unittest.TestCase):
             ("--rnn-core none|--depth-records", dict(ALONE, memory_attention=False)),
             ("--word-pool", dict(word_pool="mean", word_records=False, char_memory=N)),
             ("--word-pool", dict(word_pool="mean", memory_attention=False)),
+            ("--word-pool rotated-mean", dict(word_pool="rotated-mean", word_records=False, char_memory=N)),
+            ("unknown word_pool", dict(word_pool="spun")),
             ("--words-beyond-chars", dict(words_beyond_chars=True)),
             ("--words-beyond-chars", dict(words_beyond_chars=True, char_memory=N, word_records=False)),
         )
@@ -198,7 +244,7 @@ class AttentionOnlyTest(unittest.TestCase):
                 layers = options.pop("layers", 2)
                 with self.assertRaisesRegex(ValueError, message):
                     make_model(layers=layers, **options, **PARALLEL)
-        for options in (ALONE, dict(word_pool="mean"), dict(words_beyond_chars=True, char_memory=N)):
+        for options in (ALONE, dict(word_pool="mean"), dict(word_pool="rotated-mean"), dict(words_beyond_chars=True, char_memory=N)):
             with self.subTest(off_the_parallel_path=options):
                 model = make_model(layers=2, **options)  # not the parallel path
                 model.eval()
@@ -209,6 +255,7 @@ class AttentionOnlyTest(unittest.TestCase):
     def test_cli_flags(self) -> None:
         source = Path(runner.__file__).read_text()
         self.assertIn('choices=["gru", "tanh", "none"]', source)
+        self.assertIn('choices=["last", "mean", "rotated-mean"]', source)
         for flag in ('"--word-pool"', '"--words-beyond-chars"', '"--stop-after-epoch"'):
             self.assertIn(flag, source)
         self.assertIn("word_pool=args.word_pool", source)
