@@ -7,7 +7,11 @@ question: >-
   If a character GRU's weights are updated every 2 characters, so the error
   reaches back only 2 steps, how much worse does it predict than with a
   256-character window?
-answer:   running
+answer: >-
+  Stage 1: updated every 2 characters, the tiny GRU scores 7.473 against
+  6.012 with a 256-character window (+24.3%), between counting models that
+  see 2 and 3 characters back (8.03, 6.11). Stage 2 (level 1 on top,
+  updated on its own two steps) is running.
 opened:   2026-11-21
 updated:  2026-11-21
 code:     standalone, this directory (tiny_tbptt.py); no branch
@@ -50,11 +54,64 @@ ever rewards keeping something in the state for more than 2 steps.
   of each piece (249,950 predictions). The model is tiny and sees 2M
   characters, so the numbers aren't comparable to imm's runs, only to each
   other.
+- **Reference:** `ngram_ref.py` scores counting models that see only the
+  last 0 to 5 characters, trained on the same 2M characters and scored the
+  same way (interpolated absolute discounting).
+
+### Stage 2: level 1 on top
+
+The user's next step: add level 1 over the 2-character GRU, updated on its
+own two steps (`tiny_levels.py`).
+- **Level 1,** a GRU 128 wide, steps at every second character, reading the
+  character GRU's state there.
+- **Its updates:** every 2 of its own steps, so every 4 characters, at
+  every other character update, from those 4 predictions. Its error reaches
+  back through its 2 steps.
+- **It can't reach into the character GRU:** those weights change between
+  its two steps, so it reads the character state detached.
+- **Read:** each prediction adds level 1's state after its latest step,
+  projected 128 → 128 and times tanh of a gate that starts at 0, to the
+  character GRU's state in front of the output layer, as `gru-tree` does.
+- **Size:** 208,609 parameters, against the 2-character GRU's 93,024. The
+  control is a character GRU of the same size (hidden 215, 208,125),
+  updated every 2 characters.
+- Each at learning rates 3e-5 and 1e-4, the two best for the 2-character
+  GRU in stage 1.
 
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/two-char-updates/run.sh` runs the six arms in
 turn and writes `results/k<K>_lr<LR>.json` (the curve, the final score).
-`tiny_tbptt.py --help` gives the single-arm flags.
+`tiny_tbptt.py --help` gives the single-arm flags. Stage 1 added a
+seventh arm afterwards (window 2 at 3e-5, as its best rate was the lowest
+tried); `run.sh` lists it. `python3 ngram_ref.py > results/ngram_ref.txt`
+gives the counting references. Stage 2: `sh rnd/two-char-updates/run2.sh`.
 
 ## Results
+
+### 2026-11-21: stage 1, windows 2 and 256
+
+`run.sh`, CPU, 16:30–17:48 EST, then the 3e-5 arm 17:49–18:11. Held-out
+perplexity per character after 2,000,000 training characters:
+
+| window | updates | 3e-5 | 1e-4 | 3e-4 | 1e-3 | 3e-3 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 1,000,000 | **7.473** | 7.506 | 8.212 | 10.562 | |
+| 256 | 7,840 | | | 6.699 | **6.012** | 6.430 |
+
+- **The 2-character window costs +24.3%** at each window's best rate
+  (7.473 against 6.012).
+- **It sees about 2–3 characters back.** Counting models that see only the
+  last 0–5 characters (`results/ngram_ref.txt`) score 23.91, 12.81, 8.03,
+  6.11, 5.47 and 5.50. The 2-character GRU falls between 2 characters back
+  (8.03) and 3 (6.11).
+- **It stops learning sooner.** At 1e-4 it reached 7.47 at 1.25M characters
+  and 7.51 at 2M; at 3e-5 it was still falling (7.54 → 7.47), as was the
+  256 window (6.07 → 6.01).
+- **Both GRUs are undertrained:** counting the last 4 characters (5.47)
+  beats them. The result gives the cost's direction and rough size, not
+  either window's ceiling.
+- Every arm bumps up at 1.5M characters: the one stream reads a stretch of
+  text unlike the held-out pieces.
+- Time: 1,240–1,320 s for each 2-character arm, ~275 s for each 256 arm.
+

@@ -9,7 +9,7 @@ ionice -c 3 -p $$
 export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
 cd "$(dirname "$0")"
 mkdir -p results
-for spec in "256 3e-4" "256 1e-3" "256 3e-3" "2 1e-4" "2 3e-4" "2 1e-3"; do
+for spec in "256 3e-4" "256 1e-3" "256 3e-3" "2 1e-4" "2 3e-4" "2 1e-3" "2 3e-5"; do
   set -- $spec
   echo "start window=$1 lr=$2 $(date -Iseconds)"
   python3 tiny_tbptt.py --window "$1" --lr "$2" --train-chars 2000000 --out "results/k$1_lr$2.json"

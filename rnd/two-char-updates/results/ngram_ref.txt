@@ -1,0 +1,6 @@
+{"n": 1, "context_chars": 0, "heldout_ppl": 23.9099, "predictions": 249950}
+{"n": 2, "context_chars": 1, "heldout_ppl": 12.8144, "predictions": 249950}
+{"n": 3, "context_chars": 2, "heldout_ppl": 8.0277, "predictions": 249950}
+{"n": 4, "context_chars": 3, "heldout_ppl": 6.1135, "predictions": 249950}
+{"n": 5, "context_chars": 4, "heldout_ppl": 5.4735, "predictions": 249950}
+{"n": 6, "context_chars": 5, "heldout_ppl": 5.5044, "predictions": 249950}
