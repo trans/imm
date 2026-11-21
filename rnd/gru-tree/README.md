@@ -54,6 +54,40 @@ fixed spans instead of words.
   - slot 130, the character and word GRUs without attention: 3.3473;
   - the 1.84M transformer: 3.1862.
 
+![The tree model: a character GRU, ten GRU levels above it stepping every 2, 4, 8, … characters, and each character's read of every level joining its state before a linear output layer](model.svg)
+
+**The model as slot 147 ran it** (`draw_model.py` draws `model.svg`),
+over 16 characters from the middle of a piece, places 1,025 to 1,040:
+- **Steps:** each box is one GRU step. The character GRU steps at every
+  character. Level k, a GRU 132 wide, steps after every 2^k-th character of
+  the piece, so all ten levels step together after character 1,024.
+- **Up:** level k's input is level k−1's state after every second step of
+  it: the state after the pair, which has read both halves and everything
+  before them. Each level is one GRU running along the text at its own
+  rate, carrying its own state. No step combines just two children, as a
+  node in a strict tree would.
+- **Down:** the teal column is what character 1,036 reads. It takes each
+  level's state after its latest step: levels 1 and 2 have just stepped,
+  level 3's state is from 1,032, and levels 4–10 are from 1,024. Each state
+  is projected 132 → 192 and multiplied by tanh of its level's gate. The
+  sum is added to the character GRU's state h, and the output layer reads
+  the result.
+- **What the levels don't reach:** the character GRU's own steps. Their
+  reads join after it, in front of a linear layer.
+- **Right:** each level's gate after epoch 3 of slot 147.
+
+| part | trained parameters |
+|---|---:|
+| character embedding, 96 × 192 | 18,432 |
+| character GRU, 192 wide | 222,336 |
+| level 1 GRU, input 192, width 132 | 129,096 |
+| levels 2–10, GRUs 132 → 132, 105,336 each | 948,024 |
+| the levels' projections, 132 → 192 | 255,360 |
+| the levels' gates | 10 |
+| learned start states, 192 + 10 × 132 | 1,512 |
+| output layer, 192 → 96 | 18,528 |
+| **total** | **1,593,298** |
+
 The user's design is the tree of GRUs. The step rule, the carry and the
 read-down are the lead agent's choices, open to change.
 
@@ -87,6 +121,7 @@ Scripts here:
 - `steps_per_update.py` counts how often each level steps in a training
   update (`results/steps_per_update.txt`).
 - `env.sh` and `rss.py` wrap them in the machine's limits.
+- `draw_model.py` draws `model.svg`, the figure under Design.
 
 ## Results
 
