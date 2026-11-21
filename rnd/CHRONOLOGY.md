@@ -42,4 +42,4 @@ names its own data and prior.
 | 33 | 2026-11-20 | [depth-records-10.8m](depth-records-10.8m/) | Positive: depth records at 10.8M 2.8004, −0.65% ±0.11 against 2.8188. imm now trails the 10.8M transformer by 1.99%. |
 | 34 | 2026-11-20 | [attention-only-words](attention-only-words/) | Negative: attention alone (no GRU) scores 3.423 at epoch 3, 5.72 points behind slot 127. Mean word records lose at every cutoff: 0.68, 0.89 (rotated), 1.35 and 6.77 points behind A. |
 | 35 | 2026-11-20 | [reading-early](reading-early/) | Reference: in 8 pairs, gaps of about 1 point or more at epoch 3 kept their sign; smaller ones moved up to ~0.5. Learning rate and dropout need full runs. |
-| 36 | 2026-11-21 | [gru-tree](gru-tree/) | Planned: a GRU-only binary tree, 10 levels over the character GRU, built and tested (8818093); not yet run. |
+| 36 | 2026-11-21 | [gru-tree](gru-tree/) | Negative (slot 147, epoch 3): the 10-level tree 4.016 against a plain GRU of the same size 3.664 (+9.61%); only levels 1–2 open their gates. |

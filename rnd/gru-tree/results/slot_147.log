@@ -1,0 +1,31 @@
+slot 147 granted 2026-11-21T15:11:17-05:00
+code 8818093 0 changed files
+probe start 2026-11-21T15:11:17-05:00
+probe exit=0 2026-11-21T15:11:23-05:00
+normal segments=351382; worst window 864 characters; devices cuda
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak 1.42 GiB, 117 ms
+arm T: {'h': 192, 'levels': 10, 'width': 132} at cap 36864:    72.1 ms/update,  322.7k chars/s, peak 1.32 GiB (longest stream 498, 0 of 10 split); 3 epochs ~17 min, 8 ~0.7 h
+  the worst update (64 x 864) split at cap 36864: 2 groups, peak 1.26 GiB, 172 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 1.16 GiB, 38 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 1.16 GiB, 36 ms
+CHOICE arm=T cap=36864
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak 2.07 GiB, 49 ms
+arm G: {'h': 498, 'levels': 0, 'width': 0} at cap 36864:    40.3 ms/update,  579.5k chars/s, peak 1.92 GiB (longest stream 498, 0 of 10 split); 3 epochs ~9 min, 8 ~0.4 h
+  the worst update (64 x 864) split at cap 36864: 2 groups, peak 1.79 GiB, 100 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 1.55 GiB, 28 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 1.56 GiB, 28 ms
+CHOICE arm=G cap=36864
+capT=36864 capG=36864
+start imm pg19s100m_tree_h192_t10w132_np_doc_do0_bf16_e8s3 2026-11-21T15:11:23-05:00
+  args: --count-prior none --prior-residual-gate none --prior-input none --prior-residual-state-features= --prior-residual-scale 1.0 --prior-residual-l2 0.05 --train-streams 64 --eval-streams 64 --lr 1e-3 --segment-rule word --max-memory 128 --segments-per-update 64 --dropout 0.0 --lr-schedule cosine --min-lr 1e-4 --carry-bound gru --memory-state gru --prefetch-ahead 4 --documents data/pg19/imm-split-100m/manifest.json --epochs 8 --attention-layers 0 --no-word-records --hidden-size 192 --embedding-size 192 --tree-levels 10 --tree-width 132 --bf16 --max-update-chars 36864 --stop-after-epoch 3
+end imm pg19s100m_tree_h192_t10w132_np_doc_do0_bf16_e8s3 exit=0 2026-11-21T15:27:52-05:00 best_val_ppl=4.016
+char losses pg19s100m_tree_h192_t10w132_np_doc_do0_bf16_e8s3 (fp32) exit=0 char_losses heldout_ppl=4.0158 2026-11-21T15:28:35-05:00
+epoch=1 tree_gates=-0.2736,0.1312,0.0014,0.0003,0.0000,-0.0014,0.0002,-0.0011,-0.0005,0.0019
+epoch=2 tree_gates=-0.2667,0.1386,-0.0021,0.0000,0.0002,0.0043,-0.0023,-0.0003,-0.0066,0.0020
+epoch=3 tree_gates=-0.2669,0.1482,-0.0098,0.0011,0.0024,0.0025,-0.0027,0.0004,-0.0004,-0.0011
+start imm pg19s100m_gru_h498_np_doc_do0_bf16_e8s3 2026-11-21T15:28:35-05:00
+  args: --count-prior none --prior-residual-gate none --prior-input none --prior-residual-state-features= --prior-residual-scale 1.0 --prior-residual-l2 0.05 --train-streams 64 --eval-streams 64 --lr 1e-3 --segment-rule word --max-memory 128 --segments-per-update 64 --dropout 0.0 --lr-schedule cosine --min-lr 1e-4 --carry-bound gru --memory-state gru --prefetch-ahead 4 --documents data/pg19/imm-split-100m/manifest.json --epochs 8 --attention-layers 0 --no-word-records --hidden-size 498 --embedding-size 498 --bf16 --max-update-chars 36864 --stop-after-epoch 3
+end imm pg19s100m_gru_h498_np_doc_do0_bf16_e8s3 exit=0 2026-11-21T15:38:48-05:00 best_val_ppl=3.664
+char losses pg19s100m_gru_h498_np_doc_do0_bf16_e8s3 (fp32) exit=0 char_losses heldout_ppl=3.6636 2026-11-21T15:39:38-05:00
+ended 147 @imm
+slot ended 2026-11-21T15:39:38-05:00

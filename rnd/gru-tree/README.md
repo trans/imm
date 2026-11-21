@@ -1,18 +1,24 @@
 ---
 title:    A GRU-only binary tree
 kind:     experiment
-status:   running
-outcome:  n/a
+status:   concluded
+outcome:  negative
 question: >-
   Without attention or memory records, can a stack of GRUs, each level
   stepping half as often as the one below, carry the text's longer reach
   well enough to match imm's attention models at the same size?
-answer:   not yet run
+answer: >-
+  Not as built. At epoch 3 the tree scores 4.016 against 3.664 for a plain
+  character GRU of the same size (+9.61% ±0.13 per character), and only its
+  two lowest levels open their gates (−0.27 and +0.15); levels 3–10 stay
+  within ±0.01 of zero. Its loss is spelling (inside words +11.6%), which
+  its narrower character GRU (192 against 498) explains, and nothing late
+  in a piece improves.
 opened:   2026-11-21
 updated:  2026-11-21
 code:     branch gru-tree, 8818093 (from attention-only 15d1a41); flags --tree-levels N --tree-width W
 data:     PG-19 100M split (rnd/README.md)
-slots:    none yet
+slots:    147 (tag rnd/gru-tree/slot147 at 8818093)
 tags:     [hierarchy, gru, no-attention]
 related:  [attention-only-words, architecture-1.59m, simplified-no-words]
 ---
@@ -134,3 +140,58 @@ characters:
 - Level 8 steps once in 59% of updates.
 - Level 9 steps at most once, and level 10 not at all in 65% of updates.
 - So levels 9 and 10 never get gradient through their own recurrence.
+
+### 2026-11-21: the first screen, slot 147
+
+`tree_slot.sh 147` at `8818093`, granted 20:11 UTC, ended 20:39 UTC. The
+probe found both arms fit at the standard cap (64 × 576 characters):
+- T: 72 ms an update, peak 1.3 GiB;
+- G: 40 ms, peak 1.9 GiB.
+
+Held-out perplexity per character, each arm stopped after epoch 3 of 8:
+
+| arm | trained | e1 | e2 | e3 | train loss, end of e3 |
+|---|---:|---:|---:|---:|---:|
+| T: tree, h192, 10 levels × 132 | 1,593,298 | 4.260 | 4.088 | **4.016** | 1.3048 |
+| G: plain character GRU, h498 | 1,587,222 | 3.870 | 3.736 | **3.664** | 1.2062 |
+
+At epoch 3, for reference:
+
+| model | e3 |
+|---|---:|
+| slot 127, the full imm | 3.233 |
+| slot 130, depth records | 3.178 |
+| slot 142, attention alone | 3.423 |
+| slot 130, the character and word GRUs with their MLP blocks, no attention (1,067,069 trained) | 3.532 |
+
+**T against G** (`results/tree_vs_gru.txt`, T's change): +9.61% ±0.13.
+- The loss is spelling: inside words +11.64%, lowercase letters +13.25%
+  (98% of the gap), new words +13.81%.
+- Small gains where G is weakest: uppercase −4.82%, and characters the
+  prior finds hardest (its loss ≥ 3 nats) −2.8 to −7.6%.
+- No reach: the gap is +7.46% in a piece's first 256 characters and
+  +9.65% in its last 2,500; repeats more than 256 words back +11.45%.
+
+**The tree's gates** (tanh of each level's gate, level 1 first):
+
+```text
+epoch 1: -0.2736  0.1312  0.0014  0.0003  0.0000 -0.0014  0.0002 -0.0011 -0.0005  0.0019
+epoch 3: -0.2669  0.1482 -0.0098  0.0011  0.0024  0.0025 -0.0027  0.0004 -0.0004 -0.0011
+```
+
+Only levels 1 and 2 are read. Levels 3–7 step 3 to 45 times in every
+training update, so the ~364-character updates don't explain their closed
+gates.
+
+**Reading it** (the lead agent's, untested):
+- The model spent 1.33M of its 1.59M parameters on levels it doesn't
+  read, so T is in effect a 192-wide character GRU with two small levels,
+  and it loses to a 498-wide one at spelling.
+- **The levels have only a linear way in.** Each level's read is added to
+  the character GRU's state just before the output layer, which is
+  linear. The character GRU never reads the levels, and nothing
+  nonlinear combines them with it. Slot 130's GRU model, which had MLP
+  blocks between its state and the output, scored 3.532 with fewer
+  parameters than either arm here.
+- One seed; a screen.
+

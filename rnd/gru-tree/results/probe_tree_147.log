@@ -1,0 +1,13 @@
+normal segments=351382; worst window 864 characters; devices cuda
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak 1.42 GiB, 117 ms
+arm T: {'h': 192, 'levels': 10, 'width': 132} at cap 36864:    72.1 ms/update,  322.7k chars/s, peak 1.32 GiB (longest stream 498, 0 of 10 split); 3 epochs ~17 min, 8 ~0.7 h
+  the worst update (64 x 864) split at cap 36864: 2 groups, peak 1.26 GiB, 172 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 1.16 GiB, 38 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 1.16 GiB, 36 ms
+CHOICE arm=T cap=36864
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak 2.07 GiB, 49 ms
+arm G: {'h': 498, 'levels': 0, 'width': 0} at cap 36864:    40.3 ms/update,  579.5k chars/s, peak 1.92 GiB (longest stream 498, 0 of 10 split); 3 epochs ~9 min, 8 ~0.4 h
+  the worst update (64 x 864) split at cap 36864: 2 groups, peak 1.79 GiB, 100 ms
+  scoring's worst (64 x 864, no_grad, fp32): peak 1.55 GiB, 28 ms
+  scoring's worst (64 x 864, no_grad, bf16): peak 1.56 GiB, 28 ms
+CHOICE arm=G cap=36864
