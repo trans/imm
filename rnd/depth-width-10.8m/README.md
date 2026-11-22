@@ -20,7 +20,7 @@ code: >-
   branch depth-width 6ce0302: depth-records 5ae5c64 (slot 137's code) plus
   --stop-after-epoch, as 0ff2938 added it on attention-only.
 data:     PG-19 100M split (rnd/README.md), configs/pg19split100m_noprior.json
-slots:    [162]
+slots:    [162, 164]
 tags:     [depth, width, depth-records, scale, no-prior, screen]
 related:  [depth-records-10.8m, scale-10.8m, blocks-20m, half-lr-10.8m, reading-early]
 ---
@@ -147,6 +147,25 @@ trained.
     the speed, not the result.
   - `dw_slot.sh` stops if the probe puts the 3 epochs over 4 hours. A
     screen that slow waits for the user.
+
+### 2026-11-22: slot 164, the probe's cap search crashed
+
+The slot opened at 10:46 UTC. Nothing trained; the slot ended after 11
+seconds.
+
+- **The warm-up fit:** at 64 × 96 it peaked at 5.94 GiB, leaving about 1
+  GiB under the limit.
+- **Unsplit updates didn't:** every one from 64 × 576 down to 64 × 256 ran
+  out of GPU memory.
+- **Then the probe crashed.** It tests a cap of 64 × L with 64 streams that
+  are each a 64-segment window of at most L characters. 64 words don't fit
+  in under about 250 characters, so below 64 × 256 there was no window to
+  test with.
+- **Fixed** (the slot-164 version is in git at `0fed229`): a cap is now
+  tested the way the run uses it. Three updates of the text and the worst
+  update are each split at the cap, from 64 × 320 down to 64 × 64. The
+  warm-up is now 64 × 64. On the CPU, with a limit nothing meets, the
+  search runs to 64 × 64 and reports no cap.
 
 ## What we learned, or what's open
 

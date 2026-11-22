@@ -9,14 +9,20 @@ slot 137's 64 x 352. With the run's training text on the GPU (a
 out of GPU memory there, before the cap search. Most of an update's memory
 is attention scores, heads x records a character in every block, which
 width doesn't shrink, so 6 blocks need about twice 3 blocks' per character.
-The warm-up is now 64 x 96 and the search runs down to 64 x 64:
+The warm-up is now 64 x 96 and the search runs down to 64 x 64.
+
+After slot 164: the warm-up at 64 x 96 peaked at 5.94 GiB, every unsplit
+update from 64 x 576 to 64 x 256 ran out of memory, and the search then
+crashed: no 64-segment window is as short as 224 x 64 / 64 characters. So
+a cap is now tested the way the run uses it, by updates split at that cap:
 
   1. 3 warm-up updates on the 100M split's first 2M training characters,
-     at a small cap (64 x 96), so the carried word and character records
+     at a small cap (64 x 64), so the carried word and character records
      are full;
-  2. the cap: for 64 x L, L from 576 down to 64 by 32, one unsplit update
-     whose 64 streams are all a 64-segment window of at most L characters,
-     carried memory and all; the first L whose peak stays under LIMIT;
+  2. the cap: for 64 x L, L from 320 down to 64 by 32, 3 updates of the
+     usual text split at that cap, then the worst update (every stream the
+     training text's longest 64-segment window) split at that cap; the
+     first L whose peak stays under LIMIT throughout;
   3. 10 timed updates of the usual text at that cap (ms/update, peak, how
      many split), for the run's time;
   4. at that cap, the worst update (every stream the training text's
@@ -151,18 +157,33 @@ def probe(h, l, heads, tier, warm=3, timed_updates=10):
     memory = carried = None
     for u in range(warm):
         batch = [segs[u * 64 : (u + 1) * 64] for segs in stream_segments]
-        _, memory, carried, _ = step(model, opt, batch, memory, carried, STREAMS * 96)
-    print(f"  warm-up at cap {STREAMS} x 96: peak {peak():.2f} GiB", flush=True)
+        _, memory, carried, _ = step(model, opt, batch, memory, carried, STREAMS * 64)
+    print(f"  warm-up at cap {STREAMS} x 64: peak {peak():.2f} GiB", flush=True)
     name = f"h{h} L{l} heads{heads} tier{tier} depth"
     cap = None
-    for L in range(576, 63, -32):
-        batch_win, span = window_at_most(L)
-        out, ms_b, pk = try_peak(lambda: step(model, opt, [batch_win] * STREAMS, memory, carried))
-        print(f"  cap 64 x {L}: an unsplit update of {STREAMS} x {span} characters: peak {pk:.2f} GiB, {ms_b:.0f} ms", flush=True)
-        if out is not None:
-            _, memory, carried, _ = out
-        if pk < LIMIT:
-            cap = STREAMS * L
+    for L in range(320, 63, -32):
+        c = STREAMS * L
+        top, fits, groups = 0.0, True, []
+        for u in range(warm, warm + 3):
+            batch = [segs[u * 64 : (u + 1) * 64] for segs in stream_segments]
+            out, _, pk = try_peak(lambda: step(model, opt, batch, memory, carried, c))
+            top = max(top, pk)
+            if out is None:
+                fits = False
+                break
+            _, memory, carried, n = out
+            groups.append(n)
+        if fits:
+            out, _, pk = try_peak(lambda: step(model, opt, [worst] * STREAMS, memory, carried, c))
+            top = max(top, pk)
+            fits = out is not None
+            if fits:
+                _, memory, carried, n = out
+                groups.append(n)
+        print(f"  cap {STREAMS} x {L}: 3 updates of the text and the worst, split at the cap ({groups} groups): "
+              f"peak {top:.2f} GiB", flush=True)
+        if fits and top < LIMIT:
+            cap = c
             break
     if cap is None:
         print(f"  {name}: no cap fits", flush=True)
