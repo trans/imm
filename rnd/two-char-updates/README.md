@@ -152,7 +152,8 @@ gives the counting references. Stage 2: `sh rnd/two-char-updates/run2.sh`.
 Stage 3: `sh rnd/two-char-updates/run3.sh`; `tiny_levels.py`'s defaults
 still run stage 2. Stage 4: `sh rnd/two-char-updates/run4.sh`. Both at
 3e-4: `sh rnd/two-char-updates/run3-4_lr3e-4.sh`. The small GRU every 4:
-`sh rnd/two-char-updates/run3_h128.sh`.
+`sh rnd/two-char-updates/run3_h128.sh`. The distance table:
+`python3 pair_info.py > results/pair_info.txt`.
 
 ## Results
 
@@ -238,3 +239,25 @@ character after 2,000,000 training characters:
 - **The longer window pays:** the same-size GRU scores 6.179 updated every
   4 characters against 7.123 every 2 (−13.3%).
 - Time: ~1,770 s for each level-1 arm, ~1,205 s for each control.
+
+### 2026-11-21: reference, one character d back
+
+From the discussion of levels that each look only at the character d
+back. `pair_info.py` (`results/pair_info.txt`) measures how much the
+single character d back tells about the next one, on the same first 2M
+training characters. Each figure is the perplexity per character from
+knowing only that one character; knowing nothing gives 23.08.
+
+| d | 1 | 2 | 3 | 4 | 8 | 16 | 32 | 128 | 1,024 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| perplexity | 12.41 | 17.90 | 20.59 | 21.76 | 22.74 | 22.93 | 23.00 | 23.02 | 23.05 |
+
+- **Close by, characters count together.** Even if the four nearest
+  characters' effects simply added up (they needn't), they'd give
+  0.62 + 0.25 + 0.11 + 0.06 = 1.05 nats. Counting the four together gives
+  1.44 (23.08 → 5.47 held-out, `ngram_ref.txt`). That's a rough
+  comparison, not a bound.
+- **Far back, one character says almost nothing:** from 32 characters on,
+  it improves on chance by about 0.1%. What lasts that far lives in
+  combinations of characters (a name, a word), which no single character
+  carries.
