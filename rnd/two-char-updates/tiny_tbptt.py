@@ -64,6 +64,7 @@ def main() -> None:
     ap.add_argument("--embed", type=int, default=64)
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--clip", type=float, default=1.0)
+    ap.add_argument("--eval-group", type=int, default=10, help="held-out pieces scored at once (memory only)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--out", type=Path, required=True)
@@ -85,7 +86,7 @@ def main() -> None:
 
     log = {"args": {k: str(v) for k, v in vars(args).items()}, "params": params, "curve": []}
     print(f"window={args.window} lr={args.lr} params={params} pieces={len(starts)}", flush=True)
-    log["curve"].append({"chars": 0, "heldout_ppl": heldout_ppl(model, held), "sec": 0.0})
+    log["curve"].append({"chars": 0, "heldout_ppl": heldout_ppl(model, held, args.eval_group), "sec": 0.0})
     t0, seen, updates, next_eval = time.time(), 0, 0, args.eval_every
     train_nats, train_n = 0.0, 0
     for start, end in zip(starts, ends):
@@ -107,13 +108,13 @@ def main() -> None:
             train_nats += loss.item() * (b - a)
             train_n += b - a
             if seen >= next_eval:
-                row = {"chars": seen, "updates": updates, "heldout_ppl": heldout_ppl(model, held),
+                row = {"chars": seen, "updates": updates, "heldout_ppl": heldout_ppl(model, held, args.eval_group),
                        "train_ppl": math.exp(train_nats / train_n), "sec": round(time.time() - t0, 1)}
                 log["curve"].append(row)
                 print(json.dumps(row), flush=True)
                 train_nats, train_n = 0.0, 0
                 next_eval += args.eval_every
-    final = {"chars": seen, "updates": updates, "heldout_ppl": heldout_ppl(model, held), "sec": round(time.time() - t0, 1)}
+    final = {"chars": seen, "updates": updates, "heldout_ppl": heldout_ppl(model, held, args.eval_group), "sec": round(time.time() - t0, 1)}
     if log["curve"][-1]["chars"] != seen:
         log["curve"].append(final)
     log["final"] = final

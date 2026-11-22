@@ -1,7 +1,7 @@
 ---
 title:    Weight updates every two characters
 kind:     experiment
-status:   concluded
+status:   running
 outcome:  negative
 question: >-
   If a character GRU's weights are updated every 2 characters, so the error
@@ -80,6 +80,33 @@ own two steps (`tiny_levels.py`).
 - Each at learning rates 3e-5 and 1e-4, the two best for the 2-character
   GRU in stage 1.
 
+### Stage 3: both levels on one clock
+
+Stage 2's level 1 hurt. Was it the two clocks, or how level 1 is attached?
+The user asked for the test (`tiny_levels.py --char-window 4`):
+- **The model:** stage 2's (208,609 parameters), with both levels updated
+  together every 4 characters, from those 4 predictions. The character
+  GRU's error reaches back 4 steps, level 1's through its 2 steps.
+- **Only the clocks change:** level 1 still reads the character state
+  detached, and its read enters as before.
+- **The control:** a character GRU 215 (208,125) updated every 4
+  characters (`tiny_tbptt.py --window 4 --hidden 215`). The character
+  level now reaches back 4 steps, not 2, so stage 3 is read against its
+  own control, not against stage 2.
+- **Learning rates:** 3e-5 and 1e-4, with the next rate past either if a
+  best falls at the edge.
+- **Reading it:**
+  - If level 1 beats the control here, the separate clocks were the
+    trouble.
+  - If it still loses, the trouble is how level 1 is attached: its
+    detached read, or a read added in front of the output layer.
+- **Memory:** another project's 5 GB job runs alongside, so the arms run
+  two at a time, each about 0.9 GB (mostly PyTorch itself).
+  - Held-out pieces are scored 2 at a time instead of 10. That changes
+    only memory, not the numbers.
+  - A guard stops the run if the machine's available memory falls under
+    1.9 GB.
+
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/two-char-updates/run.sh` runs the six arms in
@@ -88,6 +115,8 @@ turn and writes `results/k<K>_lr<LR>.json` (the curve, the final score).
 seventh arm afterwards (window 2 at 3e-5, as its best rate was the lowest
 tried); `run.sh` lists it. `python3 ngram_ref.py > results/ngram_ref.txt`
 gives the counting references. Stage 2: `sh rnd/two-char-updates/run2.sh`.
+Stage 3: `sh rnd/two-char-updates/run3.sh`; `tiny_levels.py`'s defaults
+still run stage 2.
 
 ## Results
 
