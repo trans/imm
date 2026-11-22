@@ -219,9 +219,34 @@ same model with both levels updated together every 4 characters, against
 a character GRU updated every 4.
 
 
+### 2026-11-21: stage 3, both levels on one clock
+
+`run3.sh`, CPU, two lanes, 20:19–21:09 EST. Held-out perplexity per
+character after 2,000,000 training characters:
+
+| model | parameters | 3e-5 | 1e-4 |
+|---|---:|---:|---:|
+| character GRU 128 + level 1, both every 4 characters | 208,609 | 7.261 | **6.866** |
+| character GRU 215, every 4 characters (same size) | 208,125 | 6.647 | **6.179** |
+
+- **Level 1 still makes it worse with one clock:** +11.1% against the
+  same-size GRU at each one's best rate (+9.2% at 3e-5). The separate
+  clocks weren't the whole trouble.
+- **Both were best at the higher rate,** so this is not yet each one's
+  best: both also run at 3e-4 (`run3-4_lr3e-4.sh`), after stage 4.
+- **It learns worse here too:** the loss on the training text as it was
+  read, over the last 250,000 characters, 5.73 with level 1 against 5.14
+  without (1e-4).
+- **Its gate opens less:** tanh(g) held at 0.28–0.36 at 1e-4, and rose
+  only to 0.42 at 3e-5, against 0.68 with separate clocks (stage 2, 3e-5).
+- **The longer window pays:** the same-size GRU scores 6.179 updated every
+  4 characters against 7.123 every 2 (−13.3%).
+- Time: ~1,770 s for each level-1 arm, ~1,205 s for each control.
+
 ### 2026-11-21: stages 3 and 4, one clock, detached and attached
 
-CPU, 20:19–22:40 EST: `run3.sh`, `run4.sh`, `run3_h128.sh` and
+This completes stage 3 (its 3e-4 arms, and the 128 GRU alone) and adds
+stage 4. CPU, 20:19–22:40 EST: `run3.sh`, `run4.sh`, `run3_h128.sh` and
 `run3-4_lr3e-4.sh`. Every arm updates every 4 characters. Held-out
 perplexity per character after 2,000,000 training characters; every
 model's best rate is 1e-4, bracketed on both sides:
@@ -290,3 +315,15 @@ knowing only that one character; knowing nothing gives 23.08.
   it improves on chance by about 0.1%. What lasts that far lives in
   combinations of characters (a name, a word), which no single character
   carries.
+
+## What we learned, or what's open
+
+- Truncating the error to a few characters costs a lot (every 2 against
+  every 256: +24.3%), and the GRU learns only about as far back as its
+  window.
+- Level 1 on top of the character GRU, reading its state, harms it in
+  every form tried here: its own clock, one clock, detached or attached.
+  In these setups it never has anything the character GRU lacks, so the
+  tests can't show a hierarchy's gain, only its cost.
+- Open: a level that makes the prediction itself, so the work must be
+  divided (`rnd/pair-level`).
