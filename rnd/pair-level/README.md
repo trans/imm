@@ -1,7 +1,7 @@
 ---
 title:    Level 1 makes the prediction
 kind:     experiment
-status:   concluded
+status:   running
 outcome:  negative
 question: >-
   If level 1, a GRU stepping once every two characters, makes the
@@ -143,6 +143,24 @@ Scaled up in the same ratio to the GRU 128's compute (`run_compute.sh`):
   and 4 (3e-5, 1e-4, 3e-4). The GRU 128's runs are in hand.
 - Three lanes at once (another project's slot shares the machine), the
   short arms first.
+
+### Added after equal compute: equal wall-clock time
+
+The user asked for the speed comparison. At window 256 a pair arm took
+~146 s and the GRU 154 ~364 s, in the same lanes. So: how good is a pair
+model that trains in the GRU 154's time?
+- **Only at window 256.** At window 4 the two already take about the same
+  time (Python's overhead per update dominates), so the equal-time result
+  there is the one in hand (+15.3%).
+- **Sizing by timing** (`time_sizes.sh`): the widest shape's ratio (level
+  1 : decoder = 80 : 98) at a few scales, timed over the first 250,000
+  characters beside the GRU 154, three at once as before. The scale whose
+  time matches the GRU 154's is chosen.
+- **The run:** that size at 3e-4, 1e-3 and 3e-3, three at once, against
+  the GRU 154's 5.820 (and the GRU 128's 6.012). Same text, read once.
+- This is CPU, one stream. On a GPU with many streams the GRU's steps are
+  also sequential, so the speed gap may carry over, but its size there is
+  not measured.
 
 ## How to rerun
 
