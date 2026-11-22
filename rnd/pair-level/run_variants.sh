@@ -1,8 +1,8 @@
 #!/bin/sh
 # rnd/pair-level, the decoder screen: four shapes of the pair model at the
 # GRU 128's size, window 256, at 3e-4, 1e-3 and 3e-3. One lane a shape, its
-# three rates in turn: four lanes, ~0.7 GB each, CPU with the GPU hidden,
-# about 12 minutes. A guard stops the arms if the machine's available memory
+# three rates in turn, two lanes at a time (~0.7 GB each; other projects'
+# jobs share the memory), CPU with the GPU hidden, about 22 minutes. A guard stops the arms if the machine's available memory
 # falls under 1.9 GB.
 #   sh rnd/pair-level/run_variants.sh   (from the repo; writes results/)
 renice -n 19 -p $$ >/dev/null
@@ -40,10 +40,11 @@ lane u80_l64 --upper 80 --local 64 &
 a=$!
 lane u66_l80 --upper 66 --local 80 &
 b=$!
+wait $a $b
 lane u90_l42_feed --upper 90 --local 42 --feed &
 c=$!
 lane u75_l64_feed --upper 75 --local 64 --feed &
 d=$!
-wait $a $b $c $d
+wait $c $d
 kill $g 2>/dev/null
 echo "all done $(date -Iseconds)"
