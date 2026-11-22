@@ -20,7 +20,7 @@ code: >-
   branch depth-width 6ce0302: depth-records 5ae5c64 (slot 137's code) plus
   --stop-after-epoch, as 0ff2938 added it on attention-only.
 data:     PG-19 100M split (rnd/README.md), configs/pg19split100m_noprior.json
-slots:    []
+slots:    [162]
 tags:     [depth, width, depth-records, scale, no-prior, screen]
 related:  [depth-records-10.8m, scale-10.8m, blocks-20m, half-lr-10.8m, reading-early]
 ---
@@ -129,7 +129,24 @@ From a worktree at `rnd/depth-width-10.8m/slot<N>` (rnd/README.md), with
 
 ## Results
 
-None yet.
+### 2026-11-22: slot 162, out of GPU memory in the probe's warm-up
+
+The slot opened at 09:34 UTC. The probe ran out of GPU memory in its first
+warm-up updates at 64 × 288, before the cap search began. The GPU was
+otherwise empty (62 MiB in use), and the slot ended at once. Nothing
+trained.
+
+- **Why:** most of an update's memory is attention scores, heads × records
+  a character in every block, which a narrower width doesn't shrink. So 6
+  blocks need about twice the memory a character that 3 blocks do. Slot
+  137's 3 blocks already peaked at 6.78 GiB at 64 × 352.
+- **Fixed in the scripts** (the versions that ran in slot 162 are in git
+  at `96e059f`):
+  - The probe warms up at 64 × 96 and searches down to 64 × 64.
+  - The cap only splits an update into groups of streams, so it changes
+    the speed, not the result.
+  - `dw_slot.sh` stops if the probe puts the 3 epochs over 4 hours. A
+    screen that slow waits for the user.
 
 ## What we learned, or what's open
 

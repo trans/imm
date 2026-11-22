@@ -7,6 +7,7 @@
 # against slot 137's epoch 3, 2.9342 (epoch 2: 3.0100).
 #  1. probe_depth_width.py: the --max-update-chars cap under 6.9 GiB, the
 #     run's text on the GPU, and the time an update at that cap.
+#     (2026-11-22: stops if the 3 epochs would take over 4 hours.)
 #  2. the screen, at the cap; the epoch-3 best's per-character losses in fp32.
 # Fixed worktree $S/imm-dw at 6ce0302 (branch depth-width: depth-records
 # 5ae5c64 plus --stop-after-epoch).
@@ -55,6 +56,16 @@ case "$choice" in
 esac
 cap=$(echo "$choice" | sed 's/.*cap=\([0-9]*\).*/\1/')
 echo "cap=$cap"
+# A small cap splits every update into more groups, which is slower. Past 4
+# hours for the 3 epochs, stop: a screen that slow waits for the user.
+hours=$(grep -o '3 epochs ~[0-9.]* h' $S/dw/probe_$sid.log | head -1 | sed 's/3 epochs ~\([0-9.]*\) h/\1/')
+echo "3 epochs ~${hours} h at cap $cap"
+case "$hours" in
+  ''|*[!0-9.]*) echo "no time estimate: stopping"; finish 1 ;;
+esac
+if [ "$(echo "$hours > 4.0" | bc)" = 1 ]; then
+  echo "3 epochs would take ~${hours} h, over 4: stopping"; finish 1
+fi
 
 cfg=configs/pg19split100m_noprior.json
 base="--count-prior none --prior-residual-gate none --prior-input none --prior-residual-state-features= --prior-residual-scale 1.0 --prior-residual-l2 0.05 --train-streams 64 --eval-streams 64 --lr 1e-3 --segment-rule word --max-memory 128 --segments-per-update 64 --dropout 0.0 --lr-schedule cosine --min-lr 1e-4 --carry-bound gru --memory-state gru --prefetch-ahead 4 --tier-own-step --char-memory 1024 --documents data/pg19/imm-split-100m/manifest.json --epochs 8"

@@ -2,14 +2,19 @@
 imm: 6 blocks at width 344 (8 heads, word tier 301) with --depth-records,
 against slot 137's 3 blocks at 448. Twice the blocks, each writing its own
 records, so an update's activations grow and the cap must come down from
-slot 137's 64 x 352; the cap search runs down to 64 x 128. With the run's
-training text on the GPU (a 100M-long int64 tensor) and the limit 6.9 GiB
-in all:
+slot 137's 64 x 352. With the run's training text on the GPU (a
+100M-long int64 tensor) and the limit 6.9 GiB in all.
+
+2026-11-22, after slot 162: the first version warmed up at 64 x 288 and ran
+out of GPU memory there, before the cap search. Most of an update's memory
+is attention scores, heads x records a character in every block, which
+width doesn't shrink, so 6 blocks need about twice 3 blocks' per character.
+The warm-up is now 64 x 96 and the search runs down to 64 x 64:
 
   1. 3 warm-up updates on the 100M split's first 2M training characters,
-     at a small cap (64 x 288), so the carried word and character records
+     at a small cap (64 x 96), so the carried word and character records
      are full;
-  2. the cap: for 64 x L, L from 576 down to 128 by 32, one unsplit update
+  2. the cap: for 64 x L, L from 576 down to 64 by 32, one unsplit update
      whose 64 streams are all a 64-segment window of at most L characters,
      carried memory and all; the first L whose peak stays under LIMIT;
   3. 10 timed updates of the usual text at that cap (ms/update, peak, how
@@ -146,10 +151,11 @@ def probe(h, l, heads, tier, warm=3, timed_updates=10):
     memory = carried = None
     for u in range(warm):
         batch = [segs[u * 64 : (u + 1) * 64] for segs in stream_segments]
-        _, memory, carried, _ = step(model, opt, batch, memory, carried, STREAMS * 288)
+        _, memory, carried, _ = step(model, opt, batch, memory, carried, STREAMS * 96)
+    print(f"  warm-up at cap {STREAMS} x 96: peak {peak():.2f} GiB", flush=True)
     name = f"h{h} L{l} heads{heads} tier{tier} depth"
     cap = None
-    for L in range(576, 127, -32):
+    for L in range(576, 63, -32):
         batch_win, span = window_at_most(L)
         out, ms_b, pk = try_peak(lambda: step(model, opt, [batch_win] * STREAMS, memory, carried))
         print(f"  cap 64 x {L}: an unsplit update of {STREAMS} x {span} characters: peak {pk:.2f} GiB, {ms_b:.0f} ms", flush=True)
@@ -207,7 +213,7 @@ for cfg in configs:
     try:
         cap = probe(*cfg)
     except torch.OutOfMemoryError as e:
-        print(f"{cfg}: out of GPU memory in the normal updates ({str(e)[:100]})", flush=True)
+        print(f"{cfg}: out of GPU memory in the normal updates ({str(e)[:400]})", flush=True)
         reset_peak()
         cap = None
     if cap is not None:
