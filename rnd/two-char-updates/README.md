@@ -128,6 +128,19 @@ The user asked whether level 1 is held back by what it reads.
 - **When:** right after stage 3, two arms at ~0.9 GB with the same memory
   guard. There isn't room to run it beside stage 3.
 
+### Added after stages 3–4: the small GRU every 4 characters
+
+Stage 2 showed level 1 *harms* by comparing it with the 128-wide character
+GRU it sits on, alone. Stages 3–4 had only the same-size control, which
+can't tell harm from a level that is merely useless (the wider GRU may
+just use the parameters better). So the 128-wide GRU alone, updated every
+4 characters (`tiny_tbptt.py --window 4`, 93,024 parameters), runs at 3e-5,
+1e-4 and 3e-4 (`run3_h128.sh`).
+- If the levels model beats it, level 1 adds something, just less than
+  widening the GRU does.
+- If it matches it, level 1 is useless.
+- If it loses to it, level 1 harms, as in stage 2.
+
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/two-char-updates/run.sh` runs the six arms in
@@ -138,7 +151,8 @@ tried); `run.sh` lists it. `python3 ngram_ref.py > results/ngram_ref.txt`
 gives the counting references. Stage 2: `sh rnd/two-char-updates/run2.sh`.
 Stage 3: `sh rnd/two-char-updates/run3.sh`; `tiny_levels.py`'s defaults
 still run stage 2. Stage 4: `sh rnd/two-char-updates/run4.sh`. Both at
-3e-4: `sh rnd/two-char-updates/run3-4_lr3e-4.sh`.
+3e-4: `sh rnd/two-char-updates/run3-4_lr3e-4.sh`. The small GRU every 4:
+`sh rnd/two-char-updates/run3_h128.sh`.
 
 ## Results
 

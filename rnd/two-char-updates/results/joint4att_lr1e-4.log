@@ -1,0 +1,9 @@
+levels: hidden=128 width=128 char_window=4 level_window=4 attach=True lr=0.0001 params=208609 pieces=80
+{"chars": 250002, "char_updates": 62503, "level_updates": 62503, "heldout_ppl": 9.701162868285724, "train_ppl": 9.626439162829609, "gate": 0.3561, "sec": 196.3}
+{"chars": 500000, "char_updates": 125005, "level_updates": 125005, "heldout_ppl": 7.929738395497901, "train_ppl": 6.760168499172054, "gate": 0.3364, "sec": 398.1}
+{"chars": 750002, "char_updates": 187508, "level_updates": 187508, "heldout_ppl": 7.46482428305788, "train_ppl": 6.4130816638107415, "gate": 0.3281, "sec": 600.7}
+{"chars": 1000000, "char_updates": 250010, "level_updates": 250010, "heldout_ppl": 7.280754010370879, "train_ppl": 6.263060040913872, "gate": 0.3157, "sec": 798.1}
+{"chars": 1250002, "char_updates": 312513, "level_updates": 312513, "heldout_ppl": 6.896496566314824, "train_ppl": 6.099925053095432, "gate": 0.3022, "sec": 996.7}
+{"chars": 1500000, "char_updates": 375015, "level_updates": 375015, "heldout_ppl": 7.316712522614347, "train_ppl": 5.6691488636339935, "gate": 0.3049, "sec": 1189.3}
+{"chars": 1750002, "char_updates": 437518, "level_updates": 437518, "heldout_ppl": 6.917182247321387, "train_ppl": 5.779791518155961, "gate": 0.3011, "sec": 1384.5}
+final {"chars": 1999920, "char_updates": 500000, "level_updates": 500000, "heldout_ppl": 6.953431866497151, "gate": 0.3041, "sec": 1617.4}
