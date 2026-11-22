@@ -180,6 +180,15 @@ parameters) should take about the GRU 154's time. It runs at 3e-4, 1e-3
 and 3e-3, three at once as the GRU 154 did (`run_time.sh`), plus the next
 rate past an edge best. Its actual times are reported beside the GRU's.
 
+### Added after the first equal-time arms: timing under the same load
+
+The pair arms at level 1 280 / decoder 343 took ~460 s, against the GRU
+154's ~364 s. They ran three big models at once, under a different load
+from the GRU 154's arms, so the time wasn't equal. So the GRU 154, that
+pair model and the next size down (240 / 294) run side by side at 1e-3
+(`run_time_check.sh`). The two repeats should reproduce their scores; the
+times taken together decide which pair size matches.
+
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/pair-level/run.sh`. It writes
@@ -187,7 +196,7 @@ From the repo, on CPU: `sh rnd/pair-level/run.sh`. It writes
 for each arm. `tiny_pairs.py --help` gives the single-arm flags. The by-place reruns:
 `sh rnd/pair-level/run_by_place.sh`. The shapes: `sh rnd/pair-level/run_variants.sh`. Equal compute:
 `sh rnd/pair-level/run_compute.sh`. Equal time: `sh rnd/pair-level/time_sizes.sh`, then
-`sh rnd/pair-level/run_time.sh`.
+`sh rnd/pair-level/run_time.sh` and `sh rnd/pair-level/run_time_check.sh`.
 
 ## Results
 
