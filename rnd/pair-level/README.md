@@ -124,12 +124,30 @@ The user approved the three follow-ups.
   so it is read against both: the GRU of equal compute (128) and of
   equal size.
 
+### Added after the screen: the equal-compute arms
+
+The screen's best shape was the widest decoder, level 1 66 and decoder 80
+(6.961; level 1 75 and decoder 64 with feed was within noise, 6.971).
+Scaled up in the same ratio to the GRU 128's compute (`run_compute.sh`):
+
+| model | width | parameters | multiply-adds a character |
+|---|---|---:|---:|
+| pair model | level 1 80, decoder 98 | 122,266 | 85,916 |
+| character GRU, equal compute | 128 | 93,024 | 86,016 |
+| character GRU, equal size | 154 | 122,664 | 115,500 |
+
+- The pair model and the GRU 154 run at windows 256 (3e-4, 1e-3, 3e-3)
+  and 4 (3e-5, 1e-4, 3e-4). The GRU 128's runs are in hand.
+- Three lanes at once (another project's slot shares the machine), the
+  short arms first.
+
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/pair-level/run.sh`. It writes
 `results/w<window>_lr<rate>.json` (the curve, the final score) and a log
 for each arm. `tiny_pairs.py --help` gives the single-arm flags. The by-place reruns:
-`sh rnd/pair-level/run_by_place.sh`. The shapes: `sh rnd/pair-level/run_variants.sh`.
+`sh rnd/pair-level/run_by_place.sh`. The shapes: `sh rnd/pair-level/run_variants.sh`. Equal compute:
+`sh rnd/pair-level/run_compute.sh`.
 
 ## Results
 
