@@ -1,7 +1,7 @@
 ---
 title:    Weight updates every two characters
 kind:     experiment
-status:   running
+status:   concluded
 outcome:  negative
 question: >-
   If a character GRU's weights are updated every 2 characters, so the error
@@ -14,6 +14,9 @@ answer: >-
   updated on its own two steps, makes it worse: 8.165, +9.3% against the
   2-character GRU alone and +14.6% against one of the same size (7.123),
   though its gate opens to 0.68. It is worse on the training text too.
+  Stages 3–4: with both levels updated together every 4 characters,
+  level 1 still harms the GRU under it (6.866 against 6.523, +5.2%), and
+  attaching it so its error trains that GRU changes almost nothing (6.953).
 opened:   2026-11-21
 updated:  2026-11-21
 code:     standalone, this directory (tiny_tbptt.py); no branch
@@ -216,29 +219,55 @@ same model with both levels updated together every 4 characters, against
 a character GRU updated every 4.
 
 
-### 2026-11-21: stage 3, both levels on one clock
+### 2026-11-21: stages 3 and 4, one clock, detached and attached
 
-`run3.sh`, CPU, two lanes, 20:19–21:09 EST. Held-out perplexity per
-character after 2,000,000 training characters:
+CPU, 20:19–22:40 EST: `run3.sh`, `run4.sh`, `run3_h128.sh` and
+`run3-4_lr3e-4.sh`. Every arm updates every 4 characters. Held-out
+perplexity per character after 2,000,000 training characters; every
+model's best rate is 1e-4, bracketed on both sides:
 
-| model | parameters | 3e-5 | 1e-4 |
-|---|---:|---:|---:|
-| character GRU 128 + level 1, both every 4 characters | 208,609 | 7.261 | **6.866** |
-| character GRU 215, every 4 characters (same size) | 208,125 | 6.647 | **6.179** |
+| model | parameters | 3e-5 | 1e-4 | 3e-4 |
+|---|---:|---:|---:|---:|
+| character GRU 128 alone | 93,024 | 7.136 | **6.523** | 6.816 |
+| the same + level 1, detached (stage 3) | 208,609 | 7.261 | **6.866** | 7.307 |
+| the same + level 1, attached (stage 4) | 208,609 | 7.272 | **6.953** | 7.212 |
+| character GRU 215 alone (same size) | 208,125 | 6.647 | **6.179** | 6.726 |
 
-- **Level 1 still makes it worse with one clock:** +11.1% against the
-  same-size GRU at each one's best rate (+9.2% at 3e-5). The separate
-  clocks weren't the whole trouble.
-- **Both were best at the higher rate,** so this is not yet each one's
-  best: both also run at 3e-4 (`run3-4_lr3e-4.sh`), after stage 4.
-- **It learns worse here too:** the loss on the training text as it was
-  read, over the last 250,000 characters, 5.73 with level 1 against 5.14
-  without (1e-4).
-- **Its gate opens less:** tanh(g) held at 0.28–0.36 at 1e-4, and rose
-  only to 0.42 at 3e-5, against 0.68 with separate clocks (stage 2, 3e-5).
-- **The longer window pays:** the same-size GRU scores 6.179 updated every
-  4 characters against 7.123 every 2 (−13.3%).
-- Time: ~1,770 s for each level-1 arm, ~1,205 s for each control.
+- **Level 1 harms the GRU it sits on, with one clock too:** +5.2%
+  detached and +6.6% attached, against that GRU alone. Against the
+  same-size GRU, +11.1% and +12.5%.
+- **Neither the clocks nor the detach is the cause:**
+  - With separate clocks (stage 2) the harm was +9.3%. At a 2-character
+    window, though, so the size isn't comparable.
+  - Attaching changes almost nothing: the two curves and gates nearly
+    overlap (6.953 against 6.866, +1.3%). Level 1's path sends the
+    character GRU little gradient.
+- **It learns worse, not just generalises worse:** the loss on the
+  training text as it was read, over the last 250,000 characters, 5.73
+  detached and 5.78 attached, against 5.61 for the GRU alone (1e-4).
+- **Its gate opens less with one clock,** and less the faster it learns:
+  tanh(g) ends at 0.42 (3e-5), 0.28 (1e-4) and 0.15 (3e-4), against 0.68
+  with separate clocks (stage 2, 3e-5).
+- **The longer window pays:** the same-size GRU scores 6.179 updated
+  every 4 characters against 7.123 every 2 (−13.3%).
+- Time, 2–5 arms at once: ~1,620–1,780 s for a level-1 arm (~2,540 s at
+  3e-4, five at once), ~1,205–1,260 s for the same-size GRU, ~1,450 s for
+  the 128 GRU (five at once).
+- Each process opened a CUDA context through torch's Adam step, which
+  held another project's slot; the scripts now hide the GPU (`bd646b2`).
+
+**Reading it** (the lead agent's, untested): in these setups level 1
+never has anything the character GRU lacks. It reads the character state,
+and with one clock its error reaches no further in characters than the
+character GRU's own. So the best it could do is nothing; that it harms
+suggests the extra path makes learning worse. Triplets, the user's next
+step if pairs showed any gain, are not run. Ideas raised in the
+discussion, none run:
+- Level 1 making the prediction itself, with a small character decoder
+  for each pair and no character state carried between pairs (as
+  MEGABYTE does), so the levels must divide the work.
+- Keeping the tree's nodes so a query can search them, instead of
+  reading each level's latest state.
 
 ### 2026-11-21: reference, one character d back
 
