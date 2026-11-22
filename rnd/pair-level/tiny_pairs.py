@@ -13,7 +13,9 @@ character decoder that spells out each pair. See README.md.
   - its first step (a learned start input) predicts character 2j+2;
   - its second step, reading that character, predicts character 2j+3.
   It starts afresh for every pair, so nothing passes from pair to pair
-  except through the upper GRU.
+  except through the upper GRU. With --feed, a projection of the upper
+  state is also added to the decoder's input at both steps, as MEGABYTE
+  adds its global model's output to each local input.
 - Updates every --window characters (even), from those predictions. The
   upper state is carried, detached at each update, and reset to zeros at a
   piece's start; its error reaches back --window / 2 of its steps.
@@ -43,7 +45,7 @@ DATA = REPO / "data/pg19/imm-split-100m"
 
 
 class PairGRU(nn.Module):
-    def __init__(self, vocab: int, embed: int, upper: int, local: int) -> None:
+    def __init__(self, vocab: int, embed: int, upper: int, local: int, feed: bool = False) -> None:
         super().__init__()
         self.embed = nn.Embedding(vocab, embed)
         self.upper = nn.GRU(2 * embed, upper, batch_first=True)
@@ -52,6 +54,7 @@ class PairGRU(nn.Module):
         self.local = nn.GRU(embed, local, batch_first=True)
         self.head = nn.Linear(local, vocab)
         self.upper_width = upper
+        self.feed = nn.Linear(upper, embed) if feed else None  # made last: without it, the same init as before
 
     def pair_inputs(self, pairs):  # [B, P, 2] -> [B, P, 2E]
         e = self.embed(pairs)
@@ -64,7 +67,10 @@ class PairGRU(nn.Module):
         h0 = torch.tanh(self.init(before)).reshape(1, B * P, -1)
         first = self.start.expand(B * P, 1, -1)
         second = self.embed(pairs[:, :, 0]).reshape(B * P, 1, -1)
-        out, _ = self.local(torch.cat([first, second], dim=1), h0)  # [B*P, 2, L]
+        steps = torch.cat([first, second], dim=1)  # [B*P, 2, E]
+        if self.feed is not None:
+            steps = steps + self.feed(before).reshape(B * P, 1, -1)
+        out, _ = self.local(steps, h0)  # [B*P, 2, L]
         return self.head(out).reshape(B, 2 * P, -1)
 
     def forward(self, pairs, u0):
@@ -113,6 +119,7 @@ def main() -> None:
     ap.add_argument("--embed", type=int, default=64)
     ap.add_argument("--upper", type=int, default=96, help="the upper GRU's width")
     ap.add_argument("--local", type=int, default=42, help="the decoder GRU's width")
+    ap.add_argument("--feed", action="store_true", help="add the upper state, projected, to each decoder input")
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--eval-group", type=int, default=2, help="held-out pieces scored at once (memory only)")
     ap.add_argument("--seed", type=int, default=1)
@@ -133,12 +140,12 @@ def main() -> None:
     ends = starts[1:] + [args.train_chars]
     assert all((e - s) % 2 == 0 for s, e in zip(starts, ends)), "pieces must have an even length"
 
-    model = PairGRU(len(vocab), args.embed, args.upper, args.local)
+    model = PairGRU(len(vocab), args.embed, args.upper, args.local, args.feed)
     params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     log = {"args": {k: str(v) for k, v in vars(args).items()}, "params": params, "curve": []}
-    print(f"pairs: window={args.window} upper={args.upper} local={args.local} lr={args.lr} params={params} pieces={len(starts)}", flush=True)
+    print(f"pairs: window={args.window} upper={args.upper} local={args.local} feed={args.feed} lr={args.lr} params={params} pieces={len(starts)}", flush=True)
     log["curve"].append({"chars": 0, "heldout_ppl": heldout_ppl(model, held, args.eval_group), "sec": 0.0})
     t0, seen, updates, next_eval = time.time(), 0, 0, args.eval_every
     train_nats, train_n = 0.0, 0

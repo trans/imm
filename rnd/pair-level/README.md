@@ -1,7 +1,7 @@
 ---
 title:    Level 1 makes the prediction
 kind:     experiment
-status:   concluded
+status:   running
 outcome:  negative
 question: >-
   If level 1, a GRU stepping once every two characters, makes the
@@ -99,12 +99,37 @@ second, which also reads the first? Both best 256-window arms run again
 are also given over even and odd places: a pair's first and second
 character. The rerun should reproduce each final score.
 
+### Added after the by-place scores: the decoder, and equal compute
+
+The user approved the three follow-ups.
+- **The screen, at window 256** (`run_variants.sh`): four shapes, each at
+  the GRU 128's size, at 3e-4, 1e-3 and 3e-3. Against the first pair
+  model (u96/l42, 7.261) and the GRU (6.012):
+
+  | shape | level 1 | decoder | feed | parameters | multiply-adds a character |
+  |---|---:|---:|:---:|---:|---:|
+  | wider decoder | 80 | 64 | | 92,992 | 58,240 |
+  | wider still | 66 | 80 | | 93,192 | 64,086 |
+  | feed | 90 | 42 | yes | 92,990 | 51,588 |
+  | both | 75 | 64 | yes | 93,261 | 58,358 |
+
+  - "Feed" (`--feed`) adds a projection of level 1's state to the
+    decoder's input at both steps, as MEGABYTE adds its global output to
+    each local input. Without it, level 1's state only starts the decoder.
+  - Each shape passes the leak and windowed-equals-whole checks. The
+    first pair model starts from the same weights as before.
+- **Equal compute:** the best shape, scaled up to the GRU 128's ~86k
+  multiply-adds a character (the first pair model did ~52k), at windows
+  256 and 4, at the same rates. It is larger than the GRU in parameters,
+  so it is read against both: the GRU of equal compute (128) and of
+  equal size.
+
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/pair-level/run.sh`. It writes
 `results/w<window>_lr<rate>.json` (the curve, the final score) and a log
 for each arm. `tiny_pairs.py --help` gives the single-arm flags. The by-place reruns:
-`sh rnd/pair-level/run_by_place.sh`.
+`sh rnd/pair-level/run_by_place.sh`. The shapes: `sh rnd/pair-level/run_variants.sh`.
 
 ## Results
 
