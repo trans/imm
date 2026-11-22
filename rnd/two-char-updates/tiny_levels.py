@@ -1,9 +1,11 @@
 """The tiny character GRU of tiny_tbptt.py with level 1 on top. By default
 each level is updated on its own two steps (README.md, stage 2); with
---char-window 4 both are updated together every 4 characters (stage 3).
+--char-window 4 both are updated together every 4 characters (stage 3);
+adding --attach lets level 1's error flow into the character GRU (stage 4).
 
   python3 tiny_levels.py --lr 1e-4 --train-chars 2000000 --out run.json
   python3 tiny_levels.py --char-window 4 --lr 1e-4 --train-chars 2000000 --out run.json
+  python3 tiny_levels.py --char-window 4 --attach --lr 1e-4 --train-chars 2000000 --out run.json
 
 - The character GRU steps at every character. Its weights (with the
   embedding and the output layer) are updated every --char-window
@@ -14,9 +16,11 @@ each level is updated on its own two steps (README.md, stage 2); with
   (with its read's projection and gate) are updated every --level-window
   characters (default 4: every 2 of its own steps, at every other character
   update), from those predictions; its error reaches back through its steps
-  in that window. It can't reach into the character GRU: with the defaults,
-  those weights change between its two steps (stage 3 keeps the detach, so
-  only the clocks change).
+  in that window. By default it can't reach into the character GRU: with
+  the default windows, those weights change between its two steps (stage 3
+  keeps the detach, so only the clocks change). With --attach (only when
+  both windows are equal) it reads the character state undetached, so its
+  error also trains the character GRU, back to the update's start.
 - Each prediction at p adds level 1's state after its latest step at or
   before p, projected and times tanh(gate) (gate starts at 0), to the
   character GRU's state, in front of the output layer (as gru-tree does).
@@ -90,6 +94,7 @@ def main() -> None:
     ap.add_argument("--width", type=int, default=128, help="level 1's width")
     ap.add_argument("--char-window", type=int, default=2, help="characters a character-level update")
     ap.add_argument("--level-window", type=int, default=4, help="characters a level-1 update (a multiple of --char-window)")
+    ap.add_argument("--attach", action="store_true", help="level 1's error flows into the character GRU (needs equal windows)")
     ap.add_argument("--eval-group", type=int, default=10, help="held-out pieces scored at once (memory only)")
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=1)
@@ -98,6 +103,7 @@ def main() -> None:
     args = ap.parse_args()
     kc, kl = args.char_window, args.level_window
     assert kc >= 1 and kl % kc == 0, "--level-window must be a multiple of --char-window"
+    assert not args.attach or kc == kl, "--attach needs --level-window equal to --char-window"
 
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
@@ -118,7 +124,7 @@ def main() -> None:
         return round(math.tanh(model.gate.item()), 4)
 
     log = {"args": {k: str(v) for k, v in vars(args).items()}, "params": params, "curve": []}
-    print(f"levels: hidden={args.hidden} width={args.width} char_window={kc} level_window={kl} lr={args.lr} params={params} pieces={len(starts)}", flush=True)
+    print(f"levels: hidden={args.hidden} width={args.width} char_window={kc} level_window={kl} attach={args.attach} lr={args.lr} params={params} pieces={len(starts)}", flush=True)
     log["curve"].append({"chars": 0, "heldout_ppl": heldout_ppl(model, held, args.eval_group), "gate": gate(), "sec": 0.0})
     t0, seen, char_updates, level_updates, next_eval = time.time(), 0, 0, 0, args.eval_every
     train_nats, train_n = 0.0, 0
@@ -132,7 +138,8 @@ def main() -> None:
             reads = []
             for j in range(b - a):
                 if (a - start + j) % 2 == 1:  # level 1 steps at odd p
-                    _, s = model.level1(out[:, j : j + 1].detach(), s)
+                    read_in = out[:, j : j + 1]
+                    _, s = model.level1(read_in if args.attach else read_in.detach(), s)
                 reads.append(s[0])
             logits = model.logits(out, torch.stack(reads, dim=1))
             loss = nn.functional.cross_entropy(logits[0], train[a + 1 : b + 1])

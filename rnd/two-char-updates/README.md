@@ -107,6 +107,27 @@ The user asked for the test (`tiny_levels.py --char-window 4`):
   - A guard stops the run if the machine's available memory falls under
     1.9 GB.
 
+### Stage 4: level 1 attached
+
+The user asked whether level 1 is held back by what it reads.
+- **What it reads:** every second character, the character state, which
+  with these short windows is a blend of about the last 2–3 characters.
+- **Why that's the attachment:** detached, the character level alone
+  decides what's in that state, for its own next prediction.
+- **The test (the user's choice, `tiny_levels.py --char-window 4
+  --attach`):** stage 3's model, with level 1 reading the character state
+  undetached. Level 1's error then also trains the character GRU, back to
+  the update's start (4 characters), so level 1 can shape its own input.
+  - Checked on one window with the gate open: detached, level 1 sends no
+    gradient into the character GRU; attached, it does.
+- **Against what:** stage 3's control (GRU 215 every 4) and its detached
+  model, at the same rates (3e-5, 1e-4).
+- **Next, if pairs show any gain** (the user's plan): level 1 stepping
+  every 3rd character, for comparison. Pairs cut across words, so later
+  steps have to build on them, but they can pick up morpheme-sized pieces.
+- **When:** right after stage 3, two arms at ~0.9 GB with the same memory
+  guard. There isn't room to run it beside stage 3.
+
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/two-char-updates/run.sh` runs the six arms in
@@ -116,7 +137,7 @@ seventh arm afterwards (window 2 at 3e-5, as its best rate was the lowest
 tried); `run.sh` lists it. `python3 ngram_ref.py > results/ngram_ref.txt`
 gives the counting references. Stage 2: `sh rnd/two-char-updates/run2.sh`.
 Stage 3: `sh rnd/two-char-updates/run3.sh`; `tiny_levels.py`'s defaults
-still run stage 2.
+still run stage 2. Stage 4: `sh rnd/two-char-updates/run4.sh`.
 
 ## Results
 
