@@ -1,7 +1,7 @@
 ---
 title:    Level 1 makes the prediction
 kind:     experiment
-status:   running
+status:   concluded
 outcome:  negative
 question: >-
   If level 1, a GRU stepping once every two characters, makes the
@@ -16,8 +16,11 @@ answer: >-
   long window helps it a little more (−9.0% against −7.8%), from a much
   worse start. Most of the loss is in each pair's second character (+25.7%,
   against +16.1% for the first), which points at the narrow decoder.
+  Widening the decoder helps most (6.961 at window 256), but at the GRU
+  128's compute the pair model still loses: 6.753 against 6.012 (+12.3%),
+  and +16.0% against a GRU of its own size (5.820).
 opened:   2026-11-21
-updated:  2026-11-21
+updated:  2026-11-22
 code:     standalone, this directory (tiny_pairs.py); no branch
 data:     PG-19 100M split (rnd/README.md), its first 2M training characters
 slots:    none (CPU, ~0.7 GB an arm, GPU hidden)
@@ -194,15 +197,73 @@ stage 1). The final held-out scores by place:
 - **The first character is +16% worse too,** so level 1 is short as well,
   or that same narrow path is.
 
+### 2026-11-21: the decoder screen, window 256
+
+`run_variants.sh`, CPU, two lanes, 23:38–23:52 EST. Every shape is the
+GRU 128's size and best at 1e-3, bracketed by 3e-4 and 3e-3. Held-out
+perplexity per character after 2,000,000 training characters, and by
+place in the pair at the best rate:
+
+| shape | level 1 | decoder | feed | 3e-4 | 1e-3 | 3e-3 | first | second |
+|---|---:|---:|:---:|---:|---:|---:|---:|---:|
+| first pair model | 96 | 42 | | 8.196 | **7.261** | 7.655 | 6.926 | 7.613 |
+| wider decoder | 80 | 64 | | 7.963 | **6.998** | 7.315 | 6.737 | 7.268 |
+| wider still | 66 | 80 | | 7.856 | **6.961** | 7.164 | 6.857 | 7.067 |
+| feed | 90 | 42 | yes | 8.139 | **7.105** | 7.690 | 6.828 | 7.393 |
+| both | 75 | 64 | yes | 7.846 | **6.971** | 7.433 | 6.776 | 7.171 |
+| character GRU 128 | | | | 6.699 | **6.012** | 6.430 | 5.966 | 6.059 |
+
+- **Widening the decoder helps most:** 7.261 → 6.998 → 6.961. It also
+  closes most of the gap between a pair's first and second character.
+- **Feeding level 1's state into every step helps a little:** 7.261 →
+  7.105 with the narrow decoder, 6.998 → 6.971 with the wider one.
+- **The best two are tied within noise** (6.961, 6.971). Both are still
+  about 16% behind the GRU.
+- Time: ~131–146 s an arm.
+
+### 2026-11-21/22: equal compute
+
+`run_compute.sh`, CPU, three lanes, 23:53–00:38 EST. The widest shape
+scaled to the GRU 128's compute (level 1 80, decoder 98), against the GRU
+of equal compute (128) and of equal size (154). Each best rate is
+bracketed:
+
+| window | model | parameters | multiply-adds a character | rates | scores | best |
+|---:|---|---:|---:|---|---|---:|
+| 256 | pair model | 122,266 | 85,916 | 3e-4, 1e-3, 3e-3 | 7.532, 6.753, 6.988 | **6.753** |
+| 256 | GRU 128 | 93,024 | 86,016 | the same | 6.699, 6.012, 6.430 | **6.012** |
+| 256 | GRU 154 | 122,664 | 115,500 | the same | 6.530, 5.820, 6.356 | **5.820** |
+| 4 | pair model | 122,266 | 85,916 | 3e-5, 1e-4, 3e-4 | 8.340, 7.405, 7.538 | **7.405** |
+| 4 | GRU 128 | 93,024 | 86,016 | the same | 7.136, 6.523, 6.816 | **6.523** |
+| 4 | GRU 154 | 122,664 | 115,500 | the same | 6.955, 6.422, 6.794 | **6.422** |
+
+- **At equal compute the pair model still loses:** +12.3% at window 256
+  and +13.5% at 4, against the GRU 128. Against the GRU of its own size,
+  +16.0% and +15.3%.
+- **It gains from size and window about as the GRU does:**
+  - From 93k to 122k parameters: −3.0% (6.961 → 6.753), against −3.2%
+    for the GRU (128 → 154).
+  - From window 4 to 256: −8.8%, against −9.4% for the GRU 154.
+  - So no sign that its cheaper reach pays.
+- **It learns worse, not just generalises worse:** the loss on the
+  training text over the last 250,000 characters, 6.16 against 5.19 for
+  the GRU 154 (window 256, 1e-3).
+- **Its one advantage is speed:** at window 256 an arm took ~146 s,
+  against ~364 s for the GRU 154 in the same lanes. It has half the
+  sequential steps, and the pairs decode in parallel. At window 4, Python
+  overhead evens them out (~1,045 s against ~1,100 s).
+- The two places in a pair are now close for the pair model (6.619 and
+  6.889 at window 256), as for the GRU (5.770 and 5.870).
+
 ## What we learned, or what's open
 
-- Making level 1 the only way to the prediction, at the same size, costs
-  about a fifth. A hierarchy that forces the work to be divided does
-  divide it, but this one pays for it in every prediction.
-- Open, none run:
-  - a wider decoder and a narrower level 1 at the same size;
-  - level 1's state fed into every decoder step, as MEGABYTE adds its
-    global output to each local input, not just used to start it;
-  - comparing at the same compute rather than the same parameters (the
-    pair model does about 60% of the GRU's arithmetic a character: ~52k
-    multiply-adds against ~86k).
+- Making level 1 the only way to the prediction costs every prediction
+  something, at equal size and at equal compute. A hierarchy that forces
+  the work to be divided does divide it, but this one pays for it.
+- The decoder's width mattered most: from 7.261 to 6.961 at the same size.
+  At the GRU's compute the gap is +12.3% (window 256).
+- Its cheaper reach didn't show: a long window helps it no more than it
+  helps the GRU.
+- Its speed did: about 2.5 times faster an arm at window 256 than a GRU of
+  its size, here on CPU. At equal wall-clock time it could be bigger. That
+  comparison isn't run.
