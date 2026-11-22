@@ -1,8 +1,8 @@
 ---
 title:    Level 1 makes the prediction
 kind:     experiment
-status:   running
-outcome:  negative
+status:   concluded
+outcome:  mixed
 question: >-
   If level 1, a GRU stepping once every two characters, makes the
   prediction itself through a small character decoder for each pair, with
@@ -18,7 +18,9 @@ answer: >-
   against +16.1% for the first), which points at the narrow decoder.
   Widening the decoder helps most (6.961 at window 256), but at the GRU
   128's compute the pair model still loses: 6.753 against 6.012 (+12.3%),
-  and +16.0% against a GRU of its own size (5.820).
+  and +16.0% against a GRU of its own size (5.820). In equal wall-clock
+  time on this CPU it can be about seven times larger, and then it wins a
+  little: 5.753 against the GRU 154's 5.820 (−1.2%), timed side by side.
 opened:   2026-11-21
 updated:  2026-11-22
 code:     standalone, this directory (tiny_pairs.py); no branch
@@ -301,6 +303,39 @@ bracketed:
 - The two places in a pair are now close for the pair model (6.619 and
   6.889 at window 256), as for the GRU (5.770 and 5.870).
 
+### 2026-11-22: equal wall-clock time
+
+`run_time.sh` (00:56–01:04 EST) and `run_time_check.sh` (01:05–01:12),
+window 256, CPU. The pair model at level 1 280 / decoder 343, sized to
+train in the GRU 154's time:
+
+| model | parameters | 3e-4 | 1e-3 | 3e-3 |
+|---|---:|---:|---:|---:|
+| pair model, 280 / 343 | 900,876 | 6.154 | **5.753** | 7.216 |
+| GRU 154 (equal-compute section) | 122,664 | 6.530 | **5.820** | 6.356 |
+
+Its three arms took ~460 s together, against ~364 s for the GRU 154's in
+another load. So the best of each ran again side by side, with a size
+smaller, at 1e-3:
+
+| run together | parameters | score | seconds |
+|---|---:|---:|---:|
+| GRU 154 | 122,664 | 5.820 | 439 |
+| pair model 280 / 343 | 900,876 | **5.753** | 432 |
+| pair model 240 / 294 | 689,302 | 5.818 | 386 |
+
+- **In equal time the pair model wins a little:** 5.753 against 5.820
+  (−1.2%), in slightly less time (432 s against 439 s). Each best rate is
+  bracketed. The two repeats reproduce their scores exactly.
+- **The pair model 240 / 294 ties the GRU in 12% less time** (5.818).
+- **The win is speed, not division of labour:** it needs 7.3 times the
+  parameters, and about 5.8 times the arithmetic a character. It gets
+  them because it takes half the sequential steps and decodes all the
+  pairs in a window at once.
+- **The margin is small, and from one seed:** the seed-to-seed spread of
+  these tiny runs isn't measured. This is a CPU with one stream. On a GPU with many streams
+  the GRU's steps run batched, so the speed gap may shrink. Not measured.
+
 ## What we learned, or what's open
 
 - Making level 1 the only way to the prediction costs every prediction
@@ -311,5 +346,7 @@ bracketed:
 - Its cheaper reach didn't show: a long window helps it no more than it
   helps the GRU.
 - Its speed did: about 2.5 times faster an arm at window 256 than a GRU of
-  its size, here on CPU. At equal wall-clock time it could be bigger. That
-  comparison isn't run.
+  its size, here on CPU. Given the GRU 154's time, a pair model seven
+  times its size wins by 1.2%. That's the only comparison it wins, and
+  it wins on speed, not on dividing the work. Open: whether the speed
+  holds on a GPU with many streams.
