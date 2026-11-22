@@ -1,7 +1,7 @@
 ---
 title:    Depth against width at 10.8M
 kind:     experiment
-status:   planned
+status:   parked
 outcome:  n/a
 question: >-
   At 10.8M imm trails the transformer by 1.99%, and the gap is in plain
@@ -10,7 +10,9 @@ question: >-
   of 448 and 3 attention blocks. With the same parameters, do 6 blocks at
   width 344 beat 3 at 448?
 answer: >-
-  Not run yet. The check before it: imm's held-out excess over the
+  Not run: 6 blocks at 344 fit this GPU only at a 64 x 96 cap, at 3.2x the
+  base's time an update (3 epochs ~5.2 h), and scoring doesn't fit (slot
+  165). The arm waits for a decision. The check before it: imm's held-out excess over the
   transformer at epoch 8 (+0.0196 nats per character) is +0.0118 from a
   higher training loss and +0.0077 from a larger train-to-held-out gap, so
   imm fits the training text less well more than it generalizes worse.
@@ -20,7 +22,7 @@ code: >-
   branch depth-width 6ce0302: depth-records 5ae5c64 (slot 137's code) plus
   --stop-after-epoch, as 0ff2938 added it on attention-only.
 data:     PG-19 100M split (rnd/README.md), configs/pg19split100m_noprior.json
-slots:    [162, 164]
+slots:    [162, 164, 165]
 tags:     [depth, width, depth-records, scale, no-prior, screen]
 related:  [depth-records-10.8m, scale-10.8m, blocks-20m, half-lr-10.8m, reading-early]
 ---
@@ -121,7 +123,8 @@ From a worktree at `rnd/depth-width-10.8m/slot<N>` (rnd/README.md), with
 - `fit_gap.py`: the check before the screen, from slot 137's CSV and the
   transformer's log and JSON.
 
-**Results files** (`results/`): `fit_gap_10.8m.txt`.
+**Results files** (`results/`): `fit_gap_10.8m.txt`; `probe_162.log`,
+`probe_164.log`, `probe_165.log` and the slots' logs; `saved_bytes.txt`.
 
 **Checkpoints and per-character losses**, in `runs/`:
 `pg19s100m_h344_par_l6_w301_own_np_doc_mm128_do0_cm1024_depth_bf16_e8s3`
@@ -167,8 +170,50 @@ seconds.
   warm-up is now 64 × 64. On the CPU, with a limit nothing meets, the
   search runs to 64 × 64 and reports no cap.
 
+### 2026-11-22: slot 165, 6 blocks at 344 don't fit at a usable speed
+
+The slot opened at 10:49 UTC. The probe ran and found no workable cap, so
+nothing trained (`results/probe_165.log`).
+
+- **The cap search:**
+  - The warm-up at 64 × 64 peaked at 4.85 GiB.
+  - Every cap from 64 × 320 down to 64 × 128 ran out of GPU memory.
+  - 64 × 96 passed: three updates and the worst split into 5, 5, 5 and 10
+    groups, peaking at 6.67 GiB.
+- **The speed there: 1,361 ms an update**, 3.2× slot 137's 424 ms.
+  - That puts 3 epochs at about 5.2 hours and 8 at about 14.
+  - The script's ceiling is 4 hours for the screen.
+- **It doesn't run at all, either.** After the timed updates, the worst
+  update at that cap ran out of memory, and so did scoring's worst case (64
+  streams of the longest window, unsplit, no gradient).
+- **Memory per character, compared:**
+  - On the GPU, 3 blocks at 448 added 0.26 GiB per 2,048 more characters
+    an update (slot 137's probe, unsplit updates).
+  - 6 blocks at 344 added about 1.09 GiB going from a cap of 64 × 64 to
+    64 × 96 (slots 164 and 165, split updates). That's about 4×, though
+    the two slopes aren't measured the same way.
+- **What autograd saves doesn't explain it** (`saved_bytes.py`,
+  `results/saved_bytes.txt`; CPU, fp32, one unsplit update of 4 streams):
+  - 3 × 448 with depth records saves 322 KiB a character, 6 × 344 saves
+    471: 1.46× as much.
+  - Depth records add 17–23% at either depth.
+  - So most of the extra GPU memory is something that splitting the
+    update doesn't reduce. It isn't found yet.
+
 ## What we learned, or what's open
 
-- Open: the screen.
+- **As built, 6 blocks at 344 can't be screened on this GPU** (8 GB, 6.9
+  GiB usable): it fits only at 64 × 96, there it runs at 3.2× the base's
+  time an update, and scoring doesn't fit.
+- **Waiting for the user.** The ways on:
+  - **Depth at 1.59M,** where memory is ample: slot 127's 2 blocks at 192
+    against 4 blocks at 152 (1,561,962 trained parameters, −1.6%, about
+    the 10.8M arm's −1.7%; `$S/dw/size_depth.py`). A screen would take
+    under an hour. It tells whether depth beats width in imm at all, at
+    the smaller size.
+  - **Find the memory the cap doesn't split,** then try 6 blocks at 10.8M
+    again. It would still be slower per update than the base.
+  - **4 blocks at 10.8M**, at a width that keeps 10.9M parameters: less
+    memory than 6, still a test of depth.
 - Not tested here: depth at a fixed GRU width (it needs the blocks'
   width set apart from the GRU's), or 4 blocks between the two.

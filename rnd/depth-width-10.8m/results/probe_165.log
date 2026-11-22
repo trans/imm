@@ -1,0 +1,16 @@
+normal segments=351382; worst window 864 characters; devices cuda
+  warm-up at cap 64 x 64: peak 4.85 GiB
+  cap 64 x 320: 3 updates of the text and the worst, split at the cap ([] groups): peak inf GiB
+  cap 64 x 288: 3 updates of the text and the worst, split at the cap ([] groups): peak inf GiB
+  cap 64 x 256: 3 updates of the text and the worst, split at the cap ([] groups): peak inf GiB
+  cap 64 x 224: 3 updates of the text and the worst, split at the cap ([] groups): peak inf GiB
+  cap 64 x 192: 3 updates of the text and the worst, split at the cap ([] groups): peak inf GiB
+  cap 64 x 160: 3 updates of the text and the worst, split at the cap ([] groups): peak inf GiB
+  cap 64 x 128: 3 updates of the text and the worst, split at the cap ([4] groups): peak inf GiB
+  cap 64 x 96: 3 updates of the text and the worst, split at the cap ([5, 5, 5, 10] groups): peak 6.67 GiB
+h344 L6 heads8 tier301 depth at cap 6144:  1361.5 ms/update,   16.9k chars/s, peak 6.66 GiB (longest stream 498, 10 of 10 split); 3 epochs ~5.2 h, 8 ~14.0 h
+  the worst update (64 x 864) split at cap 6144: ? groups, peak inf GiB, nan ms
+  scoring's worst (64 x 864, no_grad, fp32): peak inf GiB, nan ms
+  scoring's worst (64 x 864, no_grad, bf16): peak inf GiB, nan ms
+  h344 L6 heads8 tier301 depth: the split worst update or scoring doesn't fit
+CHOICE none

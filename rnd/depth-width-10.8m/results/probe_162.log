@@ -1,0 +1,3 @@
+normal segments=351382; worst window 864 characters; devices cuda
+(344, 6, 8, 301): out of GPU memory in the normal updates (CUDA out of memory. Tried to allocate 632.00 MiB. GPU 0 has a total capacity of 7.70 GiB of which 60)
+CHOICE none

@@ -1,0 +1,10 @@
+slot 162 granted 2026-11-22T04:34:45-05:00
+code 6ce0302 0 changed files
+probe start 2026-11-22T04:34:45-05:00
+probe exit=0 2026-11-22T04:34:50-05:00
+normal segments=351382; worst window 864 characters; devices cuda
+(344, 6, 8, 301): out of GPU memory in the normal updates (CUDA out of memory. Tried to allocate 632.00 MiB. GPU 0 has a total capacity of 7.70 GiB of which 60)
+CHOICE none
+no cap fits (CHOICE none): stopping
+ended 162 @imm
+slot ended 2026-11-22T04:34:50-05:00

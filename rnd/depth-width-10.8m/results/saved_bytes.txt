@@ -1,0 +1,11 @@
+Bytes autograd saves for backward in one unsplit update (saved_bytes.py):
+CPU, fp32, 4 streams, 1,477 characters, carried records filled by 20
+updates first; each storage counted once.
+h448 L3 depth=0:    398.5 MiB saved for 1477 characters,  276.2 KiB a character
+h448 L3 depth=1:    464.6 MiB saved for 1477 characters,  322.1 KiB a character
+h344 L6 depth=0:    551.8 MiB saved for 1477 characters,  382.6 KiB a character
+h344 L6 depth=1:    678.7 MiB saved for 1477 characters,  470.6 KiB a character
+h344 L3 depth=0:    306.3 MiB saved for 1477 characters,  212.3 KiB a character
+h344 L3 depth=1:    357.0 MiB saved for 1477 characters,  247.5 KiB a character
+h448 L6 depth=0:    714.8 MiB saved for 1477 characters,  495.6 KiB a character
+h448 L6 depth=1:    880.1 MiB saved for 1477 characters,  610.2 KiB a character

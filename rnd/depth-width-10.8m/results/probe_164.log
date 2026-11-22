@@ -1,0 +1,27 @@
+normal segments=351382; worst window 864 characters; devices cuda
+  warm-up at cap 64 x 96: peak 5.94 GiB
+  cap 64 x 576: an unsplit update of 64 x 576 characters: peak inf GiB, nan ms
+  cap 64 x 544: an unsplit update of 64 x 544 characters: peak inf GiB, nan ms
+  cap 64 x 512: an unsplit update of 64 x 512 characters: peak inf GiB, nan ms
+  cap 64 x 480: an unsplit update of 64 x 480 characters: peak inf GiB, nan ms
+  cap 64 x 448: an unsplit update of 64 x 448 characters: peak inf GiB, nan ms
+  cap 64 x 416: an unsplit update of 64 x 416 characters: peak inf GiB, nan ms
+  cap 64 x 384: an unsplit update of 64 x 384 characters: peak inf GiB, nan ms
+  cap 64 x 352: an unsplit update of 64 x 352 characters: peak inf GiB, nan ms
+  cap 64 x 320: an unsplit update of 64 x 320 characters: peak inf GiB, nan ms
+  cap 64 x 288: an unsplit update of 64 x 288 characters: peak inf GiB, nan ms
+  cap 64 x 256: an unsplit update of 64 x 256 characters: peak inf GiB, nan ms
+Traceback (most recent call last):
+  File "/home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/dw/probe_depth_width.py", line 214, in <module>
+    cap = probe(*cfg)
+  File "/home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/dw/probe_depth_width.py", line 159, in probe
+    batch_win, span = window_at_most(L)
+                      ~~~~~~~~~~~~~~^^^
+  File "/home/trans/.cache/tmp/claude/claude-1000/-home-trans-air-imm/df897c15-423f-4248-a6c9-51e21de981da/scratchpad/dw/probe_depth_width.py", line 77, in window_at_most
+    i = int(ok[np.argmax(spans[ok])])
+               ~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.14/site-packages/numpy/_core/fromnumeric.py", line 1352, in argmax
+    return _wrapfunc(a, 'argmax', axis=axis, out=out, **kwds)
+  File "/usr/lib/python3.14/site-packages/numpy/_core/fromnumeric.py", line 54, in _wrapfunc
+    return bound(*args, **kwds)
+ValueError: attempt to get argmax of an empty sequence
