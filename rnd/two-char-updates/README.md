@@ -137,7 +137,8 @@ seventh arm afterwards (window 2 at 3e-5, as its best rate was the lowest
 tried); `run.sh` lists it. `python3 ngram_ref.py > results/ngram_ref.txt`
 gives the counting references. Stage 2: `sh rnd/two-char-updates/run2.sh`.
 Stage 3: `sh rnd/two-char-updates/run3.sh`; `tiny_levels.py`'s defaults
-still run stage 2. Stage 4: `sh rnd/two-char-updates/run4.sh`.
+still run stage 2. Stage 4: `sh rnd/two-char-updates/run4.sh`. Both at
+3e-4: `sh rnd/two-char-updates/run3-4_lr3e-4.sh`.
 
 ## Results
 
@@ -199,3 +200,27 @@ all it can add is what it carries across its own two steps. A test: the
 same model with both levels updated together every 4 characters, against
 a character GRU updated every 4.
 
+
+### 2026-11-21: stage 3, both levels on one clock
+
+`run3.sh`, CPU, two lanes, 20:19–21:09 EST. Held-out perplexity per
+character after 2,000,000 training characters:
+
+| model | parameters | 3e-5 | 1e-4 |
+|---|---:|---:|---:|
+| character GRU 128 + level 1, both every 4 characters | 208,609 | 7.261 | **6.866** |
+| character GRU 215, every 4 characters (same size) | 208,125 | 6.647 | **6.179** |
+
+- **Level 1 still makes it worse with one clock:** +11.1% against the
+  same-size GRU at each one's best rate (+9.2% at 3e-5). The separate
+  clocks weren't the whole trouble.
+- **Both were best at the higher rate,** so this is not yet each one's
+  best: both also run at 3e-4 (`run3-4_lr3e-4.sh`), after stage 4.
+- **It learns worse here too:** the loss on the training text as it was
+  read, over the last 250,000 characters, 5.73 with level 1 against 5.14
+  without (1e-4).
+- **Its gate opens less:** tanh(g) held at 0.28–0.36 at 1e-4, and rose
+  only to 0.42 at 3e-5, against 0.68 with separate clocks (stage 2, 3e-5).
+- **The longer window pays:** the same-size GRU scores 6.179 updated every
+  4 characters against 7.123 every 2 (−13.3%).
+- Time: ~1,770 s for each level-1 arm, ~1,205 s for each control.

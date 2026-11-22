@@ -1,0 +1,105 @@
+{
+ "args": {
+  "lr": "0.0001",
+  "train_chars": "2000000",
+  "eval_every": "250000",
+  "embed": "64",
+  "hidden": "128",
+  "width": "128",
+  "char_window": "4",
+  "level_window": "4",
+  "eval_group": "2",
+  "clip": "1.0",
+  "seed": "1",
+  "threads": "2",
+  "out": "results/joint4_lr1e-4.json"
+ },
+ "params": 208609,
+ "curve": [
+  {
+   "chars": 0,
+   "heldout_ppl": 96.00581894446516,
+   "gate": 0.0,
+   "sec": 0.0
+  },
+  {
+   "chars": 250002,
+   "char_updates": 62503,
+   "level_updates": 62503,
+   "heldout_ppl": 9.8088974488454,
+   "train_ppl": 9.646524924577816,
+   "gate": 0.3585,
+   "sec": 224.4
+  },
+  {
+   "chars": 500000,
+   "char_updates": 125005,
+   "level_updates": 125005,
+   "heldout_ppl": 7.956865205586278,
+   "train_ppl": 6.771269059559148,
+   "gate": 0.3319,
+   "sec": 452.1
+  },
+  {
+   "chars": 750002,
+   "char_updates": 187508,
+   "level_updates": 187508,
+   "heldout_ppl": 7.488997919800753,
+   "train_ppl": 6.426117704386596,
+   "gate": 0.322,
+   "sec": 688.3
+  },
+  {
+   "chars": 1000000,
+   "char_updates": 250010,
+   "level_updates": 250010,
+   "heldout_ppl": 7.2477426363977475,
+   "train_ppl": 6.267848129299941,
+   "gate": 0.3126,
+   "sec": 943.9
+  },
+  {
+   "chars": 1250002,
+   "char_updates": 312513,
+   "level_updates": 312513,
+   "heldout_ppl": 6.902617535503075,
+   "train_ppl": 6.126414236076135,
+   "gate": 0.2989,
+   "sec": 1180.3
+  },
+  {
+   "chars": 1500000,
+   "char_updates": 375015,
+   "level_updates": 375015,
+   "heldout_ppl": 7.228250387570884,
+   "train_ppl": 5.658872039172918,
+   "gate": 0.2837,
+   "sec": 1387.4
+  },
+  {
+   "chars": 1750002,
+   "char_updates": 437518,
+   "level_updates": 437518,
+   "heldout_ppl": 6.852706679979577,
+   "train_ppl": 5.731153254644348,
+   "gate": 0.2869,
+   "sec": 1583.7
+  },
+  {
+   "chars": 1999920,
+   "char_updates": 500000,
+   "level_updates": 500000,
+   "heldout_ppl": 6.865811821890633,
+   "gate": 0.2778,
+   "sec": 1776.3
+  }
+ ],
+ "final": {
+  "chars": 1999920,
+  "char_updates": 500000,
+  "level_updates": 500000,
+  "heldout_ppl": 6.865811821890633,
+  "gate": 0.2778,
+  "sec": 1776.3
+ }
+}
