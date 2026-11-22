@@ -14,10 +14,16 @@ perplexity per character, exp of the mean loss in nats over characters
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 
-import torch
+# CPU only. Hide the GPU: on CPU, Adam's step still checks for CUDA-graph
+# capture, which opens a CUDA context, and the slot watcher counts any GPU
+# process as a heavy job.
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+import torch  # noqa: E402
 import torch.nn as nn
 
 REPO = Path(__file__).resolve().parents[2]
