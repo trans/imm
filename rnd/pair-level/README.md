@@ -162,13 +162,32 @@ model that trains in the GRU 154's time?
   also sequential, so the speed gap may carry over, but its size there is
   not measured.
 
+### The size for equal time (`time_sizes.sh`, 00:42–00:46 EST)
+
+Seconds to train on the first 250,000 characters and score them, window
+256, three at a time:
+
+| model | parameters | seconds |
+|---|---:|---:|
+| GRU 154 (run twice) | 122,664 | 54.2, 52.2 |
+| pair model, level 1 120, decoder 147 | 222,136 | 30.4 |
+| pair model, 160 / 196 | 349,932 | 35.7 |
+| pair model, 200 / 245 | 505,654 | 41.7 |
+| pair model, 240 / 294 | 689,302 | 47.1 |
+
+Time rises ~5.4 s a step, so level 1 280 / decoder 343 (900,876
+parameters) should take about the GRU 154's time. It runs at 3e-4, 1e-3
+and 3e-3, three at once as the GRU 154 did (`run_time.sh`), plus the next
+rate past an edge best. Its actual times are reported beside the GRU's.
+
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/pair-level/run.sh`. It writes
 `results/w<window>_lr<rate>.json` (the curve, the final score) and a log
 for each arm. `tiny_pairs.py --help` gives the single-arm flags. The by-place reruns:
 `sh rnd/pair-level/run_by_place.sh`. The shapes: `sh rnd/pair-level/run_variants.sh`. Equal compute:
-`sh rnd/pair-level/run_compute.sh`.
+`sh rnd/pair-level/run_compute.sh`. Equal time: `sh rnd/pair-level/time_sizes.sh`, then
+`sh rnd/pair-level/run_time.sh`.
 
 ## Results
 

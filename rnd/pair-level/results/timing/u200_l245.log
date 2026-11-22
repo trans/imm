@@ -1,0 +1,2 @@
+pairs: window=256 upper=200 local=245 feed=False lr=0.001 params=505654 pieces=11
+final {"chars": 249991, "updates": 981, "heldout_ppl": 9.113604030714624, "heldout_ppl_first": 8.8283699836103, "heldout_ppl_second": 9.407933986243009, "sec": 41.7}

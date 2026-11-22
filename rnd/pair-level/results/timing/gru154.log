@@ -1,0 +1,2 @@
+window=256 lr=0.001 params=122664 pieces=11
+final {"chars": 249991, "updates": 981, "heldout_ppl": 8.913131005066274, "heldout_ppl_even": 8.85560579543375, "heldout_ppl_odd": 8.971006711546867, "sec": 54.2}

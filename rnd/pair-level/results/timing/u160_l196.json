@@ -1,0 +1,41 @@
+{
+ "args": {
+  "window": "256",
+  "lr": "0.001",
+  "train_chars": "250002",
+  "eval_every": "250000",
+  "embed": "64",
+  "upper": "160",
+  "local": "196",
+  "feed": "False",
+  "clip": "1.0",
+  "eval_group": "2",
+  "seed": "1",
+  "threads": "2",
+  "out": "results/timing/u160_l196.json"
+ },
+ "params": 349932,
+ "curve": [
+  {
+   "chars": 0,
+   "heldout_ppl": 93.9662756032589,
+   "sec": 0.0
+  },
+  {
+   "chars": 249991,
+   "updates": 981,
+   "heldout_ppl": 9.228028049087547,
+   "heldout_ppl_first": 8.967058915162783,
+   "heldout_ppl_second": 9.496483218239232,
+   "sec": 35.7
+  }
+ ],
+ "final": {
+  "chars": 249991,
+  "updates": 981,
+  "heldout_ppl": 9.228028049087547,
+  "heldout_ppl_first": 8.967058915162783,
+  "heldout_ppl_second": 9.496483218239232,
+  "sec": 35.7
+ }
+}
