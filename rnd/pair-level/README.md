@@ -1,8 +1,8 @@
 ---
 title:    Level 1 makes the prediction
 kind:     experiment
-status:   running
-outcome:  n/a
+status:   concluded
+outcome:  negative
 question: >-
   If level 1, a GRU stepping once every two characters, makes the
   prediction itself through a small character decoder for each pair, with
@@ -10,7 +10,12 @@ question: >-
   as a plain character GRU of the same size, updated every 4 characters and
   every 256?
 answer: >-
-  Not yet run.
+  No. At the same size (93,106 against 93,024) the pair model scores 7.975
+  against 6.523 updated every 4 characters (+22.3%), and 7.261 against
+  6.012 every 256 (+20.8%). It is worse on the training text too. The
+  long window helps it a little more (−9.0% against −7.8%), from a much
+  worse start. Most of the loss is in each pair's second character (+25.7%,
+  against +16.1% for the first), which points at the narrow decoder.
 opened:   2026-11-21
 updated:  2026-11-21
 code:     standalone, this directory (tiny_pairs.py); no branch
@@ -103,4 +108,58 @@ for each arm. `tiny_pairs.py --help` gives the single-arm flags. The by-place re
 
 ## Results
 
-None yet.
+### 2026-11-21: windows 4 and 256
+
+`run.sh`, CPU, four lanes, 23:01–23:20 EST. Held-out perplexity per
+character after 2,000,000 training characters:
+
+| window | model | parameters | rates | scores | best |
+|---:|---|---:|---|---|---:|
+| 4 | pair model | 93,106 | 3e-5, 1e-4, 3e-4 | 9.022, 7.975, 8.001 | **7.975** |
+| 4 | character GRU 128 | 93,024 | the same | 7.136, 6.523, 6.816 | **6.523** |
+| 256 | pair model | 93,106 | 3e-4, 1e-3, 3e-3 | 8.196, 7.261, 7.655 | **7.261** |
+| 256 | character GRU 128 | 93,024 | the same | 6.699, 6.012, 6.430 | **6.012** |
+
+- **The pair model loses by about a fifth at both windows:** +22.3% at
+  4, +20.8% at 256. Each best rate is bracketed, the GRU's included.
+- **It learns worse, not just generalises worse:** the loss on the
+  training text as it was read, over the last 250,000 characters, 7.17
+  against 5.61 (window 4) and 6.76 against 5.38 (window 256).
+- **The cheaper reach pays only a little:** the long window improves the
+  pair model by 9.0% and the GRU by 7.8%.
+- **Where it's worse, against counting:** at window 4 it scores about
+  what counting 2 characters back does (8.03, `two-char-updates`).
+- Time: ~1,110 s for a window-4 arm, ~180–195 s for a window-256 arm.
+
+### 2026-11-21: where the loss sits
+
+`run_by_place.sh`, 23:22–23:27 EST. The two best 256-window arms again.
+They reproduce their scores (7.261, and 6.012 as in `two-char-updates`
+stage 1). The final held-out scores by place:
+
+| place in the pair | pair model | character GRU 128 | gap |
+|---|---:|---:|---:|
+| first (from level 1's state alone) | 6.926 | 5.966 | +16.1% |
+| second (also reads the first) | 7.613 | 6.059 | +25.7% |
+
+- **The GRU scores both places alike** (5.97, 6.06): pairs mean nothing
+  to it.
+- **The pair model loses most on the second character,** the one with
+  the most local help: it reads the first directly. The decoder, 42 wide,
+  is the weakest spot. It gets level 1's state only through one 96 → 42
+  projection.
+- **The first character is +16% worse too,** so level 1 is short as well,
+  or that same narrow path is.
+
+## What we learned, or what's open
+
+- Making level 1 the only way to the prediction, at the same size, costs
+  about a fifth. A hierarchy that forces the work to be divided does
+  divide it, but this one pays for it in every prediction.
+- Open, none run:
+  - a wider decoder and a narrower level 1 at the same size;
+  - level 1's state fed into every decoder step, as MEGABYTE adds its
+    global output to each local input, not just used to start it;
+  - comparing at the same compute rather than the same parameters (the
+    pair model does about 60% of the GRU's arithmetic a character: ~52k
+    multiply-adds against ~86k).

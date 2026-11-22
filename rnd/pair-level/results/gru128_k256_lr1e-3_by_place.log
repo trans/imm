@@ -1,0 +1,9 @@
+window=256 lr=0.001 params=93024 pieces=80
+{"chars": 250246, "updates": 981, "heldout_ppl": 9.007457777984317, "train_ppl": 10.227705080000378, "sec": 41.1}
+{"chars": 500236, "updates": 1961, "heldout_ppl": 7.319621790008249, "train_ppl": 6.692263111755197, "sec": 80.9}
+{"chars": 750226, "updates": 2941, "heldout_ppl": 6.814544878541425, "train_ppl": 6.241321812757168, "sec": 121.5}
+{"chars": 1000216, "updates": 3921, "heldout_ppl": 6.6683547807643375, "train_ppl": 6.04764351224548, "sec": 161.4}
+{"chars": 1250206, "updates": 4901, "heldout_ppl": 6.371692735939962, "train_ppl": 5.977279781520334, "sec": 201.2}
+{"chars": 1500196, "updates": 5881, "heldout_ppl": 6.38330673870554, "train_ppl": 5.366724964878975, "sec": 240.8}
+{"chars": 1750186, "updates": 6861, "heldout_ppl": 6.0655873827899205, "train_ppl": 5.383706101845581, "sec": 280.4}
+final {"chars": 1999920, "updates": 7840, "heldout_ppl": 6.012173435915443, "heldout_ppl_even": 5.966173838912288, "heldout_ppl_odd": 6.058509211545139, "sec": 319.1}
