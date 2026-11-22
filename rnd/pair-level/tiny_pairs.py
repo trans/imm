@@ -81,18 +81,27 @@ def encode(text: str, vocab: str) -> torch.Tensor:
 
 
 @torch.no_grad()
-def heldout_ppl(model, pieces, group: int = 2) -> float:
+def heldout_ppl(model, pieces, group: int = 2, by_place: bool = False):
+    """Perplexity per character over characters 1..4,999 (0-based) of each piece.
+    With by_place, also over the first and the second character of each pair
+    (even and odd places), as (all, first, second)."""
     model.eval()
-    nats, n = 0.0, 0
+    nats, n = torch.zeros(2, dtype=torch.float64), torch.zeros(2, dtype=torch.float64)
     for g in range(0, pieces.shape[0], group):
         part = pieces[g : g + group]  # [B, 5000]
         u0 = torch.zeros(1, part.shape[0], model.upper_width)
         logits, _ = model(part.view(part.shape[0], -1, 2), u0)
-        # character 0 of each piece is not scored: predictions for 1 .. 4,999
-        nats += nn.functional.cross_entropy(logits[:, 1:].reshape(-1, logits.shape[-1]), part[:, 1:].reshape(-1), reduction="sum").item()
-        n += part[:, 1:].numel()
+        loss = nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), part.reshape(-1), reduction="none").view(part.shape)
+        loss = loss[:, 1:].double()  # character 0 of each piece is not scored
+        place = torch.arange(1, part.shape[1]) % 2  # 0: a pair's first character
+        for k in (0, 1):
+            nats[k] += loss[:, place == k].sum()
+            n[k] += loss[:, place == k].numel()
     model.train()
-    return math.exp(nats / n)
+    total = math.exp(nats.sum().item() / n.sum().item())
+    if by_place:
+        return total, math.exp(nats[0].item() / n[0].item()), math.exp(nats[1].item() / n[1].item())
+    return total
 
 
 def main() -> None:
@@ -159,7 +168,9 @@ def main() -> None:
                 print(json.dumps(row), flush=True)
                 train_nats, train_n = 0.0, 0
                 next_eval += args.eval_every
-    final = {"chars": seen, "updates": updates, "heldout_ppl": heldout_ppl(model, held, args.eval_group), "sec": round(time.time() - t0, 1)}
+    total, first, second = heldout_ppl(model, held, args.eval_group, by_place=True)
+    final = {"chars": seen, "updates": updates, "heldout_ppl": total, "heldout_ppl_first": first,
+             "heldout_ppl_second": second, "sec": round(time.time() - t0, 1)}
     if log["curve"][-1]["chars"] != seen:
         log["curve"].append(final)
     log["final"] = final

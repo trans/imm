@@ -48,16 +48,28 @@ def encode(text: str, vocab: str) -> torch.Tensor:
 
 
 @torch.no_grad()
-def heldout_ppl(model, pieces, group: int = 10) -> float:
+def heldout_ppl(model, pieces, group: int = 10, by_place: bool = False):
+    """Perplexity per character over characters 1..4,999 (0-based) of each piece.
+    With by_place, also over the even and the odd places (rnd/pair-level's
+    first and second character of a pair), as (all, even, odd)."""
     model.eval()
     nats, n = 0.0, 0
+    split = torch.zeros(2, dtype=torch.float64), torch.zeros(2, dtype=torch.float64)
     for g in range(0, pieces.shape[0], group):  # 10 pieces at a time, to keep memory low
         part = pieces[g : g + group]
         logits, _ = model(part[:, :-1], None)
         y = part[:, 1:].reshape(-1)
         nats += nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), y, reduction="sum").item()
         n += y.numel()
+        if by_place:
+            loss = nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), y, reduction="none").view(part.shape[0], -1).double()
+            place = torch.arange(1, part.shape[1]) % 2  # the place predicted, 1..4,999
+            for k in (0, 1):
+                split[0][k] += loss[:, place == k].sum()
+                split[1][k] += loss[:, place == k].numel()
     model.train()
+    if by_place:
+        return math.exp(nats / n), math.exp(split[0][0].item() / split[1][0].item()), math.exp(split[0][1].item() / split[1][1].item())
     return math.exp(nats / n)
 
 
@@ -120,7 +132,9 @@ def main() -> None:
                 print(json.dumps(row), flush=True)
                 train_nats, train_n = 0.0, 0
                 next_eval += args.eval_every
-    final = {"chars": seen, "updates": updates, "heldout_ppl": heldout_ppl(model, held, args.eval_group), "sec": round(time.time() - t0, 1)}
+    total, even, odd = heldout_ppl(model, held, args.eval_group, by_place=True)
+    final = {"chars": seen, "updates": updates, "heldout_ppl": total, "heldout_ppl_even": even,
+             "heldout_ppl_odd": odd, "sec": round(time.time() - t0, 1)}
     if log["curve"][-1]["chars"] != seen:
         log["curve"].append(final)
     log["final"] = final

@@ -1,7 +1,7 @@
 ---
 title:    Level 1 makes the prediction
 kind:     experiment
-status:   planned
+status:   running
 outcome:  n/a
 question: >-
   If level 1, a GRU stepping once every two characters, makes the
@@ -85,11 +85,21 @@ patches. Two things change:
   the machine's available memory falls under 1.9 GB. The GPU is hidden,
   so no CUDA context opens.
 
+### Added after the first results: where the loss sits
+
+The pair model lost by about 21% at both windows. Is the loss in the first
+character of each pair, predicted from level 1's state alone, or in the
+second, which also reads the first? Both best 256-window arms run again
+(pair model and character GRU, 1e-3, `run_by_place.sh`). Their final scores
+are also given over even and odd places: a pair's first and second
+character. The rerun should reproduce each final score.
+
 ## How to rerun
 
 From the repo, on CPU: `sh rnd/pair-level/run.sh`. It writes
 `results/w<window>_lr<rate>.json` (the curve, the final score) and a log
-for each arm. `tiny_pairs.py --help` gives the single-arm flags.
+for each arm. `tiny_pairs.py --help` gives the single-arm flags. The by-place reruns:
+`sh rnd/pair-level/run_by_place.sh`.
 
 ## Results
 

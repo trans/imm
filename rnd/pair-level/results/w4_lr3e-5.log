@@ -1,0 +1,9 @@
+pairs: window=4 upper=96 local=42 lr=3e-05 params=93106 pieces=80
+{"chars": 250001, "updates": 62503, "heldout_ppl": 14.57940781531198, "train_ppl": 18.282711957188315, "sec": 158.1}
+{"chars": 500003, "updates": 125006, "heldout_ppl": 11.833376918597214, "train_ppl": 11.630558537898802, "sec": 310.4}
+{"chars": 750001, "updates": 187508, "heldout_ppl": 10.875066511718044, "train_ppl": 10.46061373813528, "sec": 450.2}
+{"chars": 1000003, "updates": 250011, "heldout_ppl": 10.230981929796958, "train_ppl": 10.047285971639024, "sec": 600.5}
+{"chars": 1250001, "updates": 312513, "heldout_ppl": 9.671106253983382, "train_ppl": 10.029703835169071, "sec": 724.6}
+{"chars": 1500003, "updates": 375016, "heldout_ppl": 9.548232812240043, "train_ppl": 8.660990225956049, "sec": 862.7}
+{"chars": 1750001, "updates": 437518, "heldout_ppl": 9.154260850663736, "train_ppl": 8.511004282662336, "sec": 988.9}
+final {"chars": 1999920, "updates": 500000, "heldout_ppl": 9.022109376252198, "sec": 1111.3}
