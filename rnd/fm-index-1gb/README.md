@@ -14,7 +14,8 @@ answer:   Running.
 opened:   2026-11-24
 updated:  2026-11-24
 code: >-
-  branch fm-index-1gb: fm_time.cpp, run.sh. sdsl-lite from xxsds at 7696536
+  branch fm-index-1gb: fm_time.cpp, run.sh (95ef95e); extras.sh and the
+  per-depth pass in fm_time.cpp (the commit after). sdsl-lite from xxsds at 7696536
   (2026-11-16), header-only, built with g++ 14 -O3 -march=native -std=c++20.
 data: >-
   the first 999,999,959 bytes of mobius's data/pg19/imm-split-20m/books.txt
@@ -69,6 +70,15 @@ has room for the build that the laptop didn't.
 - **Check:** 300 sampled held-out contexts. Half are 1-8 characters long, the
   rest 1-24. Each one's histogram from the index is compared with a
   brute-force scan of the text (`memmem`).
+- **mobius's extras** (its mail of 2026-11-24, `extras.sh`, run after
+  `run.sh` with the program as it is now, which adds a pass timing each
+  histogram by depth):
+  - the same builds and query passes on the first 250 MB and 500 MB, for
+    how the cost grows with the text;
+  - the histogram cost by depth, 1 to 24: microseconds a call, distinct
+    symbols a call, and the depth's share of the time;
+  - two query processes at once on the 1 GB index, half the held-out text
+    each.
 - **Not measured:** the prior's use of the counts (smoothing, the gate). That
   costs the same whichever structure gave the counts.
 
@@ -83,6 +93,7 @@ g++ -O3 -march=native -std=c++20 -DNDEBUG -DFM_PLAIN -I sdsl-lite/include fm_tim
 head -c 1000000000 books.txt > books1g.raw   # then cut at the last \n: books1g.txt
 cp heldout_corpus.txt heldout.txt
 sh run.sh
+cp fm_time.cpp fm2.cpp && sh extras.sh   # compiles fm2_rrr and fm2_plain itself
 ```
 
 Results files (`results/`): `build_<v>.txt`, `check_<v>.txt`,

@@ -221,6 +221,45 @@ static int query(const std::string & index_path, const std::string & held_path, 
               << "mean_symbols_per_histogram " << (double)symbols / histograms << "\n"
               << "hist_checksum " << hsum << "\n"
               << "peak_rss_mb " << peak_rss_kb() / 1024.0 << "\n";
+
+    // Histograms by depth: the same walk once more, each interval_symbols
+    // call timed on its own, so the clock's cost (tens of nanoseconds a
+    // call) is inside these figures and not in the pass above.
+    std::vector<double> dsec(depth + 1, 0.0);
+    std::vector<uint64_t> dcalls(depth + 1, 0), dsyms(depth + 1, 0);
+    for (size_t j = 0; j < n; ++j)
+    {
+        Range g = full;
+        if (!step(csa, g, (unsigned char)h[j])) continue;
+        for (int k = 1; k <= depth && j + k < n; ++k)
+        {
+            csa_type::size_type m = 0;
+            auto a = clk::now();
+            csa.wavelet_tree.interval_symbols(g.l, g.r + 1, m, cs, ri, rj);
+            dsec[k] += secs(a, clk::now());
+            ++dcalls[k];
+            dsyms[k] += m;
+            const unsigned char next = (unsigned char)h[j + k];
+            bool found = false;
+            for (csa_type::size_type s = 0; s < m; ++s)
+                if (cs[s] == next)
+                {
+                    auto c_begin = csa.C[csa.char2comp[next]];
+                    g = {c_begin + ri[s], c_begin + rj[s] - 1};
+                    found = true;
+                }
+            if (!found || k == depth) break;
+        }
+    }
+    std::cout << "# bydepth_<k> calls us_per_call mean_symbols share_of_time\n";
+    double dtotal = 0;
+    for (int k = 1; k <= depth; ++k) dtotal += dsec[k];
+    for (int k = 1; k <= depth; ++k)
+        std::cout << "bydepth_" << k << " " << dcalls[k] << " "
+                  << (dcalls[k] ? 1e6 * dsec[k] / dcalls[k] : 0.0) << " "
+                  << (dcalls[k] ? (double)dsyms[k] / dcalls[k] : 0.0) << " "
+                  << (dtotal > 0 ? dsec[k] / dtotal : 0.0) << "\n";
+    std::cout << "bydepth_total_s " << dtotal << "\n";
     return 0;
 }
 
