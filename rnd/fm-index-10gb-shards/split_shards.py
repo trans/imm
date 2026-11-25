@@ -1,5 +1,6 @@
-"""Cut books.txt into one text per shard, every book followed by 0x01, and
-write the whole text in book order with the same separators (for the check).
+"""Cut books.txt into one text per shard, every book preceded and followed by
+0x01 (one 0x01 between two books), and write the whole text in book order
+the same way (for the check).
 
 usage: python3 -I split_shards.py <books.txt> <books.starts> <books.names>
            <groups.books> <out dir> <whole text out>
@@ -44,9 +45,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     outs = [open(os.path.join(out_dir, 'shard_%02d.txt' % s), 'wb') for s in range(nshards)]
     books = [0] * nshards
-    chars = [0] * nshards
+    chars = [1] * nshards  # the leading separator
+    for o in outs:
+        o.write(SEP)
     with open(text_path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m, \
             open(whole_path, 'wb') as whole:
+        whole.write(SEP)
         for i in range(len(starts)):
             b = m[starts[i]:ends[i]]
             if b'\x00' in b or SEP in b:
@@ -63,7 +67,7 @@ def main():
 
     print('books', len(starts))
     print('text_chars', size)
-    print('whole_chars', size + len(starts))
+    print('whole_chars', size + len(starts) + 1)
     print('shards', nshards)
     print('# shard_<i> books chars (separators included)')
     for s in range(nshards):

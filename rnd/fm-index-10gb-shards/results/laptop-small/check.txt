@@ -1,8 +1,0 @@
-shards 3
-text_chars 53349037
-checked 300
-absent_contexts 81
-separator_followers 635
-mismatches 0
-check_s 2.32756
-peak_rss_mb 107.195

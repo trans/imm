@@ -9,7 +9,9 @@ question: >-
   shard: the build's time, memory and size. Over the 250K held-out text:
   the summed follower histograms of depth 1 to 24, in us a character on one
   core and on four, and how deep each shard's contexts reach. And the sum
-  checked exactly against a scan of the whole text.
+  checked exactly against a scan of the whole text. Each shard gets a second
+  index on the unreversed text for the predecessor counts the gate's suffix
+  features need, timed on one core and checked the same way.
 answer: >-
   Not yet run.
 opened:   2026-11-25
@@ -59,6 +61,15 @@ So this measures:
   early the shards that don't fit a document stop;
 - that the sum is exact.
 
+mobius found one more need before the build started (mail
+20261125-024824Z). Five of its gate's eleven features describe the
+characters seen *before* a context: how often it occurs with one, how many
+distinct ones, their entropy, and so on (mobius's
+`src/mobius/gated_counts.cr`, lines 451-455, read from the level built at
+line 933). An index on the reversed text gives followers. Predecessors come
+from an index on the text as it stands. So each shard gets both, the two
+together a bidirectional index, and the build doubles.
+
 ## Design
 
 - **The shards:** one per k-means group of the counted books, 25 in all,
@@ -69,19 +80,27 @@ So this measures:
   - the shard sizes add to the file's 10,303,343,939 bytes;
   - the largest, shard 0, is 1,263,824,461 characters, under 2^31, so the
     32-bit build (5 bytes a character) applies to each, about 6.3 GB peak.
-- **Separators:** every book is followed by 0x01, a byte outside the 96
-  characters of the vocabulary. So no context runs across a book's edge,
-  and 0x01 shows up only as a follower at a book's end. mobius's count
+- **Separators:** every book is preceded and followed by 0x01 (one 0x01
+  between two books), a byte outside the 96 characters of the vocabulary.
+  So no context runs across a book's edge. 0x01 shows up only as a follower
+  at a book's end or a predecessor at its start, and the first book of a
+  shard has one before it, as it has in the whole text. mobius's count
   table counts nothing across a book's edge either. (mobius proposed 0x00,
   but sdsl's byte-alphabet build rejects zero bytes: 0 is its own
   end-of-text symbol.) The summed histograms drop 0x01 and 0.
-- **The index:** as in fm-index-1gb, plain variant:
-  `csa_wt<wt_huff<bit_vector>, 1u << 20, 1u << 20>` on the **reversed**
-  shard text. A context's followers are the BWT symbols in its interval.
-  Extending it at its end is one backward-search step.
-- **The walk:** as in fm-index-1gb, from each held-out start j the context
-  H[j..j+k-1] grows one character at a time, k = 1..24, in each shard until
-  it no longer occurs there.
+- **The indexes:** as in fm-index-1gb, plain variant:
+  `csa_wt<wt_huff<bit_vector>, 1u << 20, 1u << 20>`, two per shard.
+  - **rev**, on the reversed shard text. A context's followers are the BWT
+    symbols in its interval, and extending it at its end is one
+    backward-search step.
+  - **fwd**, on the shard text as it stands. A context's predecessors are
+    the BWT symbols in its interval, and extending it at its start is one
+    backward-search step.
+- **The walk:** as in fm-index-1gb. In the rev indexes, from each held-out
+  start j, the context H[j..j+k-1] grows one character at a time, k =
+  1..24, in each shard until it no longer occurs there. The fwd indexes run
+  the same code on the reversed held-out text: from each end position the
+  context grows toward its start. By symmetry the cost should match.
 - **The passes on one core** (`fm_shards query`):
   - Each shard alone, over all the held-out starts. This gives the shard's
     µs a character (what a process holding only that shard would spend),
@@ -96,10 +115,15 @@ So this measures:
   histograms would still have to be merged per start. Its cost can be read
   off the per-shard pass.
 - **The check** (`fm_shards check`): fm-index-1gb's 300 contexts (the same
-  seed; half of them 8 characters or shorter). For each, the shards'
-  summed follower counts are compared with a memmem scan of the whole text
-  in book order, separators in (`all_sep.txt`). Followers 0x01 are compared
-  too.
+  seed; half of them 8 characters or shorter). For each, the shards' summed
+  follower counts are compared with a memmem scan of the whole text in book
+  order, separators in (`all_sep.txt`), 0x01 counts included. The fwd
+  indexes are checked the same way on predecessors, with their contexts
+  drawn from the reversed held-out text.
+- **Order:** the rev set is built and measured first, since its summed
+  lookup is the open question. Then the fwd set: its builds, its one-core
+  pass and its check. Its four-process pass is left out, since four
+  processes each holding both sets would need about 70 GB.
 
 ## How to rerun
 
@@ -114,24 +138,30 @@ g++ -O3 -march=native -std=c++20 -DNDEBUG -pthread -I sdsl-lite/include fm_shard
 sh run.sh
 ```
 
-It needs about 40 GB of disk (the shard texts, the whole text with
-separators, the indexes) and 36 GB of memory at the four-process step.
+It needs about 50 GB of disk (the shard texts, the whole text with
+separators, the 50 indexes) and 36 GB of memory at the four-process step.
 
 ## Results
 
 ### 2026-11-25: the program checked on 3 small shards (laptop)
 
 These are the first 150 books of the list (53 MB), cut into 3 shards by
-their group number mod 3.
+their group number mod 3, with both index sets.
 
-- Builds: 0.9-2.8 s, 6.8-6.9 bits a character.
-- Check: 300 contexts, 0 mismatches. 81 of them occur in no shard, and 635
-  of the followers counted are book ends.
-- Query: the summed pass's counts total equals the per-shard pass's. Each
-  shard alone took 3.2-4.6 µs a character (11.6 in all). The sum took
-  19.2 µs. These shards (15 MB of index each) nearly fit in the laptop's
-  cache when queried one at a time, but not three in turn. At 8.8 GB
-  nothing fits either way.
+- Builds: 0.9-3.6 s each, 6.8-6.9 bits a character.
+- Check, rev (followers): 300 contexts, 0 mismatches. 81 of them occur in
+  no shard, and 635 of the followers counted are book ends.
+- Check, fwd (predecessors): 300 contexts, 0 mismatches. 83 occur in no
+  shard, and 139 of the predecessors counted are book starts.
+- Query: in each set the summed pass's counts total equals the per-shard
+  pass's. The follower totals didn't change when the leading separator was
+  added. Both sets reach the same mean depth (10.11 a shard, 11.29
+  pooled), as the symmetry says.
+  - rev: each shard alone took 11.6 µs a character in all, the sum 18.9.
+  - fwd: 12.1 and 20.2.
+  - These shards (15 MB of index each) nearly fit in the laptop's cache
+    when queried one at a time, but not three in turn. At 8.8 GB nothing
+    fits either way.
 
 ## What we learned, or what's open
 

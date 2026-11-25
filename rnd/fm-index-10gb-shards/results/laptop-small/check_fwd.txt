@@ -1,0 +1,9 @@
+histograms_of predecessors
+shards 3
+text_chars 53349038
+checked 300
+absent_contexts 83
+separator_counts 139
+mismatches 0
+check_s 2.25214
+peak_rss_mb 106.785

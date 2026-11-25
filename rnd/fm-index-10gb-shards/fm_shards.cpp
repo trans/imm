@@ -1,21 +1,29 @@
 // The count prior from several FM-indexes at once: one index per subject
-// shard, their follower counts added per symbol. Counts add, so the sum over
-// the shards is exactly the histogram of the text they partition.
+// shard, their counts added per symbol. Counts add, so the sum over the
+// shards is exactly the histogram of the text they partition.
 //
-// Each index is built as in rnd/fm-index-1gb/fm_time.cpp: sdsl-lite's csa_wt
-// over plain bit vectors, built on the REVERSED shard text. The followers of
-// a context c are the BWT symbols in the interval of reverse(c), and growing
-// c by one character at its end is one backward-search step. The wavelet
-// tree's symbols are the text's own bytes; 0 is sdsl's end-of-text symbol.
+// Each index is sdsl-lite's csa_wt over plain bit vectors, as in
+// rnd/fm-index-1gb/fm_time.cpp. A shard has two:
+//   - rev, built on the REVERSED shard text: the FOLLOWERS of a context c are
+//     the BWT symbols in the interval of reverse(c), and growing c by one
+//     character at its end is one backward-search step;
+//   - fwd, built on the text as it stands: the PREDECESSORS of c are the BWT
+//     symbols in c's interval, and growing c by one character at its start
+//     is one backward-search step.
+// The code is the same for both: a predecessor pass walks the reversed
+// held-out text in the fwd indexes. The wavelet tree's symbols are the
+// text's own bytes; 0 is sdsl's end-of-text symbol.
 //
-// Every book in a shard is followed by 0x01, a byte outside the alphabet, so
-// no context runs across a book's edge, and 0x01 shows up only as a follower
-// at a book's end. The summed histograms drop it and the end-of-text symbol.
+// In a shard every book is preceded and followed by 0x01, a byte outside the
+// alphabet, so no context runs across a book's edge, and 0x01 shows up only
+// as a follower at a book's end or a predecessor at its start. The summed
+// histograms drop it and the end-of-text symbol.
 //
 // usage:
-//   fm_shards build <text> <index out> <tmp dir>
-//   fm_shards query <index list> <held-out text> [depth=24] [reps=2] [per_shard=1]
+//   fm_shards build <text> <index out> <tmp dir> [rev|fwd]
+//   fm_shards query <index list> <held-out text> [depth=24] [reps=2] [per_shard=1] [followers|predecessors]
 //   fm_shards check <index list> <whole text> <held-out text> [samples=300] [depth=24] [threads=4]
+//                   [followers|predecessors]
 //
 // An index list is a file with one index path per line. Output lines are
 // "key value" pairs, one per line, for the README's tables.
@@ -70,20 +78,23 @@ static std::string read_file(const std::string & path)
     return std::string(std::istreambuf_iterator<char>(in), {});
 }
 
-static int build(const std::string & text_path, const std::string & index_path, const std::string & tmp_dir)
+static int build(const std::string & text_path, const std::string & index_path, const std::string & tmp_dir,
+                 bool reversed)
 {
     auto t0 = clk::now();
     std::string text = read_file(text_path);
-    size_t books = 0;
+    size_t separators = 0;
     for (unsigned char ch : text)
     {
         if (ch == 0) { std::cerr << "the text has a zero byte\n"; return 1; }
-        books += ch == kSeparator;
+        separators += ch == kSeparator;
     }
-    std::reverse(text.begin(), text.end());
-    std::string rev_path = tmp_dir + "/reversed.txt";
+    std::string build_path = text_path;
+    if (reversed)
     {
-        std::ofstream out(rev_path, std::ios::binary);
+        std::reverse(text.begin(), text.end());
+        build_path = tmp_dir + "/reversed.txt";
+        std::ofstream out(build_path, std::ios::binary);
         out.write(text.data(), (std::streamsize)text.size());
     }
     size_t n = text.size();
@@ -92,16 +103,17 @@ static int build(const std::string & text_path, const std::string & index_path, 
 
     csa_type csa;
     cache_config config(true, tmp_dir, "fm");
-    construct(csa, rev_path, config, 1);
+    construct(csa, build_path, config, 1);
     auto t2 = clk::now();
     store_to_file(csa, index_path);
     auto t3 = clk::now();
-    std::remove(rev_path.c_str());
+    if (reversed) std::remove(build_path.c_str());
 
     double total = (double)size_in_bytes(csa);
     std::cout << "variant " << kVariant << "\n"
+              << "index_text " << (reversed ? "reversed" : "forward") << "\n"
               << "text_chars " << n << "\n"
-              << "books " << books << "\n"
+              << "separators " << separators << "\n"
               << "read_reverse_s " << secs(t0, t1) << "\n"
               << "construct_s " << secs(t1, t2) << "\n"
               << "store_s " << secs(t2, t3) << "\n"
@@ -203,18 +215,21 @@ static inline int walk(const csa_type & csa, const std::string & h, size_t j, in
     return k - 1;
 }
 
-static int query(const std::string & list_path, const std::string & held_path, int depth, int reps, bool per_shard)
+static int query(const std::string & list_path, const std::string & held_path, int depth, int reps, bool per_shard,
+                 bool predecessors)
 {
     std::vector<std::string> paths;
     auto t0 = clk::now();
     auto shards = load_list(list_path, paths);
     auto t1 = clk::now();
     std::string h = read_file(held_path);
+    if (predecessors) std::reverse(h.begin(), h.end());
     const size_t n = h.size();
     double index_bytes = 0;
     for (auto & c : shards) index_bytes += (double)size_in_bytes(*c);
 
     std::cout << "variant " << kVariant << "\n"
+              << "histograms_of " << (predecessors ? "predecessors" : "followers") << "\n"
               << "shards " << shards.size() << "\n"
               << "index_bytes " << (size_t)index_bytes << "\n"
               << "load_s " << secs(t0, t1) << "\n"
@@ -290,8 +305,9 @@ static int query(const std::string & list_path, const std::string & held_path, i
     return 0;
 }
 
-// Brute force: count every occurrence of ctx + a in the text by scanning.
-static std::vector<uint64_t> scan_followers(const char * text, size_t size, const std::string & ctx)
+// Brute force: count every occurrence of ctx + a (or of a + ctx, with
+// predecessors) in the text by scanning.
+static std::vector<uint64_t> scan(const char * text, size_t size, const std::string & ctx, bool predecessors)
 {
     std::vector<uint64_t> f(256, 0);
     const char * p = text;
@@ -301,14 +317,15 @@ static std::vector<uint64_t> scan_followers(const char * text, size_t size, cons
         const void * hit = memmem(p, (size_t)(end - p), ctx.data(), ctx.size());
         if (!hit) break;
         const char * q = (const char *)hit;
-        if (q + ctx.size() < end) ++f[(unsigned char)q[ctx.size()]];
+        if (predecessors) { if (q > text) ++f[(unsigned char)q[-1]]; }
+        else if (q + ctx.size() < end) ++f[(unsigned char)q[ctx.size()]];
         p = q + 1;
     }
     return f;
 }
 
 static int check(const std::string & list_path, const std::string & text_path, const std::string & held_path,
-                 int samples, int depth, int threads)
+                 int samples, int depth, int threads, bool predecessors)
 {
     auto t0 = clk::now();
     std::vector<std::string> paths;
@@ -321,6 +338,9 @@ static int check(const std::string & list_path, const std::string & text_path, c
     const char * text = (const char *)mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (text == MAP_FAILED) { std::cerr << "cannot map " << text_path << "\n"; return 1; }
     std::string h = read_file(held_path);
+    // With predecessors the fwd indexes are walked along the reversed
+    // held-out text: a drawn string is a context reversed.
+    if (predecessors) std::reverse(h.begin(), h.end());
 
     // The contexts, drawn as rnd/fm-index-1gb's check draws them (same seed),
     // and the shards' summed histogram of each.
@@ -360,7 +380,11 @@ static int check(const std::string & list_path, const std::string & text_path, c
     for (int t = 0; t < threads; ++t)
         pool.emplace_back([&, t] {
             for (size_t i = (size_t)t; i < ctxs.size(); i += (size_t)threads)
-                want[i] = scan_followers(text, size, ctxs[i]);
+            {
+                std::string c = ctxs[i];
+                if (predecessors) std::reverse(c.begin(), c.end());
+                want[i] = scan(text, size, c, predecessors);
+            }
         });
     for (auto & th : pool) th.join();
 
@@ -375,11 +399,12 @@ static int check(const std::string & list_path, const std::string & text_path, c
             if (bad <= 5) std::cout << "MISMATCH sample=" << i << " k=" << ctxs[i].size() << "\n";
         }
     }
-    std::cout << "shards " << shards.size() << "\n"
+    std::cout << "histograms_of " << (predecessors ? "predecessors" : "followers") << "\n"
+              << "shards " << shards.size() << "\n"
               << "text_chars " << size << "\n"
               << "checked " << ctxs.size() << "\n"
               << "absent_contexts " << absent << "\n"
-              << "separator_followers " << sep_followers << "\n"
+              << "separator_counts " << sep_followers << "\n"
               << "mismatches " << bad << "\n"
               << "check_s " << secs(t0, clk::now()) << "\n"
               << "peak_rss_mb " << peak_rss_kb() / 1024.0 << "\n";
@@ -389,15 +414,24 @@ static int check(const std::string & list_path, const std::string & text_path, c
 int main(int argc, char ** argv)
 {
     std::string mode = argc > 1 ? argv[1] : "";
-    if (mode == "build" && argc == 5) return build(argv[2], argv[3], argv[4]);
-    if (mode == "query" && argc >= 4 && argc <= 7)
+    auto dir = [&](int i, const char * yes, const char * no) {
+        if (argc <= i) return 0;
+        if (std::strcmp(argv[i], yes) == 0) return 1;
+        if (std::strcmp(argv[i], no) == 0) return 0;
+        return -1;
+    };
+    if (mode == "build" && (argc == 5 || argc == 6) && dir(5, "fwd", "rev") >= 0)
+        return build(argv[2], argv[3], argv[4], dir(5, "fwd", "rev") == 0);
+    if (mode == "query" && argc >= 4 && argc <= 8 && dir(7, "predecessors", "followers") >= 0)
         return query(argv[2], argv[3], argc > 4 ? std::atoi(argv[4]) : 24, argc > 5 ? std::atoi(argv[5]) : 2,
-                     argc > 6 ? std::atoi(argv[6]) != 0 : true);
-    if (mode == "check" && argc >= 5 && argc <= 8)
+                     argc > 6 ? std::atoi(argv[6]) != 0 : true, dir(7, "predecessors", "followers") == 1);
+    if (mode == "check" && argc >= 5 && argc <= 9 && dir(8, "predecessors", "followers") >= 0)
         return check(argv[2], argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 300, argc > 6 ? std::atoi(argv[6]) : 24,
-                     argc > 7 ? std::atoi(argv[7]) : 4);
-    std::cerr << "usage: fm_shards build <text> <index out> <tmp dir>\n"
-                 "       fm_shards query <index list> <held-out text> [depth=24] [reps=2] [per_shard=1]\n"
-                 "       fm_shards check <index list> <whole text> <held-out text> [samples=300] [depth=24] [threads=4]\n";
+                     argc > 7 ? std::atoi(argv[7]) : 4, dir(8, "predecessors", "followers") == 1);
+    std::cerr << "usage: fm_shards build <text> <index out> <tmp dir> [rev|fwd]\n"
+                 "       fm_shards query <index list> <held-out text> [depth=24] [reps=2] [per_shard=1]"
+                 " [followers|predecessors]\n"
+                 "       fm_shards check <index list> <whole text> <held-out text> [samples=300] [depth=24]"
+                 " [threads=4] [followers|predecessors]\n";
     return 1;
 }

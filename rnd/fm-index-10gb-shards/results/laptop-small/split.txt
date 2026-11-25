@@ -1,9 +1,9 @@
 books 150
 text_chars 53348887
-whole_chars 53349037
+whole_chars 53349038
 shards 3
 # shard_<i> books chars (separators included)
-shard_00 49 27786218
-shard_01 59 13570483
-shard_02 42 11992336
-largest_shard_chars 27786218
+shard_00 49 27786219
+shard_01 59 13570484
+shard_02 42 11992337
+largest_shard_chars 27786219
