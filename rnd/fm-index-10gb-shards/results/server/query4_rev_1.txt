@@ -1,0 +1,15 @@
+variant wt_huff<bit_vector>
+histograms_of followers
+shards 26
+index_bytes 8818319804
+load_s 3.81601
+heldout_chars 62500
+depth 24
+sum_s 56.2339
+sum_us_per_char 899.742
+sum_count_total 47388752941128
+sum_count_walked 47388752941128
+sum_checksum 5192701276141656
+mean_depth_reached_per_shard 12.2186
+mean_depth_reached_pooled 16.4749
+peak_rss_mb 9816.55

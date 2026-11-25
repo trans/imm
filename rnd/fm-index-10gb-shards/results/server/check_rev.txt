@@ -1,0 +1,9 @@
+histograms_of followers
+shards 26
+text_chars 10396151311
+checked 300
+absent_contexts 43
+separator_counts 113583
+mismatches 0
+check_s 224.745
+peak_rss_mb 19732.1

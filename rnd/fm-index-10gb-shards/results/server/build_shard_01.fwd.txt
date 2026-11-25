@@ -1,0 +1,12 @@
+variant wt_huff<bit_vector>
+index_text forward
+text_chars 487494772
+separators 1790
+read_reverse_s 0.644856
+construct_s 58.4054
+store_s 0.131384
+build_s 59.1817
+peak_rss_mb 2328.28
+index_bytes 415646060
+index_bits_per_char 6.82093
+sigma 98

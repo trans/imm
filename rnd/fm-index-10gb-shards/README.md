@@ -1,8 +1,8 @@
 ---
 title:    FM-index on 10 GB of books as 25 subject shards (and a 26th)
 kind:     experiment
-status:   planned
-outcome:  open
+status:   concluded
+outcome:  positive
 question: >-
   Can the count prior come from 10 GB of books held as 25 FM-indexes, one
   per subject group, with their follower counts added at lookup time? Per
@@ -13,7 +13,18 @@ question: >-
   index on the unreversed text for the predecessor counts the gate's suffix
   features need, timed on one core and checked the same way.
 answer: >-
-  Not yet run.
+  Yes, exactly, and fast enough offline. The 26 shards' summed counts
+  matched a scan of the whole 10.4 GB on 300 contexts each way (followers
+  and predecessors), 0 mismatches. Each set of 26 indexes built in 21 min
+  (largest shard 2.9 min at a 6.0 GB peak), 8.8 GB in RAM. On one core the
+  follower histograms cost 270 us a held-out character with each shard
+  walked over all the starts, but 690 us with all 26 walked in turn for
+  each start: the cache holds one shard's most-used parts, not 26 shards'.
+  Two shards in turn cost 1.22x, four 1.48x, eight 1.78x. Taking the starts
+  in blocks of 4,096 per shard brings all 26 back to 1.08x (286 us), so
+  summing on the fly can keep nearly the one-shard-at-a-time rate. Four
+  processes give 232 us a character for the machine. The predecessor set
+  costs the same within 3%.
 opened:   2026-11-25
 updated:  2026-11-25
 code: >-
@@ -182,6 +193,110 @@ their group number mod 3, with both index sets.
 - With a 4th shard from the first 10 extra160 books, cut by the extra
   arguments, both checks again gave 0 mismatches (not kept).
 
+### 2026-11-25: 10.4 GB in 26 shards on the second machine
+
+The 26 shards hold 26,497 books, 10,396,124,813 characters (10,396,151,311
+with the separators). They range from shard 0 (2,690 books, 1.26 GB) to
+shard 23 (115 books, 10 MB); the sizes are in `results/server/split.txt`.
+The run started 03:02 UTC and finished 04:08 UTC (`results/server/run.log`).
+
+**Builds** (`build_shard_*.{rev,fwd}.txt`):
+
+| | rev (followers) | fwd (predecessors) |
+|---|---:|---:|
+| All 26, one after another | 1,267 s (21.1 min) | 1,275 s (21.2 min) |
+| Largest, shard 0 | 172 s, 6.03 GB peak | the same |
+| Index, all 26 | 8.82 GB (6.79 bits a character) | 8.82 GB |
+
+**Checks** (`check_{rev,fwd}.txt`): 300 contexts each, the shards' summed
+counts against a scan of the whole text.
+
+| | Mismatches | In no shard | Book edges among the counts |
+|---|---:|---:|---:|
+| rev (followers) | 0 | 43 | 113,583 book ends |
+| fwd (predecessors) | 0 | 40 | 25,037 book starts |
+
+Each check took about 225 s on 4 threads, at a 19.7 GB peak (the indexes
+and the whole text).
+
+**One core** (`query_{rev,fwd}.txt`), per held-out character, depths 1-24:
+
+| | rev (followers) | fwd (predecessors) |
+|---|---:|---:|
+| Each shard alone, all 26 added up | 270.1 µs | 276.9 µs |
+| The same, shards 0-24 only | 263.2 µs | 269.7 µs |
+| All 26 per start, summed (best of 2) | 689.6 µs | 717.1 µs |
+| Mean depth reached, a shard | 12.19 | 12.19 |
+| Mean depth reached, all shards pooled | 16.48 | 16.48 |
+| Peak memory | 9.8 GB | 9.8 GB |
+
+- **Shards alone:** shard 0 (1.26 GB) costs 14.0 µs a character, close to
+  fm-index-1gb's 15.2 µs at 1 GB. Shard 3 (745 MB) costs 14.2. Cost
+  follows the number of followers a histogram has (24.0 against 21.3) as
+  well as the text's size. The smallest shards cost 2.8 µs (shard 23,
+  depth 6.4) and 4.0 µs (shard 24, depth 8.8).
+- **The order:** walking the shards in turn for each start costs 2.55x
+  (rev) and 2.59x (fwd) what walking each shard over all the starts does.
+  The counts are identical, and the adding up is a small part (see the
+  laptop test), so it's the order. The second machine's cache is 12 MB
+  (L3) and 2 MB a core (L2). One shard's most-used parts, its shortest
+  contexts, stay in it across starts; 26 shards' don't.
+- **Load:** the 8.8 GB of a set load in 2.7 s from the page cache.
+
+**Four processes** (`query4_rev_*.txt`, rev only), a quarter of the
+held-out text each, all 26 shards in each, summed per start: 900-930 µs a
+character each. The slowest took 58.1 s for its 62,500, so the machine
+does 232 µs a character, 2.97x one core.
+
+### 2026-11-25: the order of the walks (second machine)
+
+After the run, the user asked whether two shards at a time would still be
+too much for the cache. `fm_shards order` (`36d60f9`) times the walks
+alone, nothing summed, over the rev set: shards taken g at a time, and
+within a group the starts in blocks of B, each shard of the group walking
+every start of a block (`results/server/order_rev.txt`). Per held-out
+character, one core:
+
+| Order | µs a character | Against one at a time |
+|---|---:|---:|
+| One shard at a time, all starts | 264.9 | 1.00x |
+| 2 shards in turn, per start | 323.2 | 1.22x |
+| 4 in turn | 391.3 | 1.48x |
+| 8 in turn | 472.6 | 1.78x |
+| All 26 in turn | 678.8 | 2.56x |
+| All 26, blocks of 16 starts | 517.5 | 1.95x |
+| All 26, blocks of 256 | 401.6 | 1.52x |
+| All 26, blocks of 4,096 | 285.7 | 1.08x |
+
+- Each doubling of the shards in turn adds about 20%. There's no cliff, so
+  two at a time mostly fits.
+- All 26 in turn without summing (678.8) is within 2% of the summed pass
+  (689.6), so the adding up costs little; the order is the cost.
+- The reuse that the cache gives spans thousands of starts: blocks of 256
+  recover only half the gap, blocks of 4,096 nearly all of it. The blocked
+  order wasn't timed with the summing, which then has to hold a block's
+  histograms (about 4,096 starts x 24 depths x 20 symbols).
+
 ## What we learned, or what's open
 
-Open until the run on the second machine.
+- **The subject partition is exact and cheap to build.** 26 shards, both
+  directions, 42 minutes of builds, 17.6 GB of index, and 0 mismatches
+  against the whole text.
+- **The plain sum over all shards costs about 10x one index.** 270 µs a
+  character against the 27-29 µs fm-index-1gb extrapolated for one 10 GB
+  piece. Each shard's walk costs nearly what a whole index's does: a shard's
+  contexts reach 12.2 deep on average, against 16.5 pooled. That is the
+  price mobius expected (250-350 µs), and why consulting only some shards
+  per document is the step after.
+- **Order matters 2.5x.** Walk shard by shard, or in blocks of thousands of
+  positions; never all shards per position. mobius's event-file walks
+  should go shard by shard. Its estimate of about 1 µs an interval a shard
+  matches the shard-by-shard rate here (0.85 µs a histogram on average,
+  0.99 for shard 0).
+- **Predecessors cost the same as followers,** within 3%, as the symmetry
+  says. Same depths reached.
+- **Open:**
+  - the blocked order with the summing, if on-the-fly summing is wanted;
+  - the files live in `/var/tmp` on the second machine, which systemd's
+    tmpfiles empties of files unused for 30 days (`q /var/tmp ... 30d`),
+    so the indexes want a lasting place if they are to be kept.
