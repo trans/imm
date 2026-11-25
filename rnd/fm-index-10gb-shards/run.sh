@@ -1,16 +1,17 @@
 #!/bin/sh
-# The 10 GB as 25 subject shards, run in the work directory on the second
-# machine, beside books.txt, books.starts, books.names, groups_k25.books
-# (mobius's list) and heldout.txt, with fm_shards compiled from fm_shards.cpp
+# The 10 GB as 25 subject shards and a 26th, run in the work directory on
+# the second machine, beside books.txt, books.starts, books.names,
+# groups_k25.books (mobius's list), extra160.{txt,starts,names} (mobius's
+# 26th shard) and heldout.txt, with fm_shards compiled from fm_shards.cpp
 # (see README). Results go to results/.
 #
 # 1. Cut the shards (every book between two 0x01) and the whole text the
-#    same way.
+#    same way, all 26 shards' books in it.
 # 2. The rev indexes (followers), one after another; the open question is
 #    their summed lookup, so they are measured first:
-#    a. on one core: each shard alone, then all 25 summed per start (best of 2);
+#    a. on one core: each shard alone, then all 26 summed per start (best of 2);
 #    b. four processes at once, a quarter of the held-out text each, every
-#       one with all 25 loaded;
+#       one with all 26 loaded;
 #    c. the check: 300 contexts, the summed counts against a scan of the
 #       whole text (the scans on 4 threads).
 # 3. The fwd indexes (predecessors, for the gate's suffix features), then
@@ -18,7 +19,8 @@
 set -eu
 cd "$(dirname "$0")"
 mkdir -p results tmp shards
-nice -n 19 python3 -I split_shards.py books.txt books.starts books.names groups_k25.books shards all_sep.txt > results/split.txt 2>&1
+nice -n 19 python3 -I split_shards.py books.txt books.starts books.names groups_k25.books shards all_sep.txt \
+    extra160.txt extra160.starts extra160.names > results/split.txt 2>&1
 
 for t in shards/shard_*.txt; do
     s=$(basename "$t" .txt)

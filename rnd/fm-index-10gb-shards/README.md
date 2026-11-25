@@ -1,5 +1,5 @@
 ---
-title:    FM-index on 10 GB of books as 25 subject shards
+title:    FM-index on 10 GB of books as 25 subject shards (and a 26th)
 kind:     experiment
 status:   planned
 outcome:  open
@@ -23,7 +23,8 @@ code: >-
 data: >-
   mobius's data/pg19/imm-split-20m-books/books.txt (10,303,343,939 bytes,
   26,337 books) cut by mobius's rnd/books-heldout/groups_k25.books (mobius
-  76a1227); queries: data/pg19/imm-split-20m/heldout_corpus.txt (250,000
+  76a1227), and mobius's data/pg19/shards/extra160.txt (160 books,
+  92,780,874 bytes) as a 26th shard; queries: data/pg19/imm-split-20m/heldout_corpus.txt (250,000
   characters, sha256 095cbd13...), as in fm-index-1gb.
 slots:    []
 tags:     [prior, fm-index, scale, timing, shards, mobius]
@@ -70,8 +71,23 @@ line 933). An index on the reversed text gives followers. Predecessors come
 from an index on the text as it stands. So each shard gets both, the two
 together a bidirectional index, and the build doubles.
 
+mobius added a 26th shard the same night (mail 20261125-025437Z): the 160
+books of the 20M split's corpus that the books split leaves out (its 50
+held-out books and 110 more), as mobius's `data/pg19/shards/extra160.txt`
+(92,780,874 bytes). mobius checked that the books split's corpus is the
+20M split's minus exactly those books, same order, same bytes. Its size
+plus the 25 shards' is 10,396,124,813 bytes, the 20M split's whole.
+So shards 0-24 sum to the books split's corpus, and all 26 sum to the
+20M split's, whose count prior and runs (1.6175 alone, 1.3825 under the
+10.8M) mobius will reproduce first. Shard 25 is left out when the
+held-out books are scored.
+
 ## Design
 
+- **The 26th shard:** mobius's extra160 books, with their own starts and
+  names, cut and built like the others. The timing passes and the checks
+  use all 26 shards. The per-shard pass shows shard 25's own cost, so the
+  25 subject shards' cost can be read off as well.
 - **The shards:** one per k-means group of the counted books, 25 in all,
   from mobius's list (one line per book: name, shard, characters).
   The list was checked against the books' own files:
@@ -129,8 +145,9 @@ together a bidirectional index, and the build doubles.
 
 On the second machine, in a work directory holding `books.txt`,
 `books.starts` and `books.names` from mobius's
-`data/pg19/imm-split-20m-books/`, mobius's `groups_k25.books`, and the
-held-out text as `heldout.txt`:
+`data/pg19/imm-split-20m-books/`, mobius's `groups_k25.books`, the three
+`extra160` files from mobius's `data/pg19/shards/`, and the held-out text
+as `heldout.txt`:
 
 ```sh
 git clone https://github.com/xxsds/sdsl-lite && git -C sdsl-lite checkout 7696536
@@ -162,6 +179,8 @@ their group number mod 3, with both index sets.
   - These shards (15 MB of index each) nearly fit in the laptop's cache
     when queried one at a time, but not three in turn. At 8.8 GB nothing
     fits either way.
+- With a 4th shard from the first 10 extra160 books, cut by the extra
+  arguments, both checks again gave 0 mismatches (not kept).
 
 ## What we learned, or what's open
 
