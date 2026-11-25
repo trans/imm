@@ -295,8 +295,13 @@ character, one core:
   0.99 for shard 0).
 - **Predecessors cost the same as followers,** within 3%, as the symmetry
   says. Same depths reached.
-- **Open:**
-  - the blocked order with the summing, if on-the-fly summing is wanted;
-  - the files live in `/var/tmp` on the second machine, which systemd's
-    tmpfiles empties of files unused for 30 days (`q /var/tmp ... 30d`),
-    so the indexes want a lasting place if they are to be kept.
+- **Open:** the blocked order with the summing, timed, if on-the-fly
+  summing is wanted.
+- **Where the indexes are kept:** the run's `/var/tmp` work directory on
+  the second machine is emptied of files unused for 30 days (systemd's
+  tmpfiles, `q /var/tmp ... 30d`). So on 2026-11-25, at the user's word,
+  the 52 indexes moved to a folder in the user's home directory there, on
+  the mirrored ZFS pool. The folder holds `shards/`, `pairs26/` and
+  `pairs25/` (links), `sha256.txt` (checked after the copy) and a README.
+  They take 17.6 GB, 9.4 GB on disk with the pool's lz4. The shard texts
+  and the whole text stay in `/var/tmp`, rebuildable from mobius's data.
