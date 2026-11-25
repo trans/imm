@@ -28,9 +28,12 @@ answer: >-
 opened:   2026-11-25
 updated:  2026-11-25
 code: >-
-  branch fm-index-10gb-shards: fm_shards.cpp, split_shards.py, run.sh.
-  sdsl-lite from xxsds at 7696536, header-only, built with g++ 14 -O3
-  -march=native -std=c++20 -pthread.
+  branch fm-index-10gb-shards, merged into main: fm_shards.cpp,
+  split_shards.py, run.sh. The laptop test at 2c9c937 (tag
+  rnd/fm-index-10gb-shards/laptop-small); the run on the second machine at
+  eaec6d9 (tag rnd/fm-index-10gb-shards/server); fm_shards order at 36d60f9
+  (tag rnd/fm-index-10gb-shards/order). sdsl-lite from xxsds at 7696536,
+  header-only, built with g++ 14 -O3 -march=native -std=c++20 -pthread.
 data: >-
   mobius's data/pg19/imm-split-20m-books/books.txt (10,303,343,939 bytes,
   26,337 books) cut by mobius's rnd/books-heldout/groups_k25.books (mobius

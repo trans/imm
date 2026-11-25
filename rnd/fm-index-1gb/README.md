@@ -23,9 +23,11 @@ answer: >-
 opened:   2026-11-24
 updated:  2026-11-24
 code: >-
-  branch fm-index-1gb: fm_time.cpp, run.sh (95ef95e); extras.sh and the
-  per-depth pass in fm_time.cpp (the commit after). sdsl-lite from xxsds at 7696536
-  (2026-11-16), header-only, built with g++ 14 -O3 -march=native -std=c++20.
+  branch fm-index-1gb, merged into main: fm_time.cpp and run.sh at 95ef95e
+  (tag rnd/fm-index-1gb/1gb); extras.sh and the per-depth pass in
+  fm_time.cpp at 085218c (tag rnd/fm-index-1gb/extras). sdsl-lite from xxsds
+  at 7696536 (2026-11-16), header-only, built with g++ 14 -O3 -march=native
+  -std=c++20.
 data: >-
   the first 999,999,959 bytes of mobius's data/pg19/imm-split-20m/books.txt
   (1 GB cut at a line end; sha256 ffb80e9f...); queries: that split's
