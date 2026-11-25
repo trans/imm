@@ -1,0 +1,21 @@
+variant wt_huff<bit_vector>
+shards 3
+index_bytes 45660016
+load_s 0.0293186
+heldout_chars 250000
+depth 24
+# shard_<i> text_chars hist_s us_per_char mean_depth_reached mean_symbols_per_histogram
+shard_0 27786218 1.14517 4.58067 10.6032 18.278
+shard_1 13570483 0.877948 3.51179 9.96223 17.896
+shard_2 11992336 0.835414 3.34166 9.75906 17.5301
+per_shard_total_s 2.85853
+per_shard_total_us_per_char 11.4341
+per_shard_count_total 995240820745
+sum_s 4.62917
+sum_us_per_char 18.5167
+sum_count_total 995240820745
+sum_count_walked 995240820745
+sum_checksum 108872463815552
+mean_depth_reached_per_shard 10.1082
+mean_depth_reached_pooled 11.2886
+peak_rss_mb 55.5117
