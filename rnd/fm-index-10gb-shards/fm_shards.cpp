@@ -24,6 +24,7 @@
 //   fm_shards query <index list> <held-out text> [depth=24] [reps=2] [per_shard=1] [followers|predecessors]
 //   fm_shards check <index list> <whole text> <held-out text> [samples=300] [depth=24] [threads=4]
 //                   [followers|predecessors]
+//   fm_shards order <index list> <held-out text> <depth> <followers|predecessors> <g:B>...
 //
 // An index list is a file with one index path per line. Output lines are
 // "key value" pairs, one per line, for the README's tables.
@@ -305,6 +306,50 @@ static int query(const std::string & list_path, const std::string & held_path, i
     return 0;
 }
 
+// The walks alone (nothing summed), in another order, to see what the order
+// costs: the shards taken g at a time, and within a group the starts in
+// blocks of B; for each block, each shard of the group walks every start of
+// the block. g = 1 with B = all is the per-shard pass's order; g = all with
+// B = 1 is the summed pass's. Each g:B is one timed pass.
+static int order(const std::string & list_path, const std::string & held_path, int depth, bool predecessors,
+                 const std::vector<std::pair<size_t, size_t>> & orders)
+{
+    std::vector<std::string> paths;
+    auto shards = load_list(list_path, paths);
+    std::string h = read_file(held_path);
+    if (predecessors) std::reverse(h.begin(), h.end());
+    const size_t n = h.size();
+    std::cout << "variant " << kVariant << "\n"
+              << "histograms_of " << (predecessors ? "predecessors" : "followers") << "\n"
+              << "shards " << shards.size() << "\n"
+              << "heldout_chars " << n << "\n"
+              << "depth " << depth << "\n"
+              << "# order_<g>_<B> s us_per_char count_total mean_depth_reached_per_shard\n";
+    Scratch s;
+    for (auto [group, block] : orders)
+    {
+        group = std::min(std::max<size_t>(group, 1), shards.size());
+        block = std::min(std::max<size_t>(block, 1), n);
+        uint64_t count = 0, symbols = 0, reached = 0;
+        auto a = clk::now();
+        for (size_t g0 = 0; g0 < shards.size(); g0 += group)
+        {
+            const size_t g1 = std::min(g0 + group, shards.size());
+            for (size_t b0 = 0; b0 < n; b0 += block)
+            {
+                const size_t b1 = std::min(b0 + block, n);
+                for (size_t i = g0; i < g1; ++i)
+                    for (size_t j = b0; j < b1; ++j)
+                        reached += (uint64_t)walk(*shards[i], h, j, depth, s, nullptr, count, symbols);
+            }
+        }
+        double t = secs(a, clk::now());
+        std::cout << "order_" << group << "_" << block << " " << t << " " << 1e6 * t / n << " " << count << " "
+                  << (double)reached / ((double)n * shards.size()) << std::endl;
+    }
+    return 0;
+}
+
 // Brute force: count every occurrence of ctx + a (or of a + ctx, with
 // predecessors) in the text by scanning.
 static std::vector<uint64_t> scan(const char * text, size_t size, const std::string & ctx, bool predecessors)
@@ -428,10 +473,22 @@ int main(int argc, char ** argv)
     if (mode == "check" && argc >= 5 && argc <= 9 && dir(8, "predecessors", "followers") >= 0)
         return check(argv[2], argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 300, argc > 6 ? std::atoi(argv[6]) : 24,
                      argc > 7 ? std::atoi(argv[7]) : 4, dir(8, "predecessors", "followers") == 1);
+    if (mode == "order" && argc >= 7 && dir(5, "predecessors", "followers") >= 0)
+    {
+        std::vector<std::pair<size_t, size_t>> orders;
+        for (int i = 6; i < argc; ++i)
+        {
+            const char * colon = std::strchr(argv[i], ':');
+            if (!colon) { std::cerr << "an order is g:B, not " << argv[i] << "\n"; return 1; }
+            orders.push_back({(size_t)std::atoll(argv[i]), (size_t)std::atoll(colon + 1)});
+        }
+        return order(argv[2], argv[3], std::atoi(argv[4]), dir(5, "predecessors", "followers") == 1, orders);
+    }
     std::cerr << "usage: fm_shards build <text> <index out> <tmp dir> [rev|fwd]\n"
                  "       fm_shards query <index list> <held-out text> [depth=24] [reps=2] [per_shard=1]"
                  " [followers|predecessors]\n"
                  "       fm_shards check <index list> <whole text> <held-out text> [samples=300] [depth=24]"
-                 " [threads=4] [followers|predecessors]\n";
+                 " [threads=4] [followers|predecessors]\n"
+                 "       fm_shards order <index list> <held-out text> <depth> <followers|predecessors> <g:B>...\n";
     return 1;
 }
